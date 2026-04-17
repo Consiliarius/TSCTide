@@ -20,7 +20,7 @@ The tool computes access windows — the periods around each high water when the
 - **Wind offset** — adjusts the next tide's access window based on observed wind direction and the mooring's shallow-water geometry
 - **ICS export** from any data source, with harmonic-derived events prefixed "est."
 - **XLSX batch import** for observations recorded on a phone over time
-- **HTTPS support** via Caddy reverse proxy with automatic Let's Encrypt certificates
+- **HTTPS support** via CloudFlare Tunnel (zero inbound ports, automatic certificates)
 
 ## Quick Start
 
