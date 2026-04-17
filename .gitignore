@@ -1,0 +1,16 @@
+# Environment
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Data (persisted via Docker volume)
+data/tides.db
+data/feeds/
+data/model_config.json
+
+# OS
+.DS_Store
+Thumbs.db

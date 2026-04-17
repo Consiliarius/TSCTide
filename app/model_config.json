@@ -1,0 +1,49 @@
+{
+    "_comment": "Tidal Access Model Configuration. Tidal curve parameters used by access window calculator. Harmonic constants and secondary port offsets are documented here for reference but are currently implemented in harmonic.py and secondary_port.py respectively.",
+    "_version": "2.1.0",
+    "_last_updated": "2026-04-16",
+
+    "secondary_port_offset": {
+        "_comment": "Portsmouth to Langstone Harbour corrections. Applied by KHM parser and secondary_port.py (for harmonic predictions). Derived from Admiralty data comparison.",
+        "hw_time_offset_minutes": 9,
+        "hw_height_offset_m": 0.24,
+        "lw_time_offset_minutes": 0,
+        "lw_height_offset_m": 0.0
+    },
+
+    "tidal_curve": {
+        "_comment": "Parameters for Langstone Harbour asymmetric tidal curve used to interpolate heights between HW/LW events. The Solent exhibits an extended HW stand on the ebb.",
+        "flood_duration_fraction": 0.42,
+        "ebb_duration_fraction": 0.58,
+        "stand_duration_minutes": 40,
+        "stand_height_fraction": 0.98,
+        "_notes": "flood_duration_fraction + ebb_duration_fraction must equal 1.0. The stand occurs near HW on the ebb. stand_height_fraction is the proportion of HW height maintained during the stand period. Calibrated against UKHO half-hourly Langstone data (21-22 April 2026): stand duration ~40min at 98% of HW height, consistent across springs and neaps. Impact: ebb threshold crossings ~10-15min later on springs, ~20-30min later on neaps where HW is close to threshold."
+    },
+
+    "harmonic_reference": {
+        "_comment": "Harmonic constants are implemented in app/harmonic.py. Documented here for reference only. 19 constituents calibrated against KHM Portsmouth April 2026.",
+        "mean_level_m": 2.84,
+        "constituents": {
+            "M2": {"amplitude": 1.55, "phase_lag": 167},
+            "S2": {"amplitude": 0.56, "phase_lag": 218},
+            "N2": {"amplitude": 0.31, "phase_lag": 145},
+            "K2": {"amplitude": 0.15, "phase_lag": 214},
+            "K1": {"amplitude": 0.10, "phase_lag": 137},
+            "O1": {"amplitude": 0.10, "phase_lag": 344},
+            "P1": {"amplitude": 0.03, "phase_lag": 137},
+            "Q1": {"amplitude": 0.03, "phase_lag": 309},
+            "M4": {"amplitude": 0.22, "phase_lag": 196},
+            "MS4": {"amplitude": 0.15, "phase_lag": 264},
+            "MN4": {"amplitude": 0.06, "phase_lag": 175},
+            "M6": {"amplitude": 0.04, "phase_lag": 205},
+            "2N2": {"amplitude": 0.04, "phase_lag": 123},
+            "MU2": {"amplitude": 0.04, "phase_lag": 186},
+            "NU2": {"amplitude": 0.06, "phase_lag": 148},
+            "L2": {"amplitude": 0.05, "phase_lag": 182},
+            "T2": {"amplitude": 0.03, "phase_lag": 213},
+            "SA": {"amplitude": 0.07, "phase_lag": 170},
+            "SSA": {"amplitude": 0.03, "phase_lag": 340}
+        },
+        "accuracy": "HW: +/-0.2m height, +/-30min timing. LW heights less accurate."
+    }
+}

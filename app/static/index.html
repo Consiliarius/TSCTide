@@ -1,0 +1,1245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tidal Access Window Predictor</title>
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+<style>
+  :root {
+    --navy: #1b2a4a;
+    --navy-light: #2c3e6b;
+    --sea: #3a7ca5;
+    --sea-light: #5ba4c9;
+    --sand: #f5f0e8;
+    --sand-dark: #e8e0d0;
+    --warn: #c0392b;
+    --ok: #27ae60;
+    --est: #e67e22;
+    --text: #2c3e50;
+    --text-light: #7f8c8d;
+    --border: #bdc3c7;
+    --radius: 6px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, sans-serif;
+    background: var(--sand); color: var(--text);
+    line-height: 1.5; font-size: 14px;
+  }
+  header {
+    background: var(--navy); color: #fff; padding: 12px 20px;
+    display: flex; align-items: center; gap: 16px;
+  }
+  header h1 { font-size: 18px; font-weight: 600; }
+  header .subtitle { font-size: 12px; color: var(--sea-light); }
+  .container { max-width: 960px; margin: 0 auto; padding: 16px; }
+
+  /* Tab bar */
+  .tabs {
+    display: flex; gap: 4px; margin-bottom: 16px;
+    border-bottom: 2px solid var(--border);
+  }
+  .tab {
+    padding: 8px 16px; background: transparent; color: var(--text);
+    border: none; border-radius: var(--radius) var(--radius) 0 0;
+    font-size: 13px; font-weight: 600; cursor: pointer;
+    border-bottom: 3px solid transparent; margin-bottom: -2px;
+  }
+  .tab:hover { background: var(--sand); }
+  .tab.active {
+    border-bottom-color: var(--sea); color: var(--navy);
+  }
+  .view { display: none; }
+  .view.active { display: block; }
+
+  /* Activity log table */
+  .log-table {
+    width: 100%; border-collapse: collapse; font-size: 12px;
+  }
+  .log-table th, .log-table td {
+    padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  .log-table th {
+    background: var(--sand); font-weight: 600; color: var(--navy);
+    position: sticky; top: 0;
+  }
+  .log-row.severity-error { background: #fff0f0; }
+  .log-row.severity-warning { background: #fff8e8; }
+  .log-row.severity-success { background: #f0f9f0; }
+  .sev-badge {
+    display: inline-block; padding: 1px 6px; border-radius: 3px;
+    font-size: 10px; font-weight: 700; text-transform: uppercase;
+  }
+  .sev-info { background: #e3ecf3; color: var(--navy); }
+  .sev-success { background: #d4e8d4; color: #2d5f2d; }
+  .sev-warning { background: #fce8c8; color: #7a5020; }
+  .sev-error { background: #f4cccc; color: #8b1a1a; }
+  .details-toggle {
+    color: var(--sea); cursor: pointer; font-size: 11px; text-decoration: underline;
+  }
+  .details-content {
+    background: var(--sand); padding: 8px; margin-top: 4px;
+    border-radius: var(--radius); font-family: monospace; font-size: 11px;
+    white-space: pre-wrap; display: none;
+  }
+  .details-content.shown { display: block; }
+
+  /* Mooring config card */
+  .mooring-card {
+    background: #fff; border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 12px; margin-bottom: 12px;
+  }
+  .mooring-card h3 {
+    margin: 0 0 8px 0; color: var(--navy); font-size: 14px;
+    padding-bottom: 6px; border-bottom: 1px solid var(--border);
+  }
+  .config-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 6px 16px; font-size: 12px;
+  }
+  .config-grid .label { color: var(--text-light); }
+  .config-grid .value { font-weight: 600; color: var(--navy); }
+
+  /* Panels */
+  .panel {
+    background: #fff; border: 1px solid var(--border); border-radius: var(--radius);
+    margin-bottom: 16px; overflow: hidden;
+  }
+  .panel-header {
+    background: var(--navy); color: #fff; padding: 8px 14px;
+    font-size: 13px; font-weight: 600; cursor: pointer; user-select: none;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .panel-header .toggle { font-size: 11px; opacity: 0.7; }
+  .panel-body { padding: 14px; }
+  .panel-body.collapsed { display: none; }
+
+  /* Form elements */
+  label { display: block; font-size: 12px; font-weight: 600; margin-bottom: 2px; color: var(--navy); }
+  input, select, textarea {
+    width: 100%; padding: 6px 8px; border: 1px solid var(--border);
+    border-radius: var(--radius); font-size: 13px; margin-bottom: 10px;
+  }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--sea); }
+  textarea { resize: vertical; min-height: 100px; font-family: monospace; font-size: 12px; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; }
+  .row > * { flex: 1; min-width: 120px; }
+  .row-tight { display: flex; gap: 8px; align-items: end; }
+
+  /* Buttons */
+  button {
+    padding: 7px 14px; border: none; border-radius: var(--radius);
+    font-size: 13px; font-weight: 600; cursor: pointer;
+    transition: opacity 0.2s;
+  }
+  button:hover { opacity: 0.85; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-primary { background: var(--navy); color: #fff; }
+  .btn-sea { background: var(--sea); color: #fff; }
+  .btn-ok { background: var(--ok); color: #fff; }
+  .btn-warn { background: var(--est); color: #fff; }
+  .btn-sm { padding: 4px 10px; font-size: 12px; }
+  .btn-group { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+
+  /* Toggle switch */
+  .switch-row { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .switch { position: relative; width: 40px; height: 22px; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .slider {
+    position: absolute; inset: 0; background: var(--border); border-radius: 22px;
+    cursor: pointer; transition: 0.3s;
+  }
+  .slider::before {
+    content: ""; position: absolute; height: 16px; width: 16px; left: 3px; bottom: 3px;
+    background: #fff; border-radius: 50%; transition: 0.3s;
+  }
+  .switch input:checked + .slider { background: var(--sea); }
+  .switch input:checked + .slider::before { transform: translateX(18px); }
+
+  /* Results table */
+  .results-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .results-table th {
+    background: var(--navy); color: #fff; padding: 6px 10px;
+    text-align: left; font-weight: 600;
+  }
+  .results-table td { padding: 6px 10px; border-bottom: 1px solid var(--sand-dark); }
+  .results-table tr:nth-child(even) { background: var(--sand); }
+  .results-table tr.no-access { color: var(--text-light); font-style: italic; }
+  .source-badge {
+    display: inline-block; padding: 1px 6px; border-radius: 3px;
+    font-size: 11px; font-weight: 600; color: #fff;
+  }
+  .source-ukho { background: var(--ok); }
+  .source-khm { background: var(--sea); }
+  .source-harmonic { background: var(--est); }
+
+  /* Feed URL */
+  .feed-url {
+    background: var(--sand); border: 1px dashed var(--border); padding: 8px 12px;
+    border-radius: var(--radius); font-family: monospace; font-size: 12px;
+    word-break: break-all; margin: 8px 0;
+  }
+
+  /* Status messages */
+  .status { padding: 8px 12px; border-radius: var(--radius); margin: 8px 0; font-size: 13px; }
+  .status-ok { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+  .status-err { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+  .status-info { background: #d1ecf1; color: #0c5460; border: 1px solid #bee5eb; }
+
+  /* Wind info */
+  .wind-info {
+    background: #fff3cd; border: 1px solid #ffc107; padding: 8px 12px;
+    border-radius: var(--radius); font-size: 13px; margin: 8px 0;
+  }
+
+  /* Obs form */
+  .obs-item {
+    background: var(--sand); padding: 8px; border-radius: var(--radius);
+    margin-bottom: 6px; font-size: 12px;
+  }
+
+  .hidden { display: none; }
+  .mt-8 { margin-top: 8px; }
+  .mb-8 { margin-bottom: 8px; }
+
+  @media (max-width: 600px) {
+    .row > * { min-width: 100%; }
+    .container { padding: 8px; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>Tidal Access Window Predictor</h1>
+    <div class="subtitle">Langstone Harbour — Swing Mooring Access</div>
+  </div>
+</header>
+
+<div class="container">
+
+  <!-- Tab navigation -->
+  <div class="tabs">
+    <button class="tab active" data-view="main" onclick="switchView('main')">Access Windows</button>
+    <button class="tab" data-view="system" onclick="switchView('system')">System Activity</button>
+    <button class="tab" data-view="moorings" onclick="switchView('moorings')">Mooring Configs</button>
+  </div>
+
+  <!-- Main view -->
+  <div class="view active" id="view-main">
+
+  <!-- Getting Started -->
+  <div class="panel">
+    <div class="panel-header" onclick="togglePanel('help')">
+      Getting Started <span class="toggle" id="help-toggle">▶</span>
+    </div>
+    <div class="panel-body collapsed" id="help-body" style="font-size:13px;line-height:1.6;">
+      <p>This tool predicts when your boat has enough water to safely leave or return to a swing mooring in Langstone Harbour.</p>
+      <p style="font-weight:600;margin-top:10px;">Quick start (no account needed)</p>
+      <p>Enter your boat's draught and an estimate of your mooring's drying height below, then click <b>UKHO (7 days)</b> and then <b>Calculate Access Windows</b> to see your access windows. Alternatively you can also paste data from the Royal Navy KHM Portsmouth tide tables (linked to below) by clicking <b>KHM Paste</b> for a longer range, or use the built-in harmonic model for an approximate long-range forecast.</p>
+	  <p style="margin-top:5px;">KHM predictions are more accurate than harmonic predictions, and UKHO predictions are likely more accurate than both. The secondary port offset for Langstone Harbour is automatically applied for data pasted from the KHM tide table.</p>
+      <p style="font-weight:600;margin-top:10px;">Saving your configuration</p>
+      <p>Enter a Mooring ID (1–100) and click <b>Save Configuration</b> to persist your settings. When re-visiting the page in future, or if you need to revise any aspect of the configuration, enter your mooring ID and press <b>Load from Mooring ID</b> to populate the tool with your last saved configuration.</p>
+	  <p style="margin-top:5px;">This also enables the <b>iCal subscription feed</b> — a URL you can add to Apple Calendar, Google Calendar, or Outlook so calculated access windows appear automatically on your phone or desktop. The feed will start with the access windows you initially calculate, and then will update daily at 02:00 BST. During the update, UKHO data is used to predict access windows for the next 7 days. If data is needed for further into the future, either use the KHM Paste option or the Harmonic (long range) prediction. Your UKHO-calculated data for the next 7 days is never overwritten by these alternative sources.</p>
+      <p style="font-weight:600;margin-top:10px;">Improving accuracy</p>
+      <p>If you are using a mooring ID, you can enable <b>Use Observational Data</b> to provide observational information as to whether your boat is afloat or aground at specific times. Over time, these observations narrow down the true drying height of your mooring and a confidence rating is shown. Observations can be entered manually or batch-imported from a spreadsheet that you can fill in over time.</p>
+      <p style="font-weight:600;margin-top:10px;">Wind offset</p>
+      <p>If your mooring is near the edge of the channel, the direction the boat lies as the tide drops affects the depth available. Provide the direction in which the shallower-water lies, and the additional extra height of the ground in that direction have access windows automatically adjusted for when the wind may have pushed the boat toward the shallow side. During each tide's ebb, the system checks which direction the wind is blowing and updates the access window if it's likely the boat is lying on dryer/shallower ground.</p>
+	  <p style="font-weight:600;margin-top:10px;">Obligatory safety warning</p>
+	  <p>This tool is provided with absolutely no guarantee of accuracy and may have limited value over simply assuming you can use your boat around 2 hours either side of High Water. It should not be relied upon for navigation, safety or any other critical purpose.</p>
+    </div>
+  </div>
+
+  <!-- Configuration Panel -->
+  <div class="panel">
+    <div class="panel-header" onclick="togglePanel('cfg')">
+      Configuration <span class="toggle" id="cfg-toggle">▼</span>
+    </div>
+    <div class="panel-body" id="cfg-body">
+      <div class="row">
+        <div>
+          <label>Mooring ID (1–100, optional)</label>
+          <input type="number" id="mooring_id" min="1" max="100" placeholder="e.g. 42" oninput="updateMooringOptions()">
+        </div>
+        <div>
+          <label>Boat Name (optional)</label>
+          <input type="text" id="boat_name" placeholder="e.g. RMS Titanic">
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label>Draught (m)</label>
+          <input type="number" id="draught_m" step="0.01" value="1.0">
+        </div>
+        <div>
+          <label>Drying Height (m)</label>
+          <input type="number" id="drying_height_m" step="0.01" value="2.0">
+        </div>
+        <div>
+          <label>Safety Margin (m)</label>
+          <input type="number" id="safety_margin_m" step="0.01" value="0.3">
+        </div>
+      </div>
+
+      <!-- Mooring-dependent options (hidden until Mooring ID is entered) -->
+      <div id="mooring-options" class="hidden">
+
+      <!-- Wind Offset (also hidden if OWM API key not configured) -->
+      <div id="wind-section" class="hidden">
+        <div class="switch-row">
+          <label class="switch">
+            <input type="checkbox" id="wind_offset_enabled" onchange="toggleWindConfig()">
+            <span class="slider"></span>
+          </label>
+          <span style="font-size:13px;font-weight:600;">Wind Offset</span>
+          <span style="font-size:11px;color:var(--warn);font-weight:600;">(experimental!)</span>
+        </div>
+        <div id="wind-config" class="hidden">
+        <div class="row">
+          <div>
+            <label>Shallow Water Direction</label>
+            <select id="shallow_direction">
+              <option value="">Select...</option>
+              <option>N</option><option>NE</option><option>E</option><option>SE</option>
+              <option>S</option><option>SW</option><option>W</option><option>NW</option>
+            </select>
+          </div>
+          <div>
+            <label>Additional Drying Height (m)</label>
+            <input type="number" id="shallow_extra_depth_m" step="0.1" value="0.0">
+          </div>
+        </div>
+      </div>
+      </div><!-- end wind-section -->
+
+      <!-- Calendar subscription toggle -->
+      <div class="switch-row">
+        <label class="switch">
+          <input type="checkbox" id="calendar_enabled">
+          <span class="slider"></span>
+        </label>
+        <span style="font-size:13px;font-weight:600;">Enable Calendar Subscription</span>
+      </div>
+
+      <div class="switch-row">
+        <label class="switch">
+          <input type="checkbox" id="use_observations" onchange="toggleObsPanel()">
+          <span class="slider"></span>
+        </label>
+        <span style="font-size:13px;font-weight:600;">Use Observational Data</span>
+      </div>
+
+      </div><!-- end mooring-options -->
+
+      <div class="btn-group">
+        <button class="btn-primary" onclick="saveConfig()">Save Configuration</button>
+        <button class="btn-sea" onclick="loadConfig()">Load from Mooring ID</button>
+      </div>
+      <div id="cfg-status"></div>
+
+      <!-- Feed URL (shown when config is saved with calendar enabled) -->
+      <div id="feed-url-section" class="hidden mt-8">
+        <label>iCal Feed URL (subscribe to this in your calendar app)</label>
+        <div class="feed-url" id="feed-url"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Observations & Calibration Panel (between config and calculate; hidden until toggle + mooring ID) -->
+  <div class="panel hidden" id="obs-panel">
+    <div class="panel-header" onclick="togglePanel('obs')">
+      Observations &amp; Calibration <span class="toggle" id="obs-toggle">▼</span>
+    </div>
+    <div class="panel-body" id="obs-body">
+
+      <!-- Calibration Status -->
+      <div id="cal-status" style="background:var(--sand);border:1px solid var(--border);border-radius:var(--radius);padding:10px;margin-bottom:12px;">
+        <div style="font-size:13px;font-weight:600;margin-bottom:6px;">Calibration Status</div>
+        <div class="row" style="font-size:12px;">
+          <div>Drying height: <strong id="cal-drying">—</strong></div>
+          <div>Observations: <strong id="cal-obs">0</strong> (<span id="cal-obs-detail">—</span>)</div>
+          <div>Confidence: <strong id="cal-confidence">—</strong> <span id="cal-conf-detail" style="color:var(--text-light);">Need observations</span></div>
+        </div>
+        <div id="cal-range" style="font-size:12px;margin-top:4px;color:var(--text-light);">Manual estimate</div>
+      </div>
+
+      <!-- Manual Entry -->
+      <div style="font-size:13px;font-weight:600;margin-bottom:6px;">Record Observation</div>
+      <div class="row">
+        <div>
+          <label>Date &amp; Time</label>
+          <input type="datetime-local" id="obs_timestamp">
+        </div>
+        <div>
+          <label>State</label>
+          <select id="obs_state">
+            <option value="afloat">Afloat</option>
+            <option value="aground">Aground</option>
+          </select>
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label>Wind Direction (optional)</label>
+          <select id="obs_wind">
+            <option value="">Unknown</option>
+            <option>N</option><option>NE</option><option>E</option><option>SE</option>
+            <option>S</option><option>SW</option><option>W</option><option>NW</option>
+          </select>
+        </div>
+        <div>
+          <label>Direction of Lay — bow heading (optional)</label>
+          <select id="obs_lay">
+            <option value="">Unknown</option>
+            <option>N</option><option>NE</option><option>E</option><option>SE</option>
+            <option>S</option><option>SW</option><option>W</option><option>NW</option>
+          </select>
+        </div>
+      </div>
+      <button class="btn-primary btn-sm" onclick="submitObservation()">Record Observation</button>
+
+      <!-- XLSX Import -->
+      <div style="margin-top:12px;border-top:1px solid var(--border);padding-top:12px;">
+        <div style="font-size:13px;font-weight:600;margin-bottom:6px;">Batch Import</div>
+        <p style="font-size:12px;color:var(--text-light);margin-bottom:6px;">
+          Upload an XLSX file to import multiple observations at once.
+          <a href="/api/observations/template" style="color:var(--sea);">Download template</a>
+        </p>
+        <input type="file" id="obs_file" accept=".xlsx" onchange="uploadObsXlsx()" style="font-size:12px;">
+      </div>
+
+      <div id="obs-status" class="mt-8"></div>
+      <div id="obs-list" class="mt-8"></div>
+      <div id="obs-clear-section" class="hidden mt-8">
+        <button class="btn-sm" style="background:var(--warn);color:#fff;" onclick="clearAllObservations()">Clear All Observations</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Data Source & Calculate Panel -->
+  <div class="panel">
+    <div class="panel-header" onclick="togglePanel('calc')">
+      Calculate Access Windows <span class="toggle" id="calc-toggle">▼</span>
+    </div>
+    <div class="panel-body" id="calc-body">
+      <div class="btn-group mb-8">
+        <button class="btn-primary" onclick="showUkho()">UKHO (7 days)</button>
+        <button class="btn-sea" onclick="showKhmPaste()">KHM Paste (30 days)</button>
+        <button class="btn-warn" onclick="showHarmonic()">Harmonic (long range)</button>
+      </div>
+
+      <!-- UKHO section -->
+      <div id="ukho-section" class="hidden">
+        <p style="font-size:12px;color:var(--text-light);margin-bottom:8px;">
+          Tidal predictions from the UK Hydrographic Office (Admiralty) for Langstone Harbour.
+          UKHO data covers the next 7 days and is the most accurate source available.
+        </p>
+        <div class="btn-group">
+          <button class="btn-primary" onclick="calculate('ukho')">Calculate Access Windows</button>
+          <button class="btn-sm btn-primary" onclick="fetchUkhoNow()">Refresh UKHO Data</button>
+        </div>
+      </div>
+
+      <!-- KHM paste area -->
+      <div id="khm-section" class="hidden">
+        <p style="font-size:12px;margin-bottom:8px;">
+          Copy the table rows from
+          <a href="https://www.royalnavy.mod.uk/khm/portsmouth/port-information/tide-tables" target="_blank" style="color:var(--sea)">Royal Navy KHM Portsmouth</a>.
+          Select the table rows and paste below. Tab-separated, 13 columns.
+        </p>
+        <div class="row" style="margin-bottom:8px;">
+          <div>
+            <label>Timezone of KHM data</label>
+            <select id="khm-tz">
+              <option value="BST" selected>BST (UTC+1) — default for KHM</option>
+              <option value="GMT">GMT (UTC+0)</option>
+            </select>
+          </div>
+          <div>
+            <label>Year (if not in date column)</label>
+            <input type="number" id="khm-year" value="2026" min="2024" max="2030" style="width:100px">
+          </div>
+        </div>
+        <textarea id="khm-text" placeholder="14/04&#9;06:12&#9;10:10&#9;4&#9;03:16&#9;1.6&#9;22:38&#9;4.3&#9;15:30&#9;1.3&#9;19:58&#9;2.7&#9;40%"></textarea>
+        <div class="btn-group">
+          <button class="btn-sea" onclick="submitKhm()">Parse &amp; Calculate</button>
+        </div>
+      </div>
+
+      <!-- Harmonic range selector -->
+      <div id="harmonic-section" class="hidden">
+        <p style="font-size:12px;color:var(--text-light);margin-bottom:8px;">
+          Approximate predictions from a built-in harmonic model. Less accurate than UKHO but available for any date range.
+        </p>
+        <div class="row-tight">
+          <div>
+            <label>Days Ahead</label>
+            <input type="number" id="harmonic_days" value="30" min="7" max="365" style="width:80px">
+          </div>
+          <button class="btn-warn" onclick="calculate('harmonic')">Calculate</button>
+        </div>
+      </div>
+
+      <div id="calc-status"></div>
+    </div>
+  </div>
+
+  <!-- Results Panel -->
+  <div class="panel">
+    <div class="panel-header" onclick="togglePanel('results')">
+      Access Windows <span class="toggle" id="results-toggle">▼</span>
+    </div>
+    <div class="panel-body" id="results-body">
+      <div id="wind-info-display"></div>
+      <div id="results-content">
+        <p style="color:var(--text-light);font-size:13px;">
+          Select a data source above and calculate to see access windows.
+        </p>
+      </div>
+      <div class="btn-group hidden" id="results-actions">
+        <button class="btn-primary" onclick="exportIcs()">Download .ICS</button>
+        <button class="btn-ok hidden" id="btn-add-feed" onclick="addToFeed()">Add to Calendar Feed</button>
+      </div>
+    </div>
+  </div>
+
+  </div><!-- end #view-main -->
+
+  <!-- System Activity view -->
+  <div class="view" id="view-system">
+    <div class="panel">
+      <div class="panel-header" style="cursor:default;">
+        System Activity <span style="font-size:11px;opacity:0.8;">Last 30 days</span>
+      </div>
+      <div class="panel-body">
+        <div class="row" style="margin-bottom:10px;">
+          <div>
+            <label>Event Type</label>
+            <select id="sys-filter-type" onchange="loadSystemLog()">
+              <option value="">All</option>
+              <option value="scheduler_start">Scheduler Start</option>
+              <option value="ukho_fetch">UKHO Fetch</option>
+              <option value="khm_parse">KHM Parse</option>
+              <option value="wind_schedule">Wind Scheduling</option>
+              <option value="wind_check">Wind Check</option>
+              <option value="daily_scheduler">Daily Summary</option>
+            </select>
+          </div>
+          <div>
+            <label>Severity</label>
+            <select id="sys-filter-sev" onchange="loadSystemLog()">
+              <option value="">All</option>
+              <option value="info">Info</option>
+              <option value="success">Success</option>
+              <option value="warning">Warning</option>
+              <option value="error">Error</option>
+            </select>
+          </div>
+          <div style="flex:0;align-self:end;">
+            <button class="btn-sm btn-primary" onclick="loadSystemLog()">Refresh</button>
+          </div>
+        </div>
+        <div id="sys-log-container">
+          <p style="color:var(--text-light);font-size:12px;">Loading...</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Mooring Configs view -->
+  <div class="view" id="view-moorings">
+    <div class="panel">
+      <div class="panel-header" style="cursor:default;">Configured Moorings</div>
+      <div class="panel-body">
+        <div id="moorings-list">
+          <p style="color:var(--text-light);font-size:12px;">Loading...</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div><!-- end container -->
+
+<script>
+// State
+let lastWindows = [];
+let lastSource = '';
+
+// --- Panel toggle ---
+function togglePanel(id) {
+  const body = document.getElementById(id + '-body');
+  const toggle = document.getElementById(id + '-toggle');
+  body.classList.toggle('collapsed');
+  toggle.textContent = body.classList.contains('collapsed') ? '▶' : '▼';
+}
+
+function toggleWindConfig() {
+  document.getElementById('wind-config').classList.toggle('hidden',
+    !document.getElementById('wind_offset_enabled').checked);
+}
+
+function updateMooringOptions() {
+  const mid = document.getElementById('mooring_id').value;
+  document.getElementById('mooring-options').classList.toggle('hidden', !mid);
+}
+
+function hideAllSourceSections() {
+  document.getElementById('ukho-section').classList.add('hidden');
+  document.getElementById('khm-section').classList.add('hidden');
+  document.getElementById('harmonic-section').classList.add('hidden');
+}
+function showUkho() {
+  hideAllSourceSections();
+  document.getElementById('ukho-section').classList.remove('hidden');
+}
+function showKhmPaste() {
+  hideAllSourceSections();
+  document.getElementById('khm-section').classList.remove('hidden');
+}
+function showHarmonic() {
+  hideAllSourceSections();
+  document.getElementById('harmonic-section').classList.remove('hidden');
+}
+
+// --- Config ---
+function getConfig() {
+  return {
+    mooring_id: parseInt(document.getElementById('mooring_id').value) || null,
+    boat_name: document.getElementById('boat_name').value,
+    draught_m: parseFloat(document.getElementById('draught_m').value) || 1.0,
+    drying_height_m: parseFloat(document.getElementById('drying_height_m').value) || 2.0,
+    safety_margin_m: parseFloat(document.getElementById('safety_margin_m').value) || 0.3,
+    wind_offset_enabled: document.getElementById('wind_offset_enabled').checked ? 1 : 0,
+    shallow_direction: document.getElementById('shallow_direction').value,
+    shallow_extra_depth_m: parseFloat(document.getElementById('shallow_extra_depth_m').value) || 0,
+    calendar_enabled: document.getElementById('calendar_enabled').checked ? 1 : 0,
+    use_observations: document.getElementById('use_observations').checked ? 1 : 0,
+  };
+}
+
+function setConfig(cfg) {
+  if (cfg.mooring_id) document.getElementById('mooring_id').value = cfg.mooring_id;
+  if (cfg.boat_name) document.getElementById('boat_name').value = cfg.boat_name;
+  document.getElementById('draught_m').value = cfg.draught_m || 1.0;
+  document.getElementById('drying_height_m').value = cfg.drying_height_m || 2.0;
+  document.getElementById('safety_margin_m').value = cfg.safety_margin_m || 0.3;
+  document.getElementById('wind_offset_enabled').checked = !!cfg.wind_offset_enabled;
+  document.getElementById('shallow_direction').value = cfg.shallow_direction || '';
+  document.getElementById('shallow_extra_depth_m').value = cfg.shallow_extra_depth_m || 0;
+  document.getElementById('calendar_enabled').checked = !!cfg.calendar_enabled;
+  document.getElementById('use_observations').checked = !!cfg.use_observations;
+  toggleWindConfig();
+  updateMooringOptions();
+  updateFeedUrl(cfg);
+  toggleObsPanel();
+}
+
+function updateFeedUrl(cfg) {
+  const section = document.getElementById('feed-url-section');
+  if (cfg.mooring_id && cfg.calendar_enabled) {
+    const url = window.location.origin + '/feeds/mooring_' + cfg.mooring_id + '.ics';
+    document.getElementById('feed-url').textContent = url;
+    section.classList.remove('hidden');
+  } else {
+    section.classList.add('hidden');
+  }
+}
+
+async function saveConfig() {
+  const cfg = getConfig();
+  if (!cfg.mooring_id) {
+    showStatus('cfg-status', 'Mooring ID is required to save configuration.', 'err');
+    return;
+  }
+  try {
+    const res = await fetch('/api/moorings', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(cfg)
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Save failed');
+    showStatus('cfg-status', `Configuration saved for Mooring ${cfg.mooring_id}.`, 'ok');
+    updateFeedUrl(cfg);
+    toggleObsPanel();
+  } catch(e) {
+    showStatus('cfg-status', e.message, 'err');
+  }
+}
+
+async function loadConfig() {
+  const mid = document.getElementById('mooring_id').value;
+  if (!mid) {
+    showStatus('cfg-status', 'Enter a Mooring ID to load.', 'err');
+    return;
+  }
+  try {
+    const res = await fetch('/api/moorings/' + mid);
+    if (res.status === 404) throw new Error('Mooring not found');
+    const data = await res.json();
+    setConfig(data);
+    showStatus('cfg-status', `Loaded configuration for Mooring ${mid}.`, 'ok');
+    toggleObsPanel();
+  } catch(e) {
+    showStatus('cfg-status', e.message, 'err');
+  }
+}
+
+// --- Calculation ---
+async function calculate(source) {
+  const cfg = getConfig();
+  const body = {
+    source: source,
+    draught_m: cfg.draught_m,
+    drying_height_m: cfg.drying_height_m,
+    safety_margin_m: cfg.safety_margin_m,
+    mooring_id: cfg.mooring_id,
+  };
+  if (source === 'harmonic') {
+    body.days = parseInt(document.getElementById('harmonic_days').value) || 30;
+  }
+  showStatus('calc-status', 'Calculating...', 'info');
+  try {
+    const res = await fetch('/api/calculate', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body)
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Calculation failed');
+
+    lastWindows = data.windows;
+    lastSource = source;
+    renderResults(data);
+    let msg = `${data.event_count} access window(s) from ${source.toUpperCase()} data.`;
+    if (data.feed_updated) msg += ' Calendar feed updated.';
+    showStatus('calc-status', msg, 'ok');
+  } catch(e) {
+    showStatus('calc-status', e.message, 'err');
+  }
+}
+
+async function fetchUkhoNow() {
+  showStatus('calc-status', 'Fetching UKHO data...', 'info');
+  try {
+    const res = await fetch('/api/fetch-ukho', {method:'POST'});
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Fetch failed');
+    showStatus('calc-status', `Fetched ${data.fetched} events from UKHO.`, 'ok');
+  } catch(e) {
+    showStatus('calc-status', e.message, 'err');
+  }
+}
+
+async function submitKhm() {
+  const text = document.getElementById('khm-text').value;
+  if (!text.trim()) {
+    showStatus('calc-status', 'Paste KHM data first.', 'err');
+    return;
+  }
+  const isBst = document.getElementById('khm-tz').value === 'BST';
+  const year = parseInt(document.getElementById('khm-year').value) || 2026;
+  showStatus('calc-status', 'Parsing KHM data...', 'info');
+  try {
+    const res = await fetch('/api/parse-khm', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({text: text, year: year, is_bst: isBst})
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Parse failed');
+    showStatus('calc-status', `Parsed ${data.parsed} events (Langstone corrections applied). Calculating...`, 'ok');
+    hideAllSourceSections();
+    await calculate('khm');
+  } catch(e) {
+    showStatus('calc-status', e.message, 'err');
+  }
+}
+
+// --- Results ---
+function renderResults(data) {
+  const container = document.getElementById('results-content');
+  const windDisplay = document.getElementById('wind-info-display');
+  const actionsDiv = document.getElementById('results-actions');
+  const addBtn = document.getElementById('btn-add-feed');
+
+  // Wind info
+  if (data.wind_info && data.wind_info.applied) {
+    windDisplay.innerHTML = `<div class="wind-info">
+      Wind offset applied: wind from <b>${data.wind_info.direction}</b>,
+      shallow water to <b>${data.wind_info.shallow_side}</b>
+      — added ${data.wind_info.offset_m}m to drying height.
+    </div>`;
+  } else {
+    windDisplay.innerHTML = '';
+  }
+
+  const windows = data.windows || [];
+  if (!windows.length) {
+    container.innerHTML = '<p style="color:var(--text-light)">No access windows found.</p>';
+    actionsDiv.classList.add('hidden');
+    return;
+  }
+
+  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const fmt = (iso) => {
+    if (!iso) return '—';
+    const d = new Date(iso);
+    return d.toLocaleDateString('en-GB', {weekday:'short', day:'numeric', month:'short'}) +
+      ' ' + d.toLocaleTimeString('en-GB', {hour:'2-digit', minute:'2-digit'});
+  };
+  const fmtTime = (iso) => {
+    if (!iso) return '—';
+    return new Date(iso).toLocaleTimeString('en-GB', {hour:'2-digit', minute:'2-digit'});
+  };
+
+  let html = '<table class="results-table"><thead><tr>' +
+    '<th>Date</th><th>HW Time</th><th>HW Height</th>' +
+    '<th>Access From</th><th>Access To</th><th>Duration</th><th>Source</th>' +
+    '</tr></thead><tbody>';
+
+  for (const w of windows) {
+    const cls = (w.below_threshold || w.incomplete_data) ? ' class="no-access"' : '';
+    const hwDate = new Date(w.hw_timestamp);
+    const dateStr = hwDate.toLocaleDateString('en-GB', {weekday:'short', day:'numeric', month:'short'});
+    const hwTime = fmtTime(w.hw_timestamp);
+    const src = w.source || data.source;
+    const badge = `<span class="source-badge source-${src}">${src.toUpperCase()}</span>`;
+    const windMark = w.wind_adjusted ? ' 💨' : '';
+
+    if (w.below_threshold) {
+      html += `<tr${cls}><td>${dateStr}</td><td>${hwTime}</td>` +
+        `<td>${w.hw_height_m?.toFixed(1) || '?'}m</td>` +
+        `<td colspan="3">Below threshold — no access</td><td>${badge}</td></tr>`;
+    } else if (w.incomplete_data) {
+      html += `<tr${cls}><td>${dateStr}</td><td>${hwTime}</td>` +
+        `<td>${w.hw_height_m?.toFixed(1) || '?'}m</td>` +
+        `<td colspan="3">Insufficient data to compute window</td><td>${badge}</td></tr>`;
+    } else {
+      html += `<tr${cls}><td>${dateStr}</td><td>${hwTime}</td>` +
+        `<td>${w.hw_height_m?.toFixed(1) || '?'}m</td>` +
+        `<td>${fmtTime(w.start_time)}</td><td>${fmtTime(w.end_time)}</td>` +
+        `<td>${w.duration_minutes} min${windMark}</td><td>${badge}</td></tr>`;
+    }
+  }
+  html += '</tbody></table>';
+  container.innerHTML = html;
+
+  // Show action buttons
+  actionsDiv.classList.remove('hidden');
+  const cfg = getConfig();
+  // "Add to Calendar Feed" only needed when mooring is set but calendar subscription
+  // is not enabled — when enabled, the feed auto-updates on every calculation.
+  if (cfg.mooring_id && !cfg.calendar_enabled) {
+    addBtn.classList.remove('hidden');
+  } else {
+    addBtn.classList.add('hidden');
+  }
+}
+
+// --- Export ---
+async function exportIcs() {
+  const cfg = getConfig();
+  try {
+    const res = await fetch('/api/export-ics', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        windows: lastWindows,
+        source: lastSource,
+        boat_name: cfg.boat_name,
+        mooring_id: cfg.mooring_id,
+      })
+    });
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'tidal_access.ics';
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch(e) {
+    showStatus('calc-status', 'Export failed: ' + e.message, 'err');
+  }
+}
+
+async function addToFeed() {
+  const cfg = getConfig();
+  if (!cfg.mooring_id) return;
+  try {
+    const res = await fetch('/api/calculate', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        source: lastSource,
+        draught_m: cfg.draught_m,
+        drying_height_m: cfg.drying_height_m,
+        safety_margin_m: cfg.safety_margin_m,
+        mooring_id: cfg.mooring_id,
+        add_to_feed: true,
+        days: lastSource === 'harmonic' ? (parseInt(document.getElementById('harmonic_days').value) || 30) : undefined,
+      })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Failed');
+    showStatus('calc-status', 'Events added to calendar feed.', 'ok');
+  } catch(e) {
+    showStatus('calc-status', e.message, 'err');
+  }
+}
+
+// --- Observations ---
+function toggleObsPanel() {
+  const cfg = getConfig();
+  const on = document.getElementById('use_observations').checked;
+  const panel = document.getElementById('obs-panel');
+  if (on && cfg.mooring_id) {
+    panel.classList.remove('hidden');
+    loadObservations(cfg.mooring_id);
+    loadCalibration(cfg.mooring_id);
+  } else {
+    panel.classList.add('hidden');
+    if (on && !cfg.mooring_id) {
+      showStatus('cfg-status', 'Enter a Mooring ID to use observational data.', 'info');
+    }
+  }
+}
+
+async function submitObservation() {
+  const cfg = getConfig();
+  if (!cfg.mooring_id) {
+    showStatus('obs-status', 'Configure a Mooring ID first.', 'err');
+    return;
+  }
+  const ts = document.getElementById('obs_timestamp').value;
+  if (!ts) {
+    showStatus('obs-status', 'Provide a date and time.', 'err');
+    return;
+  }
+  const body = {
+    timestamp: new Date(ts).toISOString(),
+    state: document.getElementById('obs_state').value,
+    wind_direction: document.getElementById('obs_wind').value,
+    direction_of_lay: document.getElementById('obs_lay').value,
+  };
+  try {
+    const res = await fetch(`/api/moorings/${cfg.mooring_id}/observations`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body)
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Failed');
+    let msg = 'Observation recorded.';
+    if (data.recalibrated) {
+      msg += ` Drying height recalibrated to ${data.calibration.best_estimate?.toFixed(2)}m.`;
+      document.getElementById('drying_height_m').value = data.calibration.best_estimate?.toFixed(2);
+    }
+    showStatus('obs-status', msg, 'ok');
+    loadObservations(cfg.mooring_id);
+    updateCalibrationDisplay(data.calibration);
+  } catch(e) {
+    showStatus('obs-status', e.message, 'err');
+  }
+}
+
+async function uploadObsXlsx() {
+  const cfg = getConfig();
+  if (!cfg.mooring_id) {
+    showStatus('obs-status', 'Configure a Mooring ID first.', 'err');
+    return;
+  }
+  const fileInput = document.getElementById('obs_file');
+  const file = fileInput.files[0];
+  if (!file) return;
+
+  showStatus('obs-status', 'Uploading...', 'info');
+  try {
+    const buf = await file.arrayBuffer();
+    const res = await fetch(`/api/moorings/${cfg.mooring_id}/observations/upload`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'},
+      body: buf
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Upload failed');
+    let msg = `Imported ${data.imported} observations.`;
+    if (data.errors > 0) msg += ` ${data.errors} rows skipped.`;
+    if (data.recalibrated) {
+      msg += ` Drying height recalibrated to ${data.calibration.best_estimate?.toFixed(2)}m.`;
+      document.getElementById('drying_height_m').value = data.calibration.best_estimate?.toFixed(2);
+    }
+    showStatus('obs-status', msg, data.imported > 0 ? 'ok' : 'err');
+    loadObservations(cfg.mooring_id);
+    updateCalibrationDisplay(data.calibration);
+    fileInput.value = '';
+  } catch(e) {
+    showStatus('obs-status', e.message, 'err');
+  }
+}
+
+async function loadCalibration(mooringId) {
+  try {
+    const res = await fetch(`/api/moorings/${mooringId}/calibration`);
+    const cal = await res.json();
+    updateCalibrationDisplay(cal);
+  } catch(e) { /* silent */ }
+}
+
+function updateCalibrationDisplay(cal) {
+  if (!cal) return;
+  const drying = parseFloat(document.getElementById('drying_height_m').value) || 0;
+  document.getElementById('cal-drying').textContent = drying.toFixed(2) + 'm';
+  document.getElementById('cal-obs').textContent = (cal.afloat_count || 0) + (cal.aground_count || 0);
+  document.getElementById('cal-obs-detail').textContent =
+    `${cal.afloat_count || 0} afloat, ${cal.aground_count || 0} aground` +
+    (cal.unmatched ? `, ${cal.unmatched} unmatched` : '');
+
+  const confSymbols = {
+    'high': '●●●', 'medium': '●●○', 'low': '●○○',
+    'partial-low': '●○○', 'partial-high': '●○○',
+    'inconsistent': '⚠', 'none': '—'
+  };
+  const confDesc = {
+    'high': 'Bounds < 0.2m apart',
+    'medium': 'Bounds < 0.5m apart',
+    'low': 'Bounds > 0.5m apart',
+    'partial-low': 'Only aground data',
+    'partial-high': 'Only afloat data',
+    'inconsistent': 'Bounds conflict!',
+    'none': 'Need observations'
+  };
+  document.getElementById('cal-confidence').textContent = confSymbols[cal.confidence] || '—';
+  document.getElementById('cal-conf-detail').textContent = confDesc[cal.confidence] || '';
+
+  const rangeEl = document.getElementById('cal-range');
+  if (cal.lower_bound !== null && cal.upper_bound !== null) {
+    rangeEl.textContent = `Estimated range: ${cal.lower_bound.toFixed(2)} – ${cal.upper_bound.toFixed(2)}m`;
+  } else if (cal.lower_bound !== null) {
+    rangeEl.textContent = `Estimated: > ${cal.lower_bound.toFixed(2)}m`;
+  } else if (cal.upper_bound !== null) {
+    rangeEl.textContent = `Estimated: < ${cal.upper_bound.toFixed(2)}m`;
+  } else {
+    rangeEl.textContent = 'Manual estimate';
+  }
+}
+
+async function loadObservations(mooringId) {
+  try {
+    const res = await fetch(`/api/moorings/${mooringId}/observations`);
+    const data = await res.json();
+    const list = document.getElementById('obs-list');
+    const clearSection = document.getElementById('obs-clear-section');
+    if (!data.length) {
+      list.innerHTML = '<p style="color:var(--text-light);font-size:12px;">No observations recorded.</p>';
+      clearSection.classList.add('hidden');
+      return;
+    }
+    clearSection.classList.remove('hidden');
+    list.innerHTML = data.map(o => {
+      const d = new Date(o.timestamp);
+      const ds = d.toLocaleDateString('en-GB', {day:'numeric',month:'short',year:'numeric'});
+      const ts = d.toLocaleTimeString('en-GB', {hour:'2-digit',minute:'2-digit'});
+      let detail = `${ds} ${ts} — <b>${o.state}</b>`;
+      if (o.wind_direction) detail += ` | Wind: ${o.wind_direction}`;
+      if (o.direction_of_lay) detail += ` | Lay: ${o.direction_of_lay}`;
+      detail += ` <button class="btn-sm" style="background:transparent;color:var(--warn);border:1px solid var(--warn);padding:1px 6px;font-size:11px;margin-left:8px;" onclick="deleteObservation(${o.id})">✕</button>`;
+      return `<div class="obs-item">${detail}</div>`;
+    }).join('');
+  } catch(e) { /* silent */ }
+}
+
+async function deleteObservation(obsId) {
+  const cfg = getConfig();
+  if (!cfg.mooring_id) return;
+  try {
+    const res = await fetch(`/api/moorings/${cfg.mooring_id}/observations/${obsId}`, {
+      method: 'DELETE'
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Failed');
+    showStatus('obs-status', 'Observation deleted.', 'ok');
+    loadObservations(cfg.mooring_id);
+    if (data.calibration) updateCalibrationDisplay(data.calibration);
+  } catch(e) {
+    showStatus('obs-status', e.message, 'err');
+  }
+}
+
+async function clearAllObservations() {
+  const cfg = getConfig();
+  if (!cfg.mooring_id) return;
+  if (!confirm('Delete all observations for this mooring? This cannot be undone.')) return;
+  try {
+    const res = await fetch(`/api/moorings/${cfg.mooring_id}/observations`, {
+      method: 'DELETE'
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Failed');
+    showStatus('obs-status', `Cleared ${data.deleted_count} observations.`, 'ok');
+    loadObservations(cfg.mooring_id);
+    if (data.calibration) updateCalibrationDisplay(data.calibration);
+  } catch(e) {
+    showStatus('obs-status', e.message, 'err');
+  }
+}
+
+// --- Utility ---
+function showStatus(id, msg, type) {
+  const el = document.getElementById(id);
+  el.className = 'status status-' + type;
+  el.textContent = msg;
+  if (type === 'ok') setTimeout(() => el.textContent = '', 5000);
+}
+
+// Set default observation timestamp to now
+document.getElementById('obs_timestamp').value =
+  new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+
+// Check config status on page load
+(async function init() {
+  try {
+    const res = await fetch('/api/config/status');
+    const status = await res.json();
+    if (status.owm_available) {
+      document.getElementById('wind-section').classList.remove('hidden');
+    }
+  } catch(e) { /* wind section stays hidden */ }
+})();
+
+// --- Tab switching ---
+function switchView(viewName) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+  document.querySelector(`.tab[data-view="${viewName}"]`).classList.add('active');
+  document.getElementById(`view-${viewName}`).classList.add('active');
+  if (viewName === 'system') loadSystemLog();
+  if (viewName === 'moorings') loadMooringConfigs();
+}
+
+// --- Time formatting for logs ---
+function fmtLogTime(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  const date = d.toLocaleDateString('en-GB', {day:'2-digit', month:'short'});
+  const time = d.toLocaleTimeString('en-GB', {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+  return `${date} ${time}`;
+}
+
+function escapeHtml(s) {
+  if (s == null) return '';
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function renderLogEntries(entries, container) {
+  if (!entries.length) {
+    container.innerHTML = '<p style="color:var(--text-light);font-size:12px;">No entries.</p>';
+    return;
+  }
+  let html = '<table class="log-table"><thead><tr>' +
+    '<th style="width:130px;">Time</th><th style="width:80px;">Severity</th>' +
+    '<th style="width:140px;">Event</th><th>Message</th></tr></thead><tbody>';
+  entries.forEach((e, i) => {
+    const sev = e.severity || 'info';
+    const detailsId = `details-${e.id}`;
+    const hasDetails = e.details && Object.keys(e.details).length > 0;
+    const detailsLink = hasDetails
+      ? ` <span class="details-toggle" onclick="toggleDetails('${detailsId}')">details</span>`
+      : '';
+    html += `<tr class="log-row severity-${sev}">` +
+      `<td>${fmtLogTime(e.timestamp)}</td>` +
+      `<td><span class="sev-badge sev-${sev}">${sev}</span></td>` +
+      `<td>${escapeHtml(e.event_type)}</td>` +
+      `<td>${escapeHtml(e.message)}${detailsLink}` +
+      (hasDetails
+        ? `<div class="details-content" id="${detailsId}">${escapeHtml(JSON.stringify(e.details, null, 2))}</div>`
+        : '') +
+      `</td></tr>`;
+  });
+  html += '</tbody></table>';
+  container.innerHTML = html;
+}
+
+function toggleDetails(id) {
+  document.getElementById(id).classList.toggle('shown');
+}
+
+async function loadSystemLog() {
+  const type = document.getElementById('sys-filter-type').value;
+  const sev = document.getElementById('sys-filter-sev').value;
+  const params = new URLSearchParams({scope: 'system', limit: '500'});
+  if (type) params.append('event_type', type);
+  if (sev) params.append('severity', sev);
+  try {
+    const res = await fetch(`/api/activity-log?${params}`);
+    const entries = await res.json();
+    renderLogEntries(entries, document.getElementById('sys-log-container'));
+  } catch(e) {
+    document.getElementById('sys-log-container').innerHTML =
+      `<p style="color:var(--warn);font-size:12px;">Failed to load: ${escapeHtml(e.message)}</p>`;
+  }
+}
+
+async function loadMooringConfigs() {
+  const container = document.getElementById('moorings-list');
+  try {
+    const res = await fetch('/api/moorings');
+    const moorings = await res.json();
+    if (!moorings.length) {
+      container.innerHTML = '<p style="color:var(--text-light);font-size:12px;">No moorings configured.</p>';
+      return;
+    }
+    let html = '';
+    for (const m of moorings) {
+      const name = m.boat_name || '<span style="color:var(--text-light);">(unnamed)</span>';
+      html += `<div class="mooring-card">` +
+        `<h3>Mooring #${m.mooring_id} — ${name}</h3>` +
+        `<div class="config-grid">` +
+          `<div><span class="label">Draught:</span> <span class="value">${m.draught_m.toFixed(2)}m</span></div>` +
+          `<div><span class="label">Drying height:</span> <span class="value">${m.drying_height_m.toFixed(2)}m</span></div>` +
+          `<div><span class="label">Safety margin:</span> <span class="value">${m.safety_margin_m.toFixed(2)}m</span></div>` +
+          `<div><span class="label">Calendar feed:</span> <span class="value">${m.calendar_enabled ? 'Enabled' : 'Disabled'}</span></div>` +
+          `<div><span class="label">Observational data:</span> <span class="value">${m.use_observations ? 'Enabled' : 'Disabled'}</span></div>` +
+          `<div><span class="label">Wind offset:</span> <span class="value">${m.wind_offset_enabled ? 'Enabled' : 'Disabled'}</span></div>` +
+        `</div>`;
+      if (m.wind_offset_enabled && m.shallow_direction) {
+        html += `<div style="font-size:12px;margin-top:6px;color:var(--text-light);">` +
+          `Shallow side: <b>${m.shallow_direction}</b>, extra drying: <b>+${(m.shallow_extra_depth_m || 0).toFixed(2)}m</b>` +
+          `</div>`;
+      }
+      html += `<div style="margin-top:10px;"><div style="font-size:12px;font-weight:600;color:var(--navy);margin-bottom:4px;">Activity (last 7 days)</div>` +
+        `<div id="mooring-activity-${m.mooring_id}" style="font-size:12px;"><em style="color:var(--text-light);">Loading...</em></div>` +
+        `</div></div>`;
+    }
+    container.innerHTML = html;
+
+    // Fetch activity for each mooring in parallel
+    for (const m of moorings) {
+      fetch(`/api/activity-log?scope=mooring&mooring_id=${m.mooring_id}&limit=100`)
+        .then(r => r.json())
+        .then(entries => {
+          const target = document.getElementById(`mooring-activity-${m.mooring_id}`);
+          if (!target) return;
+          if (!entries.length) {
+            target.innerHTML = '<em style="color:var(--text-light);">No recent activity.</em>';
+            return;
+          }
+          let rows = entries.map(e => {
+            const sev = e.severity || 'info';
+            return `<div style="padding:3px 0;border-bottom:1px solid var(--border);">` +
+              `<span class="sev-badge sev-${sev}">${sev}</span> ` +
+              `<span style="color:var(--text-light);">${fmtLogTime(e.timestamp)}</span> — ` +
+              `${escapeHtml(e.message)}</div>`;
+          }).join('');
+          target.innerHTML = rows;
+        })
+        .catch(() => {
+          const target = document.getElementById(`mooring-activity-${m.mooring_id}`);
+          if (target) target.innerHTML = '<em style="color:var(--warn);">Failed to load activity.</em>';
+        });
+    }
+  } catch(e) {
+    container.innerHTML = `<p style="color:var(--warn);font-size:12px;">Failed: ${escapeHtml(e.message)}</p>`;
+  }
+}
+</script>
+
+</body>
+</html>

@@ -1,0 +1,31 @@
+services:
+  tidal-access:
+    build: .
+    container_name: tidal-access
+    ports:
+      - "${PORT:-8866}:8866"
+    volumes:
+      - tidal-data:/app/data
+    env_file:
+      - .env
+    restart: unless-stopped
+
+  # HTTPS via Cloudflare Tunnel — only starts with: docker compose --profile https up -d
+  # No inbound ports needed. Requires a tunnel token from Cloudflare Zero Trust dashboard.
+  # See README for setup instructions.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    profiles: ["https"]
+    container_name: tidal-access-tunnel
+    command:
+      - tunnel
+      - --no-autoupdate
+      - run
+      - --token
+      - "${CLOUDFLARE_TUNNEL_TOKEN}"
+    depends_on:
+      - tidal-access
+    restart: unless-stopped
+
+volumes:
+  tidal-data:
