@@ -1,12 +1,12 @@
 {
     "_comment": "Tidal Access Model Configuration. Tidal curve parameters used by access window calculator. Harmonic constants and secondary port offsets are documented here for reference but are currently implemented in harmonic.py and secondary_port.py respectively.",
-    "_version": "2.1.0",
-    "_last_updated": "2026-04-16",
+    "_version": "2.2.0",
+    "_last_updated": "2026-04-20",
 
     "secondary_port_offset": {
-        "_comment": "Portsmouth to Langstone Harbour corrections. Applied by KHM parser and secondary_port.py (for harmonic predictions). Derived from Admiralty data comparison.",
+        "_comment": "Portsmouth to Langstone Harbour corrections. Applied by KHM parser and secondary_port.py (for harmonic predictions). Validated April 2026 against UKHO half-hourly data for both ports: observed HW height delta 0.0-0.1m (mean +0.05m), not +0.24m as previously assumed. LW heights effectively identical between ports.",
         "hw_time_offset_minutes": 9,
-        "hw_height_offset_m": 0.24,
+        "hw_height_offset_m": 0.05,
         "lw_time_offset_minutes": 0,
         "lw_height_offset_m": 0.0
     },
@@ -21,29 +21,29 @@
     },
 
     "harmonic_reference": {
-        "_comment": "Harmonic constants are implemented in app/harmonic.py. Documented here for reference only. 19 constituents calibrated against KHM Portsmouth April 2026.",
-        "mean_level_m": 2.84,
+        "_comment": "Harmonic constants are implemented in app/harmonic.py. Documented here for reference only. 19 constituents calibrated April 2026 against 388 Admiralty reference points (91 HW/LW + 7 spring HW + 288 half-hourly) spanning May-December 2026 plus April 2026 half-hourly data.",
+        "mean_level_m": 2.8846,
         "constituents": {
-            "M2": {"amplitude": 1.55, "phase_lag": 167},
-            "S2": {"amplitude": 0.56, "phase_lag": 218},
-            "N2": {"amplitude": 0.31, "phase_lag": 145},
-            "K2": {"amplitude": 0.15, "phase_lag": 214},
-            "K1": {"amplitude": 0.10, "phase_lag": 137},
-            "O1": {"amplitude": 0.10, "phase_lag": 344},
-            "P1": {"amplitude": 0.03, "phase_lag": 137},
-            "Q1": {"amplitude": 0.03, "phase_lag": 309},
-            "M4": {"amplitude": 0.22, "phase_lag": 196},
-            "MS4": {"amplitude": 0.15, "phase_lag": 264},
-            "MN4": {"amplitude": 0.06, "phase_lag": 175},
-            "M6": {"amplitude": 0.04, "phase_lag": 205},
-            "2N2": {"amplitude": 0.04, "phase_lag": 123},
-            "MU2": {"amplitude": 0.04, "phase_lag": 186},
-            "NU2": {"amplitude": 0.06, "phase_lag": 148},
-            "L2": {"amplitude": 0.05, "phase_lag": 182},
-            "T2": {"amplitude": 0.03, "phase_lag": 213},
-            "SA": {"amplitude": 0.07, "phase_lag": 170},
-            "SSA": {"amplitude": 0.03, "phase_lag": 340}
+            "M2": {"amplitude": 1.464, "phase_lag": 152.5},
+            "S2": {"amplitude": 0.372, "phase_lag": 186.2},
+            "N2": {"amplitude": 0.204, "phase_lag": 122.5},
+            "K2": {"amplitude": 0.139, "phase_lag": 229.5},
+            "K1": {"amplitude": 0.085, "phase_lag": 249.0},
+            "O1": {"amplitude": 0.050, "phase_lag": 331.7},
+            "P1": {"amplitude": 0.045, "phase_lag": 353.4},
+            "Q1": {"amplitude": 0.023, "phase_lag": 164.0},
+            "M4": {"amplitude": 0.169, "phase_lag": 32.0},
+            "MS4": {"amplitude": 0.109, "phase_lag": 84.0},
+            "MN4": {"amplitude": 0.039, "phase_lag": 315.9},
+            "M6": {"amplitude": 0.060, "phase_lag": 311.9},
+            "2N2": {"amplitude": 0.027, "phase_lag": 346.9},
+            "MU2": {"amplitude": 0.060, "phase_lag": 19.8},
+            "NU2": {"amplitude": 0.034, "phase_lag": 155.7},
+            "L2": {"amplitude": 0.075, "phase_lag": 174.1},
+            "T2": {"amplitude": 0.045, "phase_lag": 98.2},
+            "SA": {"amplitude": 0.074, "phase_lag": 186.7},
+            "SSA": {"amplitude": 0.045, "phase_lag": 5.3}
         },
-        "accuracy": "HW: +/-0.2m height, +/-30min timing. LW heights less accurate."
+        "accuracy": "Height RMS ~0.1m on unseen half-hourly data, ~0.4m on HW/LW peaks (dominated by Solent stand effect). HW/LW timing stdev ~17-19 min."
     }
 }

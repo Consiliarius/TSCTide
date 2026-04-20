@@ -118,11 +118,12 @@ def parse_khm_paste(text: str, year: int = None, is_bst: bool = True) -> list[di
             adjusted_ht = ht
 
             # Secondary port correction: KHM data is for Portsmouth.
-            # Langstone HW is ~9 min later and ~0.24m higher (from Admiralty data comparison).
-            # LW times and heights are effectively identical.
+            # Langstone HW is ~9 min later and ~0.05m higher (validated against
+            # UKHO half-hourly data for both ports, April 2026 — previously
+            # assumed +0.24m was too high). LW times/heights effectively identical.
             if p["type"] == "HighWater":
                 utc_dt = utc_dt + timedelta(minutes=9)
-                adjusted_ht = round(ht + 0.24, 1)
+                adjusted_ht = round(ht + 0.05, 1)
 
             events.append({
                 "timestamp": utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),

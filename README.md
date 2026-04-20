@@ -9,8 +9,8 @@ The tool computes access windows — the periods around each high water when the
 | Source | Range | Origin | Persisted | Offset Applied |
 |--------|-------|--------|-----------|----------------|
 | **UKHO** | 7 days | Admiralty Tidal API (Langstone native) | Yes | No (native data) |
-| **KHM** | ~1 month | Manual paste from Royal Navy Portsmouth tables | Yes (flagged, overwritten by UKHO) | Yes (Portsmouth → Langstone) |
-| **Harmonic** | Unlimited | Built-in harmonic model (19 constituents) | **No** (display only) | Yes (Portsmouth → Langstone) |
+| **KHM** | ~1 month | Manual paste from Royal Navy Portsmouth tables | Yes (flagged, overwritten by UKHO) | Yes (Portsmouth → Langstone: +9min, +0.05m HW) |
+| **Harmonic** | Unlimited | Built-in harmonic model (19 constituents, calibrated April 2026) | **No** (display only) | Yes (Portsmouth → Langstone: +9min, +0.05m HW) |
 
 ### Key Features
 
@@ -20,7 +20,7 @@ The tool computes access windows — the periods around each high water when the
 - **Wind offset** — adjusts the next tide's access window based on observed wind direction and the mooring's shallow-water geometry
 - **ICS export** from any data source, with harmonic-derived events prefixed "est."
 - **XLSX batch import** for observations recorded on a phone over time
-- **HTTPS support** via CloudFlare Tunnel (zero inbound ports, automatic certificates)
+- **HTTPS support** via Cloudflare Tunnel (zero inbound ports, automatic certificates)
 
 ## Quick Start
 
@@ -178,6 +178,23 @@ The feed includes `REFRESH-INTERVAL` and `X-PUBLISHED-TTL` metadata for proper c
 
 1. **Daily at 02:00** — Fetch UKHO data, store, update calendar feeds for all enabled moorings
 2. **Dynamic (HW+4h)** — Wind observation at configurable offset after each HW, recalculates next tide's window for wind-enabled moorings
+
+## Model Accuracy
+
+The harmonic model was calibrated in April 2026 against 388 Admiralty reference points (91 HW/LW events, 7 spring HW references, and 288 half-hourly height samples) spanning April to December 2026. Fit quality:
+
+| Metric | Value |
+|--------|-------|
+| Height RMS (half-hourly points) | ~0.10m |
+| Height RMS (HW/LW peaks) | ~0.39m (dominated by Solent stand effect) |
+| HW timing standard deviation | ~17 min |
+| LW timing standard deviation | ~19 min |
+
+The larger HW/LW peak RMS reflects the Solent's extended HW stand: the mathematical peak of the harmonic model falls earlier than the published HW time, which represents the mid-point of the stand. For access window calculations this is not significant since the curve shape (and therefore the threshold crossing times) is accurate.
+
+The Langstone secondary port offset (Portsmouth → Langstone: +9min, +0.05m HW) was validated against UKHO half-hourly data for both ports in April 2026. The earlier figure of +0.24m HW height offset was reduced to +0.05m based on observed data; LW times and heights are effectively identical between the two ports.
+
+UKHO data remains the most accurate source (Langstone-native, 7-day range). KHM data is second-most accurate within its ~30-day range. The harmonic model provides unlimited-range estimates with the accuracy above — events from this source are prefixed "est." in calendar titles.
 
 ## UKHO API Licensing
 

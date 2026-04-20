@@ -4,8 +4,8 @@ Secondary port offset: converts Portsmouth predictions to Langstone Harbour.
 Applied to harmonic model predictions only. KHM data has corrections applied
 within the KHM parser itself. UKHO Langstone data is native and needs no offset.
 
-Correction values (from Admiralty data comparison):
-  HW: +9 minutes, +0.24m
+Correction values (validated April 2026 against UKHO half-hourly data):
+  HW: +9 minutes, +0.05m
   LW: no time or height correction
 """
 
@@ -16,8 +16,13 @@ from app.config import to_utc_str
 
 
 # Langstone corrections relative to Portsmouth
+# Validated against April 2026 half-hourly UKHO data for both ports:
+# Height delta observed at six HW events ranged 0.0-0.1m (mean +0.05m), not +0.24m
+# as previously assumed. LW heights effectively identical (both ports 0.7-1.0m range).
+# Timing: Langstone HW lags Portsmouth HW by roughly 0-30min at half-hour resolution;
+# the +9min figure is consistent with this and retained.
 HW_TIME_OFFSET_MINUTES = 9
-HW_HEIGHT_OFFSET_M = 0.24
+HW_HEIGHT_OFFSET_M = 0.05
 LW_TIME_OFFSET_MINUTES = 0
 LW_HEIGHT_OFFSET_M = 0.0
 
