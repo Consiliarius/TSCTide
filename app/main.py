@@ -1,5 +1,5 @@
 """
-Tidal Access Window Predictor — FastAPI application.
+Tidal Access Window Predictor - FastAPI application.
 
 Single-page web app with API routes for configuration, calculation,
 data management, and iCal feed serving.
@@ -44,6 +44,22 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def _coalesce(*values, default):
+    """
+    Return the first value in *values that is not None, otherwise default.
+
+    Purpose: replaces truthiness-based `a or b` idiom where a legitimate
+    zero/empty/False value must not be overridden by a fallback. For example,
+    a drying_height_m of 0.0 or a negative value must survive unchanged.
+
+    Usage: _coalesce(data.get("x"), mooring["x"] if mooring else None, default=1.0)
+    """
+    for v in values:
+        if v is not None:
+            return v
+    return default
 
 
 @asynccontextmanager
@@ -127,7 +143,7 @@ async def save_mooring_config(request: Request):
     )
 
     # If calendar is enabled and events exist, regenerate the feed.
-    # Don't generate an empty feed on first config save — let the
+    # Don't generate an empty feed on first config save - let the
     # feed be generated when events are actually added.
     if result.get("calendar_enabled"):
         existing_events = get_calendar_events(mid)
@@ -230,7 +246,7 @@ async def add_mooring_observation(mooring_id: int, request: Request):
         log_activity(
             event_type="calibration_update",
             message=(
-                f"Drying height recalibrated: {previous_drying:.2f}m → "
+                f"Drying height recalibrated: {previous_drying:.2f}m -> "
                 f"{cal['best_estimate']:.2f}m ({cal['confidence']} confidence)"
             ),
             severity="success",
@@ -515,7 +531,7 @@ async def parse_khm_data(request: Request):
     if not text.strip():
         raise HTTPException(400, "No text provided")
 
-    # KHM parser applies Portsmouth→Langstone correction internally
+    # KHM parser applies Portsmouth->Langstone correction internally
     events = parse_khm_paste(text, year, is_bst=is_bst)
     if not events:
         raise HTTPException(400, "Could not parse any tide events from the pasted text")
@@ -562,16 +578,31 @@ async def calculate_access_windows(request: Request):
     if mooring_id:
         mooring = get_mooring(int(mooring_id))
 
-    draught = data.get("draught_m") or (mooring["draught_m"] if mooring else 1.0)
-    drying = data.get("drying_height_m") or (mooring["drying_height_m"] if mooring else 2.0)
-    margin = data.get("safety_margin_m") or (mooring["safety_margin_m"] if mooring else 0.3)
+    # Coalesce over (posted value, stored mooring value, hardcoded default)
+    # using is-None semantics so a legitimate zero or negative drying height
+    # is not replaced by the fallback. `a or b` would treat 0.0 as falsy.
+    draught = _coalesce(
+        data.get("draught_m"),
+        mooring["draught_m"] if mooring else None,
+        default=1.0,
+    )
+    drying = _coalesce(
+        data.get("drying_height_m"),
+        mooring["drying_height_m"] if mooring else None,
+        default=2.0,
+    )
+    margin = _coalesce(
+        data.get("safety_margin_m"),
+        mooring["safety_margin_m"] if mooring else None,
+        default=0.3,
+    )
 
     # Determine wind offset for next tide only.
     #
     # Wind settings: prefer POST body values when the client supplies them
     # (so unsaved toggle changes in the UI take effect immediately), falling
     # back to the stored mooring configuration otherwise. `is None` checks are
-    # used deliberately — a stored value of 0/"" must not be treated as "unset".
+    # used deliberately - a stored value of 0/"" must not be treated as "unset".
     wind_offset = 0.0
     wind_info = None
     wind_data = None
@@ -627,7 +658,7 @@ async def calculate_access_windows(request: Request):
         tide_source = "ukho"
 
     elif source == "khm":
-        # Use stored KHM data only — no mixing with UKHO
+        # Use stored KHM data only - no mixing with UKHO
         end = now + timedelta(days=60)
         events = get_tide_events(to_utc_str(query_start), to_utc_str(end), source="khm")
         tide_source = "khm"
@@ -647,7 +678,7 @@ async def calculate_access_windows(request: Request):
         return {"windows": [], "source": source, "event_count": 0, "message": "No tide data available"}
 
     # If wind offset applies, identify the NEXT HW so that the offset is only
-    # applied to that one window — a live wind observation is only a reasonable
+    # applied to that one window - a live wind observation is only a reasonable
     # predictor for conditions at the immediately-following HW, not for HWs
     # days into the future.
     next_hw_ts = None
@@ -668,7 +699,7 @@ async def calculate_access_windows(request: Request):
         source=tide_source,
     )
 
-    # Filter out windows for HW events before 'now' — these were included
+    # Filter out windows for HW events before 'now' - these were included
     # in the query only to provide interpolation context for the first real window.
     now_str = to_utc_str(now)
     windows = [w for w in windows if w["hw_timestamp"] >= now_str]
@@ -799,7 +830,7 @@ async def serve_feed(mooring_id: int):
     if not m:
         raise HTTPException(404, "Mooring not found")
 
-    # Always regenerate from current DB state — the feed is small
+    # Always regenerate from current DB state - the feed is small
     # and this ensures calendar apps never receive stale data.
     cal = calibrate_drying_height(mooring_id)
     if cal.get("confidence") == "none":

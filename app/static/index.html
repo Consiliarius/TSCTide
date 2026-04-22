@@ -167,6 +167,7 @@
   .results-table td { padding: 6px 10px; border-bottom: 1px solid var(--sand-dark); }
   .results-table tr:nth-child(even) { background: var(--sand); }
   .results-table tr.no-access { color: var(--text-light); font-style: italic; }
+  .results-table tr.always-afloat td { font-weight: 600; color: var(--ok); }
   .source-badge {
     display: inline-block; padding: 1px 6px; border-radius: 3px;
     font-size: 11px; font-weight: 600; color: #fff;
@@ -604,17 +605,29 @@ function showHarmonic() {
   document.getElementById('harmonic-section').classList.remove('hidden');
 }
 
+// --- Numeric input helper ---
+// Reads a number from an input element, distinguishing "empty/invalid" (use
+// default) from "legitimate zero or negative" (use the user's value).
+// Replaces the `parseFloat(x) || default` idiom which would wrongly swap
+// a genuine 0 for the default.
+function num(id, def) {
+  const raw = document.getElementById(id).value;
+  if (raw === '' || raw === null || raw === undefined) return def;
+  const n = parseFloat(raw);
+  return isNaN(n) ? def : n;
+}
+
 // --- Config ---
 function getConfig() {
   return {
     mooring_id: parseInt(document.getElementById('mooring_id').value) || null,
     boat_name: document.getElementById('boat_name').value,
-    draught_m: parseFloat(document.getElementById('draught_m').value) || 1.0,
-    drying_height_m: parseFloat(document.getElementById('drying_height_m').value) || 2.0,
-    safety_margin_m: parseFloat(document.getElementById('safety_margin_m').value) || 0.3,
+    draught_m: num('draught_m', 1.0),
+    drying_height_m: num('drying_height_m', 2.0),
+    safety_margin_m: num('safety_margin_m', 0.3),
     wind_offset_enabled: document.getElementById('wind_offset_enabled').checked ? 1 : 0,
     shallow_direction: document.getElementById('shallow_direction').value,
-    shallow_extra_depth_m: parseFloat(document.getElementById('shallow_extra_depth_m').value) || 0,
+    shallow_extra_depth_m: num('shallow_extra_depth_m', 0),
     calendar_enabled: document.getElementById('calendar_enabled').checked ? 1 : 0,
     use_observations: document.getElementById('use_observations').checked ? 1 : 0,
   };
@@ -623,12 +636,14 @@ function getConfig() {
 function setConfig(cfg) {
   if (cfg.mooring_id) document.getElementById('mooring_id').value = cfg.mooring_id;
   if (cfg.boat_name) document.getElementById('boat_name').value = cfg.boat_name;
-  document.getElementById('draught_m').value = cfg.draught_m || 1.0;
-  document.getElementById('drying_height_m').value = cfg.drying_height_m || 2.0;
-  document.getElementById('safety_margin_m').value = cfg.safety_margin_m || 0.3;
+  // Use ?? (nullish coalescing) so legitimate 0 or negative values from
+  // a stored config are not overridden by the defaults.
+  document.getElementById('draught_m').value = cfg.draught_m ?? 1.0;
+  document.getElementById('drying_height_m').value = cfg.drying_height_m ?? 2.0;
+  document.getElementById('safety_margin_m').value = cfg.safety_margin_m ?? 0.3;
   document.getElementById('wind_offset_enabled').checked = !!cfg.wind_offset_enabled;
   document.getElementById('shallow_direction').value = cfg.shallow_direction || '';
-  document.getElementById('shallow_extra_depth_m').value = cfg.shallow_extra_depth_m || 0;
+  document.getElementById('shallow_extra_depth_m').value = cfg.shallow_extra_depth_m ?? 0;
   document.getElementById('calendar_enabled').checked = !!cfg.calendar_enabled;
   document.getElementById('use_observations').checked = !!cfg.use_observations;
   toggleWindConfig();
@@ -805,7 +820,6 @@ function renderResults(data) {
     '</tr></thead><tbody>';
 
   for (const w of windows) {
-    const cls = (w.below_threshold || w.incomplete_data) ? ' class="no-access"' : '';
     const hwDate = new Date(w.hw_timestamp);
     const dateStr = hwDate.toLocaleDateString('en-GB', {weekday:'short', day:'numeric', month:'short'});
     const hwTime = fmtTime(w.hw_timestamp);
@@ -813,16 +827,22 @@ function renderResults(data) {
     const badge = `<span class="source-badge source-${src}">${src.toUpperCase()}</span>`;
     const windMark = w.wind_adjusted ? ' 💨' : '';
 
+    // States are mutually exclusive (set by backend): below_threshold,
+    // always_accessible, incomplete_data, or normal (none of the above).
     if (w.below_threshold) {
-      html += `<tr${cls}><td>${dateStr}</td><td>${hwTime}</td>` +
+      html += `<tr class="no-access"><td>${dateStr}</td><td>${hwTime}</td>` +
         `<td>${w.hw_height_m?.toFixed(1) || '?'}m</td>` +
         `<td colspan="3">Below threshold — no access</td><td>${badge}</td></tr>`;
+    } else if (w.always_accessible) {
+      html += `<tr class="always-afloat"><td>${dateStr}</td><td>${hwTime}</td>` +
+        `<td>${w.hw_height_m?.toFixed(1) || '?'}m</td>` +
+        `<td colspan="3">Always accessible — tide stays above threshold</td><td>${badge}</td></tr>`;
     } else if (w.incomplete_data) {
-      html += `<tr${cls}><td>${dateStr}</td><td>${hwTime}</td>` +
+      html += `<tr class="no-access"><td>${dateStr}</td><td>${hwTime}</td>` +
         `<td>${w.hw_height_m?.toFixed(1) || '?'}m</td>` +
         `<td colspan="3">Insufficient data to compute window</td><td>${badge}</td></tr>`;
     } else {
-      html += `<tr${cls}><td>${dateStr}</td><td>${hwTime}</td>` +
+      html += `<tr><td>${dateStr}</td><td>${hwTime}</td>` +
         `<td>${w.hw_height_m?.toFixed(1) || '?'}m</td>` +
         `<td>${fmtTime(w.start_time)}</td><td>${fmtTime(w.end_time)}</td>` +
         `<td>${w.duration_minutes} min${windMark}</td><td>${badge}</td></tr>`;
@@ -991,7 +1011,7 @@ async function loadCalibration(mooringId) {
 
 function updateCalibrationDisplay(cal) {
   if (!cal) return;
-  const drying = parseFloat(document.getElementById('drying_height_m').value) || 0;
+  const drying = num('drying_height_m', 0);
   document.getElementById('cal-drying').textContent = drying.toFixed(2) + 'm';
   document.getElementById('cal-obs').textContent = (cal.afloat_count || 0) + (cal.aground_count || 0);
   document.getElementById('cal-obs-detail').textContent =

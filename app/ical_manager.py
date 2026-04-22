@@ -6,15 +6,16 @@ and standalone .ics exports for download. Handles event lifecycle
 including source upgrades and wind-adjusted recalculations.
 
 Event title formats:
-  - No mooring: "Tidal Access (3½h)"
-  - Mooring number only: "Access to #27 (3½h)"
-  - Name present: "Kerry Dancer Afloat (3½h)"
+  - No mooring: "Tidal Access (3.5h)"
+  - Mooring number only: "Access to #27 (3.5h)"
+  - Name present: "Kerry Dancer Afloat (3.5h)"
   - Harmonic source prefixed with "est. "
+  - Always-accessible cycles: "Always afloat" (no duration)
 """
 
 import logging
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from icalendar import Calendar, Event
 from dateutil import parser as dtparse
@@ -25,8 +26,8 @@ from app.database import get_calendar_events, upsert_calendar_event, cleanup_sup
 
 logger = logging.getLogger(__name__)
 
-# Unicode fraction characters
-_QUARTER_FRACTIONS = {0: "", 1: "¼", 2: "½", 3: "¾"}
+# Unicode fraction characters for compact durations in event titles
+_QUARTER_FRACTIONS = {0: "", 1: "\u00bc", 2: "\u00bd", 3: "\u00be"}
 
 
 def format_duration(minutes: int) -> str:
@@ -34,7 +35,7 @@ def format_duration(minutes: int) -> str:
     Format duration in minutes as hours with unicode fractions,
     rounded down to the nearest quarter-hour.
 
-    Examples: 180→"3h", 195→"3¼h", 210→"3½h", 225→"3¾h", 183→"3h"
+    Examples: 180 -> "3h", 195 -> "3.25h", 210 -> "3.5h", 225 -> "3.75h".
     """
     total_quarters = math.floor(minutes / 15)
     whole_hours = total_quarters // 4
@@ -50,21 +51,33 @@ def build_event_title(window: dict, source: str,
     """
     Build event title based on configuration state and duration.
 
-    Title tiers:
+    Title tiers (normal windows):
       - No mooring, no name: "Tidal Access (Xh)"
       - Mooring number only: "Access to #N (Xh)"
-      - Name present (with or without mooring): "<Name> Afloat (Xh)"
+      - Name present (with or without mooring): "<n> Afloat (Xh)"
     Harmonic source prefixed with "est. "
+
+    Always-accessible windows get a dedicated title with no duration
+    (the concept doesn't apply to an unbounded window).
     """
     prefix = "est. " if source == "harmonic" else ""
+
+    if window.get("always_accessible"):
+        if boat_name:
+            return f"\u2693 {prefix}{boat_name} - Always afloat"
+        elif mooring_id:
+            return f"\u2693 {prefix}#{mooring_id} - Always afloat"
+        else:
+            return f"\u2693 {prefix}Always afloat"
+
     duration = format_duration(window.get("duration_minutes", 0))
 
     if boat_name:
-        return f"⚓ {prefix}{boat_name} Afloat ({duration})"
+        return f"\u2693 {prefix}{boat_name} Afloat ({duration})"
     elif mooring_id:
-        return f"⚓ {prefix}Access to #{mooring_id} ({duration})"
+        return f"\u2693 {prefix}Access to #{mooring_id} ({duration})"
     else:
-        return f"⚓ {prefix}Tidal Access ({duration})"
+        return f"\u2693 {prefix}Tidal Access ({duration})"
 
 
 def _build_description(ev_data: dict, tz, calibration: dict = None) -> str:
@@ -79,6 +92,9 @@ def _build_description(ev_data: dict, tz, calibration: dict = None) -> str:
 
     if ev_data.get("hw_height_m") is not None:
         lines.append(f"Height: {ev_data['hw_height_m']:.1f}m")
+
+    if ev_data.get("always_accessible"):
+        lines.append("Tide stays above threshold - always afloat this cycle")
 
     lines.append(f"Source: {ev_data.get('source', 'unknown')}")
 
@@ -158,7 +174,7 @@ def _deduplicate_events(events: list[dict]) -> list[dict]:
             kept_hw = dtparse.parse(kept["hw_timestamp"])
             gap = abs((hw - kept_hw).total_seconds()) / 60
             if gap < 90:
-                # Same tidal cycle — keep the more recently updated one
+                # Same tidal cycle - keep the more recently updated one
                 if ev.get("updated_at", "") >= kept.get("updated_at", ""):
                     keep[i] = ev
                 merged = True
@@ -182,7 +198,7 @@ def generate_feed_for_mooring(mooring_id: int, boat_name: str = "",
     cal.add("prodid", f"-//Tidal Access Mooring {mooring_id}//EN")
     cal.add("version", "2.0")
     cal.add("calscale", "GREGORIAN")
-    # No METHOD property — subscription feeds should omit it.
+    # No METHOD property - subscription feeds should omit it.
     # METHOD:PUBLISH causes some apps to treat it as a one-time import.
 
     feed_name = f"Mooring {mooring_id}"
@@ -207,6 +223,7 @@ def generate_feed_for_mooring(mooring_id: int, boat_name: str = "",
             continue
 
         ical_event = Event()
+        is_always = bool(ev_data.get("always_accessible"))
 
         start = dtparse.parse(ev_data["start_time"])
         end = dtparse.parse(ev_data["end_time"])
@@ -216,10 +233,14 @@ def generate_feed_for_mooring(mooring_id: int, boat_name: str = "",
         if end.tzinfo is None:
             end = end.replace(tzinfo=timezone.utc)
 
-        # Recalculate title from current start/end times rather than using
-        # the stored title, which may be stale if parameters changed.
+        # Recalculate title from current state. Pass always_accessible through
+        # so the title can reflect it; pass duration in minutes for the normal
+        # window case.
         duration_minutes = int((end - start).total_seconds() / 60)
-        title_window = {"duration_minutes": duration_minutes}
+        title_window = {
+            "duration_minutes": duration_minutes,
+            "always_accessible": is_always,
+        }
         title = build_event_title(
             title_window, ev_data.get("source", "ukho"), boat_name, mooring_id
         )
@@ -227,11 +248,28 @@ def generate_feed_for_mooring(mooring_id: int, boat_name: str = "",
         ical_event.add("summary", title)
         ical_event["uid"] = ev_data["event_uid"]
 
-        ical_event.add("dtstart", start)
-        ical_event.add("dtend", end)
+        if is_always:
+            # Render as an all-day event on the HW's local date. The bounds
+            # (LW-to-LW span, usually ~12h) are meaningless for "always
+            # accessible", and a 12-hour time block would both look odd and
+            # overlap with the next cycle at every LW. An all-day event is
+            # a better fit semantically and avoids both problems.
+            hw_local = dtparse.parse(ev_data["hw_timestamp"])
+            if hw_local.tzinfo is None:
+                hw_local = hw_local.replace(tzinfo=timezone.utc)
+            hw_local = hw_local.astimezone(tz).date()
+            ical_event.add("dtstart", hw_local)
+            ical_event.add("dtend", hw_local + timedelta(days=1))
+        else:
+            ical_event.add("dtstart", start)
+            ical_event.add("dtend", end)
+
         ical_event.add("description", _build_description(ev_data, tz, calibration))
         ical_event.add("dtstamp", datetime.now(timezone.utc))
-        ical_event.add("transp", "OPAQUE")
+        # TRANSPARENT: the event does not block the user's time. Access windows
+        # describe the opportunity to sail, not a commitment - they should
+        # appear as free time in the user's calendar.
+        ical_event.add("transp", "TRANSPARENT")
         ical_event.add("status", "CONFIRMED")
         cal.add_component(ical_event)
 
@@ -273,6 +311,7 @@ def generate_export_ics(windows: list[dict], source: str,
             continue
 
         ical_event = Event()
+        is_always = bool(w.get("always_accessible"))
         title = build_event_title(w, source, boat_name, mooring_id)
         ical_event.add("summary", title)
 
@@ -291,19 +330,32 @@ def generate_export_ics(windows: list[dict], source: str,
         if end.tzinfo is None:
             end = end.replace(tzinfo=timezone.utc)
 
-        ical_event.add("dtstart", start)
-        ical_event.add("dtend", end)
+        if is_always:
+            # Always-accessible: render as an all-day event on HW's local date
+            # (see feed generation for rationale).
+            hw_local = dtparse.parse(w["hw_timestamp"])
+            if hw_local.tzinfo is None:
+                hw_local = hw_local.replace(tzinfo=timezone.utc)
+            hw_local = hw_local.astimezone(tz).date()
+            ical_event.add("dtstart", hw_local)
+            ical_event.add("dtend", hw_local + timedelta(days=1))
+        else:
+            ical_event.add("dtstart", start)
+            ical_event.add("dtend", end)
 
         ev_data = {
             "hw_timestamp": w["hw_timestamp"],
             "hw_height_m": w.get("hw_height_m"),
             "source": source,
             "wind_adjusted": w.get("wind_adjusted"),
+            "always_accessible": is_always,
         }
         if calc_params:
             ev_data.update(calc_params)
         ical_event.add("description", _build_description(ev_data, tz, calibration))
         ical_event.add("dtstamp", datetime.now(timezone.utc))
+        # TRANSPARENT: see feed generation.
+        ical_event.add("transp", "TRANSPARENT")
         cal.add_component(ical_event)
 
     return cal.to_ical()
@@ -316,6 +368,11 @@ def store_windows_as_events(windows: list[dict], mooring_id: int,
 
     calc_params: {draught_m, drying_height_m, safety_margin_m, obs_calibrated}
     wind_details: {direction, speed_ms, offset_m}
+
+    Always-accessible windows are stored too, so that if the mooring is
+    recalibrated later (e.g. a deeper-draught boat raises the threshold)
+    the persisted events can be re-evaluated and updated on subsequent
+    recalculation rather than being silently missing.
     """
     from app.access_calc import generate_event_uid
 
@@ -338,6 +395,7 @@ def store_windows_as_events(windows: list[dict], mooring_id: int,
             "source": source,
             "title": title,
             "wind_adjusted": w.get("wind_adjusted", 0),
+            "always_accessible": 1 if w.get("always_accessible") else 0,
         }
 
         if calc_params:
