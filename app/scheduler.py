@@ -362,16 +362,24 @@ async def wind_observation_job(hw_timestamp: str):
             )
 
         try:
+            # Only the immediately-following HW should get the offset, not
+            # every HW in the 14-hour search window.
+            next_hw_ts = None
+            for e in sorted(next_events, key=lambda ev: ev["timestamp"]):
+                if e["event_type"] == "HighWater":
+                    next_hw_ts = e["timestamp"]
+                    break
+
             windows = compute_access_windows(
                 events=next_events,
                 draught_m=m["draught_m"],
                 drying_height_m=m["drying_height_m"],
                 safety_margin_m=m["safety_margin_m"],
                 wind_offset_m=wind_offset,
+                wind_offset_hw_timestamp=next_hw_ts,
                 source="ukho",
             )
-            for w in windows:
-                w["wind_adjusted"] = 1 if wind_offset > 0 else 0
+            # compute_access_windows already sets `wind_adjusted` per-window.
 
             cal = calibrate_drying_height(m["mooring_id"])
             calc_params = {

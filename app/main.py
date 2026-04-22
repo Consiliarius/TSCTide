@@ -548,6 +548,9 @@ async def calculate_access_windows(request: Request):
         mooring_id: int (optional - for persistent config)
         days: int (for harmonic, how far ahead)
         add_to_feed: bool (optional - add to mooring's iCal feed)
+        wind_offset_enabled: bool (optional - overrides stored mooring setting)
+        shallow_direction: str (optional - overrides stored mooring setting)
+        shallow_extra_depth_m: float (optional - overrides stored mooring setting)
     """
     data = await request.json()
     source = data.get("source", "ukho")
@@ -563,14 +566,38 @@ async def calculate_access_windows(request: Request):
     drying = data.get("drying_height_m") or (mooring["drying_height_m"] if mooring else 2.0)
     margin = data.get("safety_margin_m") or (mooring["safety_margin_m"] if mooring else 0.3)
 
-    # Determine wind offset for next tide only
+    # Determine wind offset for next tide only.
+    #
+    # Wind settings: prefer POST body values when the client supplies them
+    # (so unsaved toggle changes in the UI take effect immediately), falling
+    # back to the stored mooring configuration otherwise. `is None` checks are
+    # used deliberately — a stored value of 0/"" must not be treated as "unset".
     wind_offset = 0.0
     wind_info = None
     wind_data = None
-    if mooring and mooring.get("wind_offset_enabled") and source == "ukho":
-        shallow_dir = mooring.get("shallow_direction", "")
-        extra_depth = mooring.get("shallow_extra_depth_m", 0.0)
-        if shallow_dir and extra_depth > 0:
+    if source == "ukho":
+        posted_enabled = data.get("wind_offset_enabled")
+        if posted_enabled is None:
+            wind_enabled = bool(mooring.get("wind_offset_enabled")) if mooring else False
+        else:
+            wind_enabled = bool(posted_enabled)
+
+        posted_dir = data.get("shallow_direction")
+        if posted_dir is None:
+            shallow_dir = (mooring.get("shallow_direction", "") if mooring else "")
+        else:
+            shallow_dir = str(posted_dir)
+
+        posted_extra = data.get("shallow_extra_depth_m")
+        if posted_extra is None:
+            extra_depth = float(mooring.get("shallow_extra_depth_m", 0.0)) if mooring else 0.0
+        else:
+            try:
+                extra_depth = float(posted_extra)
+            except (TypeError, ValueError):
+                extra_depth = 0.0
+
+        if wind_enabled and shallow_dir and extra_depth > 0:
             wind_data = await fetch_current_wind()
             if wind_data and should_apply_offset(wind_data["direction_compass"], shallow_dir):
                 wind_offset = extra_depth
@@ -619,12 +646,25 @@ async def calculate_access_windows(request: Request):
     if not events:
         return {"windows": [], "source": source, "event_count": 0, "message": "No tide data available"}
 
+    # If wind offset applies, identify the NEXT HW so that the offset is only
+    # applied to that one window — a live wind observation is only a reasonable
+    # predictor for conditions at the immediately-following HW, not for HWs
+    # days into the future.
+    next_hw_ts = None
+    if wind_offset > 0:
+        now_str = to_utc_str(now)
+        for e in sorted(events, key=lambda ev: ev["timestamp"]):
+            if e["event_type"] == "HighWater" and e["timestamp"] >= now_str:
+                next_hw_ts = e["timestamp"]
+                break
+
     windows = compute_access_windows(
         events=events,
         draught_m=float(draught),
         drying_height_m=float(drying),
         safety_margin_m=float(margin),
         wind_offset_m=wind_offset,
+        wind_offset_hw_timestamp=next_hw_ts,
         source=tide_source,
     )
 
@@ -633,10 +673,8 @@ async def calculate_access_windows(request: Request):
     now_str = to_utc_str(now)
     windows = [w for w in windows if w["hw_timestamp"] >= now_str]
 
-    # Mark wind adjustment
-    if wind_offset > 0:
-        for w in windows:
-            w["wind_adjusted"] = True
+    # compute_access_windows already sets per-window `wind_adjusted` correctly;
+    # no post-processing loop needed.
 
     # Auto-update feed when mooring has calendar enabled, or when explicitly requested
     should_store = mooring_id and mooring and (

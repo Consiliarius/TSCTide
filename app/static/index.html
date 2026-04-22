@@ -696,6 +696,12 @@ async function calculate(source) {
     drying_height_m: cfg.drying_height_m,
     safety_margin_m: cfg.safety_margin_m,
     mooring_id: cfg.mooring_id,
+    // Send current (possibly unsaved) wind state so toggle changes take
+    // effect immediately without needing to save the mooring config first.
+    // Backend prefers these values over stored DB state.
+    wind_offset_enabled: cfg.wind_offset_enabled,
+    shallow_direction: cfg.shallow_direction,
+    shallow_extra_depth_m: cfg.shallow_extra_depth_m,
   };
   if (source === 'harmonic') {
     body.days = parseInt(document.getElementById('harmonic_days').value) || 30;
