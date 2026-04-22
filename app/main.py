@@ -24,9 +24,12 @@ from app.config import (
 from app.database import (
     init_db, save_mooring, get_mooring, get_all_moorings,
     add_observation, get_observations, delete_observation, clear_observations,
-    store_tide_events, get_tide_events, calibrate_drying_height,
+    store_tide_events, get_tide_events,
+    calibrate_drying_height, calibrate_wind_offset,
+    get_wind_observations_in_range,
     delete_future_events, get_calendar_events, log_activity, get_activity_log,
 )
+from app.observation_classifier import classify_observations
 from app.ukho import fetch_tidal_events
 from app.khm_parser import parse_khm_paste
 from app.harmonic import predict_events as harmonic_predict_events
@@ -60,6 +63,88 @@ def _coalesce(*values, default):
         if v is not None:
             return v
     return default
+
+
+def _build_calibration_response(mooring_id: int) -> dict:
+    """
+    Build the combined calibration response: base drying fields at top
+    level (for back-compat), wind_offset sub-object, and a classifications
+    map keyed by observation id. Used by GET /calibration and as the
+    response body for observation mutations.
+    """
+    base = calibrate_drying_height(mooring_id)
+    wind = calibrate_wind_offset(mooring_id)
+
+    observations = get_observations(mooring_id)
+    mooring = get_mooring(mooring_id)
+    classifications_map = {}
+    if mooring and observations:
+        tide_events = get_tide_events("2000-01-01", "2099-12-31")
+        wind_obs = get_wind_observations_in_range("2000-01-01", "2099-12-31")
+        classified = classify_observations(
+            observations, mooring, tide_events, wind_obs
+        )
+        for entry in classified:
+            obs_id = entry["observation"].get("id")
+            if obs_id is None:
+                continue
+            classifications_map[str(obs_id)] = {
+                "classification": entry["classification"],
+                "reason": entry["reason"],
+                "hw_timestamp": entry["hw_timestamp"],
+                "wind_compass": entry["wind_compass"],
+            }
+
+    response = dict(base)
+    response["wind_offset"] = wind
+    response["classifications"] = classifications_map
+    return response
+
+
+def _recompute_future_windows(mooring_id: int):
+    """
+    After a mooring configuration change, clear stored future events and
+    recompute them from currently-stored UKHO tide data, then regenerate
+    the iCal feed if calendar subscription is enabled.
+
+    Does nothing if no UKHO data is available. Uses the mooring's current
+    stored configuration.
+    """
+    m = get_mooring(mooring_id)
+    if not m:
+        return
+
+    now = to_utc_str(datetime.now(timezone.utc))
+    delete_future_events(mooring_id, now)
+
+    query_start = to_utc_str(datetime.now(timezone.utc) - timedelta(hours=13))
+    end = to_utc_str(datetime.now(timezone.utc) + timedelta(days=7))
+    tide_data = get_tide_events(query_start, end, source="ukho")
+    if not tide_data:
+        return
+
+    windows = compute_access_windows(
+        events=tide_data,
+        draught_m=m["draught_m"],
+        drying_height_m=m["drying_height_m"],
+        safety_margin_m=m["safety_margin_m"],
+        source="ukho",
+    )
+    cal = calibrate_drying_height(mooring_id)
+    calc_params = {
+        "draught_m": m["draught_m"],
+        "drying_height_m": m["drying_height_m"],
+        "safety_margin_m": m["safety_margin_m"],
+        "obs_calibrated": 1 if cal.get("confidence", "none") != "none" else 0,
+    }
+    store_windows_as_events(
+        windows, mooring_id, "ukho", m.get("boat_name", ""),
+        calc_params=calc_params,
+    )
+
+    if m.get("calendar_enabled"):
+        feed_cal = cal if cal.get("confidence") != "none" else None
+        generate_feed_for_mooring(mooring_id, m.get("boat_name", ""), feed_cal)
 
 
 @asynccontextmanager
@@ -166,7 +251,11 @@ async def list_observations(mooring_id: int):
 
 @app.delete("/api/moorings/{mooring_id}/observations/{observation_id}")
 async def remove_observation(mooring_id: int, observation_id: int):
-    """Delete a single observation. Triggers recalibration."""
+    """
+    Delete a single observation. Does NOT auto-apply calibration changes -
+    the updated calibration is returned for the UI to display as a
+    suggestion. The user applies it explicitly via the Apply endpoints.
+    """
     if not delete_observation(observation_id, mooring_id):
         raise HTTPException(404, "Observation not found")
 
@@ -178,18 +267,19 @@ async def remove_observation(mooring_id: int, observation_id: int):
         mooring_id=mooring_id,
     )
 
-    m = get_mooring(mooring_id)
-    cal = calibrate_drying_height(mooring_id)
-    if m and cal["best_estimate"] is not None:
-        m["drying_height_m"] = cal["best_estimate"]
-        save_mooring(m)
-
-    return {"deleted": observation_id, "calibration": cal}
+    return {
+        "deleted": observation_id,
+        "calibration": _build_calibration_response(mooring_id),
+    }
 
 
 @app.delete("/api/moorings/{mooring_id}/observations")
 async def clear_all_observations(mooring_id: int):
-    """Delete all observations for a mooring. Resets calibration to manual estimate."""
+    """
+    Delete all observations for a mooring. Does NOT auto-apply calibration
+    changes - the mooring's stored drying height and shallow_extra_depth
+    are left untouched; the UI can prompt the user to re-set them manually.
+    """
     count = clear_observations(mooring_id)
     if count > 0:
         log_activity(
@@ -200,14 +290,18 @@ async def clear_all_observations(mooring_id: int):
             mooring_id=mooring_id,
             details={"count": count},
         )
-    return {"deleted_count": count, "calibration": calibrate_drying_height(mooring_id)}
+    return {
+        "deleted_count": count,
+        "calibration": _build_calibration_response(mooring_id),
+    }
 
 
 @app.post("/api/moorings/{mooring_id}/observations")
 async def add_mooring_observation(mooring_id: int, request: Request):
     """
-    Add an observation and recalibrate drying height.
-    Recalculates all future events if calibration changes.
+    Add an observation. Does NOT auto-apply calibration changes; the
+    returned calibration payload is a suggestion for the UI to render
+    with Apply buttons.
     """
     data = await request.json()
     data["mooring_id"] = mooring_id
@@ -233,75 +327,21 @@ async def add_mooring_observation(mooring_id: int, request: Request):
         },
     )
 
-    # Attempt recalibration using only this mooring's observations
-    cal = calibrate_drying_height(mooring_id)
-    recalibrated = False
-    if (cal["best_estimate"] is not None and
-            abs(cal["best_estimate"] - m["drying_height_m"]) > 0.01):
-        previous_drying = m["drying_height_m"]
-        m["drying_height_m"] = cal["best_estimate"]
-        save_mooring(m)
-        recalibrated = True
-
-        log_activity(
-            event_type="calibration_update",
-            message=(
-                f"Drying height recalibrated: {previous_drying:.2f}m -> "
-                f"{cal['best_estimate']:.2f}m ({cal['confidence']} confidence)"
-            ),
-            severity="success",
-            scope="mooring",
-            mooring_id=mooring_id,
-            details={
-                "previous_drying_height_m": previous_drying,
-                "new_drying_height_m": cal["best_estimate"],
-                "confidence": cal["confidence"],
-                "lower_bound": cal.get("lower_bound"),
-                "upper_bound": cal.get("upper_bound"),
-                "afloat_count": cal.get("afloat_count"),
-                "aground_count": cal.get("aground_count"),
-            },
-        )
-
-        # Recalculate future events
-        now = to_utc_str(datetime.now(timezone.utc))
-        delete_future_events(mooring_id, now)
-
-        query_start = to_utc_str(datetime.now(timezone.utc) - timedelta(hours=13))
-        end = to_utc_str(datetime.now(timezone.utc) + timedelta(days=7))
-        tide_data = get_tide_events(query_start, end, source="ukho")
-        if tide_data:
-            windows = compute_access_windows(
-                events=tide_data,
-                draught_m=m["draught_m"],
-                drying_height_m=m["drying_height_m"],
-                safety_margin_m=m["safety_margin_m"],
-                source="ukho",
-            )
-            obs_calc_params = {
-                "draught_m": m["draught_m"],
-                "drying_height_m": m["drying_height_m"],
-                "safety_margin_m": m["safety_margin_m"],
-                "obs_calibrated": 1 if cal.get("confidence", "none") != "none" else 0,
-            }
-            store_windows_as_events(windows, mooring_id, "ukho", m.get("boat_name", ""),
-                                    calc_params=obs_calc_params)
-
-        if m.get("calendar_enabled"):
-            generate_feed_for_mooring(mooring_id, m.get("boat_name", ""), cal)
-
     return {
         "observation": obs,
-        "recalibrated": recalibrated,
-        "calibration": cal,
+        "calibration": _build_calibration_response(mooring_id),
     }
 
 
 @app.post("/api/moorings/{mooring_id}/observations/upload")
 async def upload_observations_xlsx(mooring_id: int, request: Request):
     """
-    Import observations from an XLSX file. Observations are tied to this mooring only.
-    Expected columns: Date, Time, State, Wind Direction, Direction of Lay, Notes
+    Import observations from an XLSX file. Observations are tied to this
+    mooring only. Expected columns: Date, Time, State, Wind Direction,
+    Direction of Lay, Notes.
+
+    Does NOT auto-apply calibration - the returned calibration payload
+    is a suggestion.
     """
     import io
     from openpyxl import load_workbook
@@ -363,9 +403,9 @@ async def upload_observations_xlsx(mooring_id: int, request: Request):
             errors += 1
             continue
 
-        # Store with mooring_id enforced
-        # XLSX template tells users to enter local time (BST during sailing season).
-        # If no timezone info, assume Europe/London and convert to UTC.
+        # Store with mooring_id enforced.
+        # XLSX template tells users to enter local time (BST during sailing
+        # season). If no timezone info, assume Europe/London and convert to UTC.
         if dt.tzinfo is None:
             import pytz
             local_tz = pytz.timezone("Europe/London")
@@ -381,45 +421,20 @@ async def upload_observations_xlsx(mooring_id: int, request: Request):
         })
         imported += 1
 
-    # Recalibrate after batch import
-    cal = calibrate_drying_height(mooring_id)
-    recalibrated = False
-    if (cal["best_estimate"] is not None and
-            abs(cal["best_estimate"] - m["drying_height_m"]) > 0.01):
-        m["drying_height_m"] = cal["best_estimate"]
-        save_mooring(m)
-        recalibrated = True
-
-        now = to_utc_str(datetime.now(timezone.utc))
-        delete_future_events(mooring_id, now)
-        query_start = to_utc_str(datetime.now(timezone.utc) - timedelta(hours=13))
-        end = to_utc_str(datetime.now(timezone.utc) + timedelta(days=7))
-        tide_data = get_tide_events(query_start, end, source="ukho")
-        if tide_data:
-            windows = compute_access_windows(
-                events=tide_data,
-                draught_m=m["draught_m"],
-                drying_height_m=m["drying_height_m"],
-                safety_margin_m=m["safety_margin_m"],
-                source="ukho",
-            )
-            upload_calc_params = {
-                "draught_m": m["draught_m"],
-                "drying_height_m": m["drying_height_m"],
-                "safety_margin_m": m["safety_margin_m"],
-                "obs_calibrated": 1 if cal.get("confidence", "none") != "none" else 0,
-            }
-            store_windows_as_events(windows, mooring_id, "ukho", m.get("boat_name", ""),
-                                    calc_params=upload_calc_params)
-
-        if m.get("calendar_enabled"):
-            generate_feed_for_mooring(mooring_id, m.get("boat_name", ""), cal)
+    if imported > 0:
+        log_activity(
+            event_type="observations_uploaded",
+            message=f"Imported {imported} observations from XLSX ({errors} rows skipped)",
+            severity="info",
+            scope="mooring",
+            mooring_id=mooring_id,
+            details={"imported": imported, "errors": errors},
+        )
 
     return {
         "imported": imported,
         "errors": errors,
-        "recalibrated": recalibrated,
-        "calibration": cal,
+        "calibration": _build_calibration_response(mooring_id),
     }
 
 
@@ -482,11 +497,164 @@ async def download_observation_template():
 
 @app.get("/api/moorings/{mooring_id}/calibration")
 async def get_calibration_status(mooring_id: int):
-    """Get current calibration status for a mooring."""
+    """
+    Get calibration status for a mooring.
+
+    Response shape:
+      - Base drying fields at the top level: best_estimate, lower_bound,
+        upper_bound, confidence, matched, unmatched, afloat_count,
+        aground_count, excluded_wind_offset_count.
+      - `wind_offset`: suggested shallow-side offset with confidence and
+        current stored values.
+      - `classifications`: map from observation id (string) to its
+        classifier output (classification, reason, hw_timestamp,
+        wind_compass).
+    """
     m = get_mooring(mooring_id)
     if not m:
         raise HTTPException(404, "Mooring not found")
-    return calibrate_drying_height(mooring_id)
+    return _build_calibration_response(mooring_id)
+
+
+@app.post("/api/moorings/{mooring_id}/calibration/apply-drying-height")
+async def apply_drying_height_calibration(mooring_id: int):
+    """
+    Apply the current base-drying-height suggestion to the mooring's
+    stored configuration, then recompute future access windows and
+    regenerate the feed.
+
+    Rejects with 400 if there is no usable suggestion.
+    """
+    m = get_mooring(mooring_id)
+    if not m:
+        raise HTTPException(404, "Mooring not found")
+
+    cal = calibrate_drying_height(mooring_id)
+    best = cal.get("best_estimate")
+    if best is None:
+        raise HTTPException(400, "No drying height suggestion available to apply")
+
+    previous = m["drying_height_m"]
+    if abs(best - previous) < 0.01:
+        # Already aligned; nothing to do, but still return success so the
+        # UI can dismiss the suggestion without error.
+        return {
+            "applied": False,
+            "reason": "suggestion matches current stored value",
+            "previous": previous,
+            "new": previous,
+            "mooring": m,
+            "calibration": _build_calibration_response(mooring_id),
+        }
+
+    m["drying_height_m"] = best
+    save_mooring(m)
+
+    log_activity(
+        event_type="calibration_apply",
+        message=(
+            f"Drying height applied from observations: "
+            f"{previous:.2f}m -> {best:.2f}m ({cal.get('confidence')})"
+        ),
+        severity="success",
+        scope="mooring",
+        mooring_id=mooring_id,
+        details={
+            "field": "drying_height_m",
+            "previous": previous,
+            "new": best,
+            "confidence": cal.get("confidence"),
+            "lower_bound": cal.get("lower_bound"),
+            "upper_bound": cal.get("upper_bound"),
+            "afloat_count": cal.get("afloat_count"),
+            "aground_count": cal.get("aground_count"),
+        },
+    )
+
+    _recompute_future_windows(mooring_id)
+
+    return {
+        "applied": True,
+        "previous": previous,
+        "new": best,
+        "mooring": get_mooring(mooring_id),
+        "calibration": _build_calibration_response(mooring_id),
+    }
+
+
+@app.post("/api/moorings/{mooring_id}/calibration/apply-wind-offset")
+async def apply_wind_offset_calibration(mooring_id: int):
+    """
+    Apply the current shallow-side wind offset suggestion to the mooring's
+    stored configuration (updates shallow_extra_depth_m), then recompute
+    future access windows and regenerate the feed.
+
+    Rejects with 400 if there is no usable suggestion.
+    """
+    m = get_mooring(mooring_id)
+    if not m:
+        raise HTTPException(404, "Mooring not found")
+
+    cal = calibrate_wind_offset(mooring_id)
+    suggested = cal.get("suggested_offset_m")
+    if suggested is None:
+        raise HTTPException(400, "No wind offset suggestion available to apply")
+
+    try:
+        previous = float(m.get("shallow_extra_depth_m") or 0.0)
+    except (TypeError, ValueError):
+        previous = 0.0
+
+    if suggested <= previous + 0.01:
+        # Aground observations only give a LOWER bound on the required
+        # offset. A suggestion at or below the current stored value does
+        # not justify reducing the offset - no evidence the stored value
+        # is too high. Applying would weaken the safety margin based on
+        # no data.
+        return {
+            "applied": False,
+            "reason": (
+                "current stored offset already meets or exceeds the "
+                "observation-derived lower bound; no increase required"
+            ),
+            "previous": previous,
+            "new": previous,
+            "mooring": m,
+            "calibration": _build_calibration_response(mooring_id),
+        }
+
+    m["shallow_extra_depth_m"] = suggested
+    save_mooring(m)
+
+    log_activity(
+        event_type="calibration_apply",
+        message=(
+            f"Wind offset applied from observations: "
+            f"+{previous:.2f}m -> +{suggested:.2f}m ({cal.get('confidence')}, "
+            f"{cal.get('observation_count')} observations)"
+        ),
+        severity="success",
+        scope="mooring",
+        mooring_id=mooring_id,
+        details={
+            "field": "shallow_extra_depth_m",
+            "previous": previous,
+            "new": suggested,
+            "confidence": cal.get("confidence"),
+            "observation_count": cal.get("observation_count"),
+            "baseline_drying_height_m": cal.get("current_drying_height_m"),
+        },
+    )
+
+    _recompute_future_windows(mooring_id)
+
+    return {
+        "applied": True,
+        "previous": previous,
+        "new": suggested,
+        "mooring": get_mooring(mooring_id),
+        "calibration": _build_calibration_response(mooring_id),
+    }
 
 
 # --- UKHO Data ---

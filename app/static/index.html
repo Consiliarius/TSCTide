@@ -200,6 +200,44 @@
     background: var(--sand); padding: 8px; border-radius: var(--radius);
     margin-bottom: 6px; font-size: 12px;
   }
+  .obs-badge {
+    display: inline-block; padding: 1px 6px; border-radius: 3px;
+    font-size: 10px; font-weight: 700; text-transform: uppercase;
+    margin-right: 6px; cursor: help;
+  }
+  .obs-badge-base { background: #e3ecf3; color: var(--navy); }
+  .obs-badge-wind { background: #fce8c8; color: #7a5020; }
+
+  /* Calibration suggestion cards (rendered inside #cal-status) */
+  .cal-card {
+    background: #fff; border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 10px; margin-bottom: 10px;
+  }
+  .cal-card:last-child { margin-bottom: 0; }
+  .cal-card-title {
+    font-size: 13px; font-weight: 600; color: var(--navy);
+    margin-bottom: 6px;
+  }
+  .cal-row { font-size: 12px; margin: 2px 0; }
+  .cal-row .label { color: var(--text-light); }
+  .cal-row .value { font-weight: 600; color: var(--navy); }
+  .cal-suggestion {
+    background: #fff8e8; border: 1px solid #ffc107;
+    border-radius: var(--radius); padding: 6px 10px; margin-top: 8px;
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 10px; flex-wrap: wrap;
+  }
+  .cal-suggestion-text { font-size: 12px; color: var(--text); }
+  .cal-apply-btn {
+    background: var(--ok); color: #fff; padding: 4px 12px;
+    font-size: 12px; font-weight: 600; border-radius: var(--radius);
+    border: none; cursor: pointer; flex-shrink: 0;
+  }
+  .cal-apply-btn:hover { opacity: 0.85; }
+  .cal-note {
+    font-size: 11px; color: var(--text-light); margin-top: 6px;
+    font-style: italic;
+  }
 
   .hidden { display: none; }
   .mt-8 { margin-top: 8px; }
@@ -356,15 +394,10 @@
     </div>
     <div class="panel-body" id="obs-body">
 
-      <!-- Calibration Status -->
-      <div id="cal-status" style="background:var(--sand);border:1px solid var(--border);border-radius:var(--radius);padding:10px;margin-bottom:12px;">
-        <div style="font-size:13px;font-weight:600;margin-bottom:6px;">Calibration Status</div>
-        <div class="row" style="font-size:12px;">
-          <div>Drying height: <strong id="cal-drying">—</strong></div>
-          <div>Observations: <strong id="cal-obs">0</strong> (<span id="cal-obs-detail">—</span>)</div>
-          <div>Confidence: <strong id="cal-confidence">—</strong> <span id="cal-conf-detail" style="color:var(--text-light);">Need observations</span></div>
-        </div>
-        <div id="cal-range" style="font-size:12px;margin-top:4px;color:var(--text-light);">Manual estimate</div>
+      <!-- Calibration Status (populated by updateCalibrationDisplay) -->
+      <div style="font-size:13px;font-weight:600;margin-bottom:6px;">Calibration Status</div>
+      <div id="cal-status" style="margin-bottom:12px;">
+        <p style="color:var(--text-light);font-size:12px;">Loading calibration...</p>
       </div>
 
       <!-- Manual Entry -->
@@ -568,6 +601,10 @@
 // State
 let lastWindows = [];
 let lastSource = '';
+// Calibration and observation list cached so renderObservations can
+// merge classifications into the observation rows without an extra fetch.
+let lastCalibration = null;
+let lastObservations = null;
 
 // --- Panel toggle ---
 function togglePanel(id) {
@@ -953,14 +990,13 @@ async function submitObservation() {
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || 'Failed');
-    let msg = 'Observation recorded.';
-    if (data.recalibrated) {
-      msg += ` Drying height recalibrated to ${data.calibration.best_estimate?.toFixed(2)}m.`;
-      document.getElementById('drying_height_m').value = data.calibration.best_estimate?.toFixed(2);
-    }
-    showStatus('obs-status', msg, 'ok');
-    loadObservations(cfg.mooring_id);
+    // Auto-apply of drying height was removed deliberately - calibration
+    // suggestions are now applied explicitly via the Apply buttons in the
+    // Calibration Status card. This avoids silent config mutation and
+    // gives the user oversight over changes driven by observations.
+    showStatus('obs-status', 'Observation recorded.', 'ok');
     updateCalibrationDisplay(data.calibration);
+    loadObservations(cfg.mooring_id);
   } catch(e) {
     showStatus('obs-status', e.message, 'err');
   }
@@ -986,15 +1022,12 @@ async function uploadObsXlsx() {
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || 'Upload failed');
+    // Auto-apply of drying height was removed - see submitObservation().
     let msg = `Imported ${data.imported} observations.`;
     if (data.errors > 0) msg += ` ${data.errors} rows skipped.`;
-    if (data.recalibrated) {
-      msg += ` Drying height recalibrated to ${data.calibration.best_estimate?.toFixed(2)}m.`;
-      document.getElementById('drying_height_m').value = data.calibration.best_estimate?.toFixed(2);
-    }
     showStatus('obs-status', msg, data.imported > 0 ? 'ok' : 'err');
-    loadObservations(cfg.mooring_id);
     updateCalibrationDisplay(data.calibration);
+    loadObservations(cfg.mooring_id);
     fileInput.value = '';
   } catch(e) {
     showStatus('obs-status', e.message, 'err');
@@ -1011,13 +1044,9 @@ async function loadCalibration(mooringId) {
 
 function updateCalibrationDisplay(cal) {
   if (!cal) return;
-  const drying = num('drying_height_m', 0);
-  document.getElementById('cal-drying').textContent = drying.toFixed(2) + 'm';
-  document.getElementById('cal-obs').textContent = (cal.afloat_count || 0) + (cal.aground_count || 0);
-  document.getElementById('cal-obs-detail').textContent =
-    `${cal.afloat_count || 0} afloat, ${cal.aground_count || 0} aground` +
-    (cal.unmatched ? `, ${cal.unmatched} unmatched` : '');
+  lastCalibration = cal;
 
+  const host = document.getElementById('cal-status');
   const confSymbols = {
     'high': '●●●', 'medium': '●●○', 'low': '●○○',
     'partial-low': '●○○', 'partial-high': '●○○',
@@ -1027,23 +1056,187 @@ function updateCalibrationDisplay(cal) {
     'high': 'Bounds < 0.2m apart',
     'medium': 'Bounds < 0.5m apart',
     'low': 'Bounds > 0.5m apart',
-    'partial-low': 'Only aground data',
-    'partial-high': 'Only afloat data',
+    'partial-low': 'Lower bound only (aground)',
+    'partial-high': 'Upper bound only (afloat)',
     'inconsistent': 'Bounds conflict!',
     'none': 'Need observations'
   };
-  document.getElementById('cal-confidence').textContent = confSymbols[cal.confidence] || '—';
-  document.getElementById('cal-conf-detail').textContent = confDesc[cal.confidence] || '';
 
-  const rangeEl = document.getElementById('cal-range');
+  // --- Base drying height card ---
+  const currentDrying = num('drying_height_m', 0);
+  const bestEst = cal.best_estimate;
+  const afloatCount = cal.afloat_count || 0;
+  const agroundCount = cal.aground_count || 0;
+  const excludedWind = cal.excluded_wind_offset_count || 0;
+
+  let baseRange = 'Manual estimate';
   if (cal.lower_bound !== null && cal.upper_bound !== null) {
-    rangeEl.textContent = `Estimated range: ${cal.lower_bound.toFixed(2)} – ${cal.upper_bound.toFixed(2)}m`;
+    baseRange = `Estimated range: ${cal.lower_bound.toFixed(2)} – ${cal.upper_bound.toFixed(2)}m`;
   } else if (cal.lower_bound !== null) {
-    rangeEl.textContent = `Estimated: > ${cal.lower_bound.toFixed(2)}m`;
+    baseRange = `Estimated: > ${cal.lower_bound.toFixed(2)}m`;
   } else if (cal.upper_bound !== null) {
-    rangeEl.textContent = `Estimated: < ${cal.upper_bound.toFixed(2)}m`;
-  } else {
-    rangeEl.textContent = 'Manual estimate';
+    baseRange = `Estimated: < ${cal.upper_bound.toFixed(2)}m`;
+  }
+
+  let baseSuggestion = '';
+  if (bestEst !== null && bestEst !== undefined &&
+      Math.abs(bestEst - currentDrying) >= 0.01) {
+    baseSuggestion =
+      `<div class="cal-suggestion">` +
+        `<div class="cal-suggestion-text">` +
+          `Observations suggest <b>${bestEst.toFixed(2)}m</b> ` +
+          `(currently ${currentDrying.toFixed(2)}m)` +
+        `</div>` +
+        `<button class="cal-apply-btn" onclick="applyDryingHeight()">Apply</button>` +
+      `</div>`;
+  }
+
+  let excludedNote = '';
+  if (excludedWind > 0) {
+    excludedNote = `<div class="cal-note">` +
+      `${excludedWind} aground observation(s) routed to wind offset ` +
+      `calibration below.</div>`;
+  }
+
+  const baseCard =
+    `<div class="cal-card">` +
+      `<div class="cal-card-title">Base Drying Height</div>` +
+      `<div class="cal-row">` +
+        `<span class="label">Current:</span> ` +
+        `<span class="value">${currentDrying.toFixed(2)}m</span>` +
+      `</div>` +
+      `<div class="cal-row">` +
+        `<span class="label">Observations used:</span> ` +
+        `<span class="value">${afloatCount + agroundCount}</span> ` +
+        `(${afloatCount} afloat, ${agroundCount} aground)` +
+      `</div>` +
+      `<div class="cal-row">` +
+        `<span class="label">Confidence:</span> ` +
+        `<span class="value">${confSymbols[cal.confidence] || '—'}</span> ` +
+        `<span style="color:var(--text-light);">` +
+          `${confDesc[cal.confidence] || ''}</span>` +
+      `</div>` +
+      `<div class="cal-row" style="color:var(--text-light);">${baseRange}</div>` +
+      baseSuggestion +
+      excludedNote +
+    `</div>`;
+
+  // --- Wind offset card (shown only when mooring has the feature set up) ---
+  const wind = cal.wind_offset || {};
+  const windEnabledInUi = document.getElementById('wind_offset_enabled').checked;
+  let windCard = '';
+  if (windEnabledInUi) {
+    const currentOffset = wind.current_shallow_extra_depth_m !== null
+      ? wind.current_shallow_extra_depth_m : num('shallow_extra_depth_m', 0);
+    const baselineDrying = wind.current_drying_height_m !== null
+      ? wind.current_drying_height_m : currentDrying;
+    const suggested = wind.suggested_offset_m;
+    const obsCount = wind.observation_count || 0;
+
+    // Only offer Apply when the observation-derived lower bound EXCEEDS
+    // the current stored offset. Observations only provide a lower bound,
+    // so a suggestion at or below the stored value does not justify
+    // reducing it - no evidence the stored value is too high.
+    let windSuggestion = '';
+    if (suggested !== null && suggested !== undefined &&
+        suggested > currentOffset + 0.01) {
+      windSuggestion =
+        `<div class="cal-suggestion">` +
+          `<div class="cal-suggestion-text">` +
+            `Observations require at least <b>+${suggested.toFixed(2)}m</b> ` +
+            `(currently +${currentOffset.toFixed(2)}m)` +
+          `</div>` +
+          `<button class="cal-apply-btn" onclick="applyWindOffset()">Apply</button>` +
+        `</div>`;
+    }
+
+    let windStatus;
+    if (obsCount === 0) {
+      windStatus = 'No qualifying observations yet.';
+    } else {
+      windStatus =
+        `${obsCount} qualifying aground observation(s); ` +
+        `offset must be at least +${(suggested || 0).toFixed(2)}m.`;
+    }
+
+    const windNote =
+      `<div class="cal-note">` +
+      `Calculated against base drying height ${baselineDrying.toFixed(2)}m. ` +
+      `If the base drying height changes, re-check this suggestion.` +
+      `</div>`;
+
+    windCard =
+      `<div class="cal-card">` +
+        `<div class="cal-card-title">Wind Offset (shallow side)</div>` +
+        `<div class="cal-row">` +
+          `<span class="label">Current extra drying:</span> ` +
+          `<span class="value">+${currentOffset.toFixed(2)}m</span>` +
+        `</div>` +
+        `<div class="cal-row" style="color:var(--text-light);">${windStatus}</div>` +
+        windSuggestion +
+        windNote +
+      `</div>`;
+  }
+
+  host.innerHTML = baseCard + windCard;
+
+  // Re-render observation rows if we have them (classifications may have changed)
+  if (lastObservations) renderObservations(lastObservations);
+}
+
+async function applyDryingHeight() {
+  const cfg = getConfig();
+  if (!cfg.mooring_id) return;
+  try {
+    const res = await fetch(
+      `/api/moorings/${cfg.mooring_id}/calibration/apply-drying-height`,
+      {method: 'POST'}
+    );
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Apply failed');
+    if (data.applied) {
+      document.getElementById('drying_height_m').value =
+        Number(data.new).toFixed(2);
+      showStatus(
+        'obs-status',
+        `Drying height updated: ${Number(data.previous).toFixed(2)}m → ` +
+          `${Number(data.new).toFixed(2)}m`,
+        'ok'
+      );
+    } else {
+      showStatus('obs-status', data.reason || 'No change applied.', 'info');
+    }
+    updateCalibrationDisplay(data.calibration);
+  } catch(e) {
+    showStatus('obs-status', e.message, 'err');
+  }
+}
+
+async function applyWindOffset() {
+  const cfg = getConfig();
+  if (!cfg.mooring_id) return;
+  try {
+    const res = await fetch(
+      `/api/moorings/${cfg.mooring_id}/calibration/apply-wind-offset`,
+      {method: 'POST'}
+    );
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Apply failed');
+    if (data.applied) {
+      document.getElementById('shallow_extra_depth_m').value =
+        Number(data.new).toFixed(2);
+      showStatus(
+        'obs-status',
+        `Wind offset updated: +${Number(data.previous).toFixed(2)}m → ` +
+          `+${Number(data.new).toFixed(2)}m`,
+        'ok'
+      );
+    } else {
+      showStatus('obs-status', data.reason || 'No change applied.', 'info');
+    }
+    updateCalibrationDisplay(data.calibration);
+  } catch(e) {
+    showStatus('obs-status', e.message, 'err');
   }
 }
 
@@ -1051,25 +1244,45 @@ async function loadObservations(mooringId) {
   try {
     const res = await fetch(`/api/moorings/${mooringId}/observations`);
     const data = await res.json();
-    const list = document.getElementById('obs-list');
-    const clearSection = document.getElementById('obs-clear-section');
-    if (!data.length) {
-      list.innerHTML = '<p style="color:var(--text-light);font-size:12px;">No observations recorded.</p>';
-      clearSection.classList.add('hidden');
-      return;
-    }
-    clearSection.classList.remove('hidden');
-    list.innerHTML = data.map(o => {
-      const d = new Date(o.timestamp);
-      const ds = d.toLocaleDateString('en-GB', {day:'numeric',month:'short',year:'numeric'});
-      const ts = d.toLocaleTimeString('en-GB', {hour:'2-digit',minute:'2-digit'});
-      let detail = `${ds} ${ts} — <b>${o.state}</b>`;
-      if (o.wind_direction) detail += ` | Wind: ${o.wind_direction}`;
-      if (o.direction_of_lay) detail += ` | Lay: ${o.direction_of_lay}`;
-      detail += ` <button class="btn-sm" style="background:transparent;color:var(--warn);border:1px solid var(--warn);padding:1px 6px;font-size:11px;margin-left:8px;" onclick="deleteObservation(${o.id})">✕</button>`;
-      return `<div class="obs-item">${detail}</div>`;
-    }).join('');
+    lastObservations = data;
+    renderObservations(data);
   } catch(e) { /* silent */ }
+}
+
+function renderObservations(observations) {
+  const list = document.getElementById('obs-list');
+  const clearSection = document.getElementById('obs-clear-section');
+  if (!observations || !observations.length) {
+    list.innerHTML = '<p style="color:var(--text-light);font-size:12px;">No observations recorded.</p>';
+    clearSection.classList.add('hidden');
+    return;
+  }
+  clearSection.classList.remove('hidden');
+
+  // classifications may not yet be available (if loadCalibration hasn't
+  // returned yet); rows without a classification simply get no badge.
+  const classifications = (lastCalibration && lastCalibration.classifications) || {};
+
+  list.innerHTML = observations.map(o => {
+    const d = new Date(o.timestamp);
+    const ds = d.toLocaleDateString('en-GB', {day:'numeric',month:'short',year:'numeric'});
+    const ts = d.toLocaleTimeString('en-GB', {hour:'2-digit',minute:'2-digit'});
+    const cls = classifications[String(o.id)];
+    let badge = '';
+    if (cls) {
+      const cname = cls.classification === 'wind_offset'
+        ? 'obs-badge-wind' : 'obs-badge-base';
+      const label = cls.classification === 'wind_offset'
+        ? 'wind offset' : 'base';
+      const reason = cls.reason ? escapeHtml(cls.reason) : '';
+      badge = `<span class="obs-badge ${cname}" title="${reason}">${label}</span>`;
+    }
+    let detail = `${badge} ${ds} ${ts} — <b>${o.state}</b>`;
+    if (o.wind_direction) detail += ` | Wind: ${o.wind_direction}`;
+    if (o.direction_of_lay) detail += ` | Lay: ${o.direction_of_lay}`;
+    detail += ` <button class="btn-sm" style="background:transparent;color:var(--warn);border:1px solid var(--warn);padding:1px 6px;font-size:11px;margin-left:8px;" onclick="deleteObservation(${o.id})">✕</button>`;
+    return `<div class="obs-item">${detail}</div>`;
+  }).join('');
 }
 
 async function deleteObservation(obsId) {

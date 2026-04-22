@@ -90,7 +90,7 @@ def _curve_interpolate(target: datetime, before: tuple, after: tuple) -> float:
         # Flooding tide
         return _cosine_interp(fraction, h_before, h_after)
     elif et_before == "HighWater" and et_after == "LowWater":
-        # Ebbing tide — apply asymmetry via stand effect
+        # Ebbing tide - apply asymmetry via stand effect
         stand_mins = curve.get("stand_duration_minutes", 30)
         stand_frac = curve.get("stand_height_fraction", 0.95)
 
@@ -100,21 +100,21 @@ def _curve_interpolate(target: datetime, before: tuple, after: tuple) -> float:
             stand_proportion = 0
 
         if fraction < stand_proportion:
-            # During the stand — height stays near HW
+            # During the stand - height stays near HW
             stand_drop = h_before * (1 - stand_frac)
             return h_before - stand_drop * (fraction / stand_proportion)
         else:
-            # After stand — cosine ebb from stand level to LW
+            # After stand - cosine ebb from stand level to LW
             adjusted_fraction = (fraction - stand_proportion) / (1 - stand_proportion)
             stand_height = h_before * stand_frac
             return _cosine_interp(1 - adjusted_fraction, h_after, stand_height)
     else:
-        # Same event types (shouldn't happen with clean data) — linear fallback
+        # Same event types (shouldn't happen with clean data) - linear fallback
         return h_before + (h_after - h_before) * fraction
 
 
 def _cosine_interp(fraction: float, h_low: float, h_high: float) -> float:
-    """Cosine interpolation between low and high values. fraction 0→1 maps low→high."""
+    """Cosine interpolation between low and high values. fraction 0 to 1 maps low to high."""
     fraction = max(0.0, min(1.0, fraction))
     # Cosine gives smooth curve: 0 at fraction=0, 1 at fraction=1
     t = (1 - math.cos(math.pi * fraction)) / 2.0
@@ -153,7 +153,18 @@ def compute_access_windows(
 
     Returns list of window dicts:
         hw_timestamp, hw_height_m, start_time, end_time, duration_minutes,
-        source, wind_adjusted, below_threshold, incomplete_data
+        source, wind_adjusted, below_threshold, incomplete_data,
+        always_accessible
+
+    Window states (mutually exclusive):
+      - below_threshold=True: HW itself doesn't clear the threshold, no window
+      - always_accessible=True: tide never drops below the threshold across
+        the tidal cycle (both bracketing LWs are above threshold). Happens
+        with low or negative drying heights or high-neap LWs.
+      - incomplete_data=True: couldn't find one or both threshold crossings
+        AND couldn't confirm "always accessible" (bracketing LWs missing from
+        the event list, typically at edges of the data window).
+      - otherwise a normal window with start_time / end_time populated.
     """
     base_threshold = drying_height_m + draught_m + safety_margin_m
 
@@ -217,6 +228,59 @@ def compute_access_windows(
             max_hours=7, interval_minutes=interval_minutes
         )
 
+        # Distinguish "always accessible" from "incomplete data":
+        #   - Always accessible: the bracketing LWs on either side of HW are
+        #     themselves above the threshold, so the tide never drops low
+        #     enough to ground the boat. Happens with low or negative drying
+        #     heights, or on shallow neaps where LW is unusually high.
+        #   - Incomplete data: one or both bracketing LWs are missing from
+        #     the event list (edge of data window, typical for first/last HW).
+        if not (start_time and end_time):
+            # Find bracketing LWs within 8 hours either side of HW
+            lw_before = next(
+                (p for p in reversed(parsed)
+                 if p["event_type"] == "LowWater"
+                 and p["dt"] < hw_dt
+                 and (hw_dt - p["dt"]).total_seconds() <= 8 * 3600),
+                None,
+            )
+            lw_after = next(
+                (p for p in parsed
+                 if p["event_type"] == "LowWater"
+                 and p["dt"] > hw_dt
+                 and (p["dt"] - hw_dt).total_seconds() <= 8 * 3600),
+                None,
+            )
+            both_lws_above = (
+                lw_before is not None
+                and lw_after is not None
+                and lw_before["height_m"] >= threshold
+                and lw_after["height_m"] >= threshold
+            )
+
+            if both_lws_above:
+                # Always accessible across this tidal cycle. Report the span
+                # from the trough of one side to the trough of the other so
+                # downstream code has something sensible to work with if it
+                # needs a duration; the UI should show this as a distinct
+                # state rather than a numeric window.
+                windows.append({
+                    "hw_timestamp": hw_ts_str,
+                    "hw_height_m": hw_height,
+                    "start_time": to_utc_str(lw_before["dt"]),
+                    "end_time": to_utc_str(lw_after["dt"]),
+                    "duration_minutes": round(
+                        (lw_after["dt"] - lw_before["dt"]).total_seconds() / 60
+                    ),
+                    "source": source,
+                    "below_threshold": False,
+                    "incomplete_data": False,
+                    "always_accessible": True,
+                    "wind_adjusted": wind_applied_here,
+                })
+                continue
+            # else: fall through to the incomplete-data window below
+
         if start_time and end_time:
             duration = (end_time - start_time).total_seconds() / 60.0
         else:
@@ -231,6 +295,7 @@ def compute_access_windows(
             "source": source,
             "below_threshold": False,
             "incomplete_data": not (start_time and end_time),
+            "always_accessible": False,
             "wind_adjusted": wind_applied_here,
         })
 
@@ -282,7 +347,7 @@ def _find_crossing(
         prev_height = height
         current += step
 
-    # No crossing found — insufficient data or HW below threshold for full range
+    # No crossing found - insufficient data or HW below threshold for full range
     return None
 
 
@@ -292,9 +357,9 @@ def generate_event_uid(mooring_id: int, hw_timestamp: str) -> str:
 
     Uses a tidal cycle number rather than exact HW minutes, so the same
     physical tide gets the same UID regardless of which data source
-    predicted it (harmonic ±30min vs UKHO). The average tidal cycle is
+    predicted it (harmonic +/- 30min vs UKHO). The average tidal cycle is
     12.42 hours; dividing hours-since-epoch by this and rounding gives
-    a cycle ID that's stable for shifts of up to ±3 hours.
+    a cycle ID that's stable for shifts of up to +/- 3 hours.
     """
     dt = dtparse.parse(hw_timestamp)
     if dt.tzinfo is None:

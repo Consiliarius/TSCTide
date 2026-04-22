@@ -346,49 +346,96 @@ def clear_observations(mooring_id: int) -> int:
         return result.rowcount
 
 
+def _load_classification_inputs(mooring_id: int):
+    """
+    Shared loader for calibration entry points. Returns a tuple:
+      (mooring, observations, tide_events, wind_observations, classifications)
+    where classifications is a list of dicts from
+    observation_classifier.classify_observations, one per observation,
+    in the same order as observations.
+
+    Returns (None, [], [], [], []) if the mooring does not exist.
+
+    Callers must not assume the data sets are bounded to a particular
+    date range - the full history is pulled so that older observations
+    can still be classified against older HW data.
+    """
+    from app.observation_classifier import classify_observations
+
+    mooring = get_mooring(mooring_id)
+    if not mooring:
+        return None, [], [], [], []
+
+    observations = get_observations(mooring_id)
+    tide_events = get_tide_events("2000-01-01", "2099-12-31")
+    wind_observations = get_wind_observations_in_range(
+        "2000-01-01", "2099-12-31"
+    )
+    classifications = classify_observations(
+        observations, mooring, tide_events, wind_observations
+    )
+    return mooring, observations, tide_events, wind_observations, classifications
+
+
 def calibrate_drying_height(mooring_id: int) -> dict:
     """
-    Estimate drying height from observations tied to a specific mooring.
+    Estimate base drying height from observations tied to this mooring.
+
+    Afloat observations always contribute an upper bound. Aground
+    observations classified "wind_offset" by app.observation_classifier
+    are excluded here *only when their implied offset is strictly
+    positive* - in that case they go to calibrate_wind_offset. Aground
+    observations whose implied offset is non-positive fall through and
+    contribute a lower bound to base drying, since they still record a
+    grounding height even if the shallow-side offset is not constrained.
 
     Returns a dict with:
         best_estimate: float or None
         lower_bound: float or None (from aground observations)
         upper_bound: float or None (from afloat observations)
-        confidence: str ('high', 'medium', 'low', 'partial-low', 'partial-high', 'inconsistent', 'none')
+        confidence: str ('high', 'medium', 'low', 'partial-low',
+                         'partial-high', 'inconsistent', 'none')
         matched: int (observations matched to tidal data)
         unmatched: int (observations outside tidal data range)
-        afloat_count: int
-        aground_count: int
+        afloat_count: int (base-classified afloat observations used)
+        aground_count: int (aground observations feeding base-drying's
+            lower bound; includes wind-offset-classified observations
+            whose implied offset was non-positive and therefore fell
+            through to base drying)
+        excluded_wind_offset_count: int (wind-offset-classified aground
+            observations whose implied offset was strictly positive and
+            therefore went to calibrate_wind_offset instead of feeding
+            the base-drying lower bound)
     """
-    observations = get_observations(mooring_id)
     result = {
         "best_estimate": None, "lower_bound": None, "upper_bound": None,
         "confidence": "none", "matched": 0, "unmatched": 0,
         "afloat_count": 0, "aground_count": 0,
+        "excluded_wind_offset_count": 0,
     }
-    if not observations:
-        return result
 
-    tide_events = get_tide_events("2000-01-01", "2099-12-31")
-    if not tide_events:
+    mooring, observations, tide_events, _wind, classifications = (
+        _load_classification_inputs(mooring_id)
+    )
+    if not mooring or not observations or not tide_events:
         return result
 
     from app.access_calc import interpolate_height_at_time
-
-    mooring = get_mooring(mooring_id)
-    if not mooring:
-        return result
     draught = mooring["draught_m"]
+    try:
+        current_drying = float(mooring.get("drying_height_m") or 0.0)
+    except (TypeError, ValueError):
+        current_drying = 0.0
 
     upper_bounds = []
     lower_bounds = []
 
-    for obs in observations:
-        if obs["state"] not in ("afloat", "aground"):
+    for cls in classifications:
+        obs = cls["observation"]
+        if obs.get("state") not in ("afloat", "aground"):
             continue
 
-        obs_time = obs["timestamp"]
-        height = interpolate_height_at_time(obs_time, tide_events)
+        height = interpolate_height_at_time(obs["timestamp"], tide_events)
         if height is None:
             result["unmatched"] += 1
             continue
@@ -399,9 +446,29 @@ def calibrate_drying_height(mooring_id: int) -> dict:
         if obs["state"] == "afloat":
             upper_bounds.append(implied_drying)
             result["afloat_count"] += 1
-        elif obs["state"] == "aground":
-            lower_bounds.append(implied_drying)
-            result["aground_count"] += 1
+            continue
+
+        # Aground observation from here on.
+        if cls["classification"] == "wind_offset":
+            # Does this observation actually constrain the wind offset?
+            # An aground obs implies offset >= h - draught - current_drying.
+            # If that is non-positive, the current base drying alone
+            # explains the grounding height and the obs provides no new
+            # information about the offset - but it is still a valid
+            # aground observation for base drying. Fall it through to the
+            # base-drying lower-bound pool below.
+            #
+            # This gate must stay in sync with calibrate_wind_offset,
+            # which uses the same `implied > 0` test to decide which
+            # observations contribute to the offset calibration.
+            implied_offset = implied_drying - current_drying
+            if implied_offset > 0:
+                result["excluded_wind_offset_count"] += 1
+                continue
+            # else: fall through
+
+        lower_bounds.append(implied_drying)
+        result["aground_count"] += 1
 
     if not upper_bounds and not lower_bounds:
         return result
@@ -433,6 +500,93 @@ def calibrate_drying_height(mooring_id: int) -> dict:
         result["best_estimate"] = round(upper - 0.15, 2)
         result["confidence"] = "partial-high"
 
+    return result
+
+
+def calibrate_wind_offset(mooring_id: int) -> dict:
+    """
+    Estimate the required shallow-side wind offset from aground
+    observations classified as "wind_offset" by
+    app.observation_classifier.
+
+    Only aground observations are used in v1. Each such observation
+    implies: h(obs_time) <= draught + base_drying + wind_offset, i.e.
+    wind_offset >= h(obs_time) - draught - base_drying. The returned
+    suggestion is the tightest (largest) of these lower bounds.
+
+    The mooring's currently-stored drying_height_m is used as the
+    baseline. If the base drying height is updated, this calibration
+    should be re-run.
+
+    Returns a dict with:
+        suggested_offset_m: float or None
+        lower_bound: float or None (same value; kept for symmetry with
+                     calibrate_drying_height)
+        confidence: str ('partial-low' if any data, else 'none')
+        observation_count: int (qualifying aground obs used)
+        current_drying_height_m: float
+        current_shallow_extra_depth_m: float
+    """
+    result = {
+        "suggested_offset_m": None,
+        "lower_bound": None,
+        "confidence": "none",
+        "observation_count": 0,
+        "current_drying_height_m": None,
+        "current_shallow_extra_depth_m": None,
+    }
+
+    mooring, observations, tide_events, _wind, classifications = (
+        _load_classification_inputs(mooring_id)
+    )
+    if not mooring:
+        return result
+
+    try:
+        current_drying = float(mooring.get("drying_height_m") or 0.0)
+    except (TypeError, ValueError):
+        current_drying = 0.0
+    try:
+        current_offset = float(mooring.get("shallow_extra_depth_m") or 0.0)
+    except (TypeError, ValueError):
+        current_offset = 0.0
+    draught = mooring["draught_m"]
+
+    result["current_drying_height_m"] = round(current_drying, 2)
+    result["current_shallow_extra_depth_m"] = round(current_offset, 2)
+
+    if not observations or not tide_events:
+        return result
+
+    from app.access_calc import interpolate_height_at_time
+
+    implied_lower_bounds = []
+    for cls in classifications:
+        if cls["classification"] != "wind_offset":
+            continue
+        obs = cls["observation"]
+        height = interpolate_height_at_time(obs["timestamp"], tide_events)
+        if height is None:
+            continue
+        # Aground at height h implies: offset >= h - draught - base_drying.
+        # Negative implied offset values mean the observation is already
+        # consistent with the base drying alone (no offset needed); those
+        # do not constrain the offset and are skipped.
+        implied = height - draught - current_drying
+        if implied > 0:
+            implied_lower_bounds.append(implied)
+
+    result["observation_count"] = len(implied_lower_bounds)
+
+    if not implied_lower_bounds:
+        return result
+
+    suggested = max(implied_lower_bounds)  # tightest lower bound
+    result["suggested_offset_m"] = round(suggested, 2)
+    result["lower_bound"] = round(suggested, 2)
+    # v1 uses aground-only data, which can only ever produce a lower bound.
+    # Confidence stays at partial-low regardless of count.
+    result["confidence"] = "partial-low"
     return result
 
 
@@ -631,6 +785,22 @@ def get_latest_wind(before: str = None) -> Optional[dict]:
                 "SELECT * FROM wind_observations ORDER BY timestamp DESC LIMIT 1"
             ).fetchone()
     return dict(row) if row else None
+
+
+def get_wind_observations_in_range(start: str, end: str) -> list[dict]:
+    """
+    Return all wind observations with timestamps between start and end
+    (inclusive, ISO strings). Used by the observation classifier to match
+    aground observations against historical HW+4h wind samples.
+    """
+    with db_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM wind_observations "
+            "WHERE timestamp >= ? AND timestamp <= ? "
+            "ORDER BY timestamp",
+            (start, end)
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 # --- Activity Log ---

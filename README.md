@@ -152,7 +152,9 @@ The calibration system computes upper bounds (from afloat observations) and lowe
 | ●○○ Partial | Only afloat or only aground data |
 | ⚠ Inconsistent | Bounds conflict |
 
-Individual observations can be deleted, or all observations for a mooring can be cleared.
+Observations that qualify for wind-offset calibration (see **Wind Offset** below) are routed to that calibration instead of contributing to the base drying height. A running count of such routed observations is shown in the UI.
+
+**Applying calibration**. Suggested values from observations are displayed in the Calibration Status card as proposals only: they are not written to the mooring configuration automatically. When a suggestion differs from the currently stored value, an **Apply** button appears next to it; clicking Apply updates the mooring config, recomputes future access windows, and regenerates the iCal feed. Individual observations can be deleted, or all observations for a mooring can be cleared; either action also updates the suggestion, but never the stored config.
 
 ## iCal Feeds
 
@@ -214,3 +216,9 @@ For swing moorings at the edge of a channel, the effective drying height depends
 The offset uses a three-sector trigger: if shallow water is to the W, the offset activates when wind is from E, NE, or SE.
 
 Trot (fore-and-aft) moorings that cannot swing, or deep-channel moorings with negligible depth variation, should leave this feature disabled.
+
+### Calibrating the wind offset from observations
+
+An aground observation only contributes to wind-offset calibration when the HW+4h wind sample of the preceding cycle shows wind pushing toward the shallow side, **and** the observed direction of lay matches that wind direction within one compass sector. Aground observations recorded when the wind was not pushing toward shallow carry no information about the magnitude of the offset — they tell you the boat grounded, but not whether the shallow side was involved — and are treated as base drying observations instead.
+
+The calibration also depends on the currently stored base drying height: the implied minimum offset is `observed_height − draught − drying_height`. If the base drying height is updated via the Apply button, the wind-offset suggestion should be re-checked, since its arithmetic baseline has shifted. The UI shows an inline note recording which base drying height was used for the current suggestion.
