@@ -181,20 +181,23 @@ The feed includes `REFRESH-INTERVAL` and `X-PUBLISHED-TTL` metadata for proper c
 
 ## Model Accuracy
 
-The harmonic model was calibrated in April 2026 against 388 Admiralty reference points (91 HW/LW events, 7 spring HW references, and 288 half-hourly height samples) spanning April to December 2026. Fit quality:
+The harmonic model was calibrated in April 2026 against 388 Admiralty reference points (91 HW/LW events, 7 spring HW references, and 288 half-hourly height samples) spanning April to December 2026. It was then validated in April 2026 against a further 710 Admiralty Portsmouth reference points (355 HW + 355 LW) drawn from six months spanning July 2026 to December 2027.
 
-| Metric | Value |
-|--------|-------|
-| Height RMS (half-hourly points) | ~0.10m |
-| Height RMS (HW/LW peaks) | ~0.39m (dominated by Solent stand effect) |
-| HW timing standard deviation | ~17 min |
-| LW timing standard deviation | ~19 min |
+The validation exercise identified a consistent systematic bias: the mathematical peak of the harmonic curve falls approximately 34 minutes later than the Admiralty's published HW time, and the mathematical trough about 28 minutes later than the published LW time. The most plausible explanation is a convention difference — the Admiralty's published HW/LW times are likely to correspond to the mid-point of the Solent's extended stand rather than the mathematical turning point — but this has not been independently verified. `predict_events()` applies a post-processing shift to align reported event timestamps with Admiralty convention. Heights at any given clock time are unaffected — the underlying tidal curve used for access-window calculations is not modified.
 
-The larger HW/LW peak RMS reflects the Solent's extended HW stand: the mathematical peak of the harmonic model falls earlier than the published HW time, which represents the mid-point of the stand. For access window calculations this is not significant since the curve shape (and therefore the threshold crossing times) is accurate.
+Accuracy after the Admiralty-convention offset is applied, measured against the 710-point validation set:
+
+| Metric | HW | LW |
+|--------|-------|-------|
+| Timing bias (mean) | +0.2 min | −0.1 min |
+| Timing standard deviation | 14.6 min | 19.5 min |
+| Height bias (mean) | +0.02m | +0.05m |
+| Height standard deviation | 0.13m | 0.19m |
 
 The Langstone secondary port offset (Portsmouth → Langstone: +9min, +0.05m HW) was validated against UKHO half-hourly data for both ports in April 2026. The earlier figure of +0.24m HW height offset was reduced to +0.05m based on observed data; LW times and heights are effectively identical between the two ports.
 
 UKHO data remains the most accurate source (Langstone-native, 7-day range). KHM data is second-most accurate within its ~30-day range. The harmonic model provides unlimited-range estimates with the accuracy above — events from this source are prefixed "est." in calendar titles.
+
 
 ## UKHO API Licensing
 
