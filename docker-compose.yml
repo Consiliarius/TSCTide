@@ -5,7 +5,7 @@ services:
     ports:
       - "${PORT:-8866}:8866"
     volumes:
-      - tidal-data:/app/data
+      - ./data:/app/data
     env_file:
       - .env
     restart: unless-stopped
@@ -26,6 +26,3 @@ services:
     depends_on:
       - tidal-access
     restart: unless-stopped
-
-volumes:
-  tidal-data:
