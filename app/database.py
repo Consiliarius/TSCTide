@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS moorings (
     shallow_extra_depth_m REAL DEFAULT 0.0,
     calendar_enabled INTEGER DEFAULT 0,
     use_observations INTEGER DEFAULT 0,
+    pin_hash TEXT DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -108,6 +109,14 @@ CREATE TABLE IF NOT EXISTS activity_log (
 CREATE INDEX IF NOT EXISTS idx_activity_ts ON activity_log(timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_activity_scope ON activity_log(scope, timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_activity_mooring ON activity_log(mooring_id, timestamp DESC);
+
+CREATE TABLE IF NOT EXISTS pin_failed_attempts (
+    mooring_id INTEGER PRIMARY KEY,
+    failed_count INTEGER NOT NULL DEFAULT 0,
+    first_failed_at TEXT NOT NULL,
+    locked_until TEXT,
+    FOREIGN KEY (mooring_id) REFERENCES moorings(mooring_id)
+);
 """
 
 
@@ -148,6 +157,8 @@ def init_db():
     mooring_cols = {row[1] for row in cursor2.fetchall()}
     if "use_observations" not in mooring_cols:
         conn.execute("ALTER TABLE moorings ADD COLUMN use_observations INTEGER DEFAULT 0")
+    if "pin_hash" not in mooring_cols:
+        conn.execute("ALTER TABLE moorings ADD COLUMN pin_hash TEXT DEFAULT ''")
     conn.commit()
     conn.close()
 
@@ -389,6 +400,185 @@ def clear_observations(mooring_id: int) -> int:
             (mooring_id,)
         )
         return result.rowcount
+
+
+# --- PIN Protection (v2) ---
+#
+# PIN hashes are stored on the moorings table in column pin_hash. An
+# empty string means "unclaimed" - the next write to a PIN-gated endpoint
+# triggers the claim flow (user sets a new PIN).
+#
+# Rate limiting is tracked in pin_failed_attempts, keyed by mooring_id.
+# Policy: up to MAX_PIN_ATTEMPTS failures within PIN_ATTEMPT_WINDOW_MINUTES
+# before the mooring is locked for PIN_LOCKOUT_MINUTES. These constants
+# live in app.pin so they can be imported by other modules without
+# creating a database dependency.
+
+def get_mooring_pin_hash(mooring_id: int) -> Optional[str]:
+    """
+    Return the stored PIN hash for a mooring, or None if the mooring
+    does not exist, or an empty string if the mooring exists but is
+    unclaimed. Callers must distinguish those two cases.
+    """
+    with db_connection() as conn:
+        row = conn.execute(
+            "SELECT pin_hash FROM moorings WHERE mooring_id = ?",
+            (mooring_id,)
+        ).fetchone()
+    if row is None:
+        return None
+    return row["pin_hash"] or ""
+
+
+def set_mooring_pin_hash(mooring_id: int, pin_hash: str) -> bool:
+    """
+    Store a PIN hash on an existing mooring row. Returns True on success,
+    False if no such mooring exists. Does NOT create a mooring row;
+    callers should ensure the row exists first (save_mooring).
+    """
+    now = to_utc_str(datetime.now(timezone.utc))
+    with db_connection() as conn:
+        result = conn.execute(
+            "UPDATE moorings SET pin_hash = ?, updated_at = ? WHERE mooring_id = ?",
+            (pin_hash, now, mooring_id)
+        )
+        return result.rowcount > 0
+
+
+def clear_mooring_pin_hash(mooring_id: int) -> bool:
+    """
+    Remove the stored PIN hash from a mooring (returning it to the
+    unclaimed state). Used by the admin-reset procedure if invoked
+    through Python; the documented reset flow is to overwrite with a
+    known hash via direct SQL.
+    """
+    return set_mooring_pin_hash(mooring_id, "")
+
+
+def check_pin_lockout(mooring_id: int) -> Optional[dict]:
+    """
+    Return None if the mooring is not currently locked. If locked,
+    returns {"locked_until": iso_str, "seconds_remaining": int}. The
+    caller is responsible for returning a 429 with this information.
+
+    A lockout expires naturally once locked_until is in the past; this
+    function does not delete the row (cleared on next successful PIN
+    verify or next failed attempt that starts a new window).
+    """
+    with db_connection() as conn:
+        row = conn.execute(
+            "SELECT locked_until FROM pin_failed_attempts WHERE mooring_id = ?",
+            (mooring_id,)
+        ).fetchone()
+    if row is None or not row["locked_until"]:
+        return None
+    locked_until = dtparse_iso(row["locked_until"])
+    now = datetime.now(timezone.utc)
+    if locked_until <= now:
+        return None
+    return {
+        "locked_until": row["locked_until"],
+        "seconds_remaining": int((locked_until - now).total_seconds()),
+    }
+
+
+def record_failed_pin_attempt(mooring_id: int,
+                              max_attempts: int,
+                              window_minutes: int,
+                              lockout_minutes: int) -> dict:
+    """
+    Record a failed PIN attempt and return the post-attempt state.
+
+    Policy:
+      - First failure (no row, or first_failed_at older than
+        window_minutes ago): failed_count := 1, first_failed_at := now.
+      - Subsequent failure within the window: failed_count increments.
+      - When failed_count reaches max_attempts: locked_until := now +
+        lockout_minutes. Any further attempts in the lockout window
+        continue to be rejected by check_pin_lockout before reaching
+        this function.
+
+    Returns: {
+        "failed_count":        current count,
+        "attempts_remaining": max(0, max_attempts - failed_count),
+        "locked_until":       iso_str or None,
+    }
+    """
+    now = datetime.now(timezone.utc)
+    now_str = to_utc_str(now)
+    window = timedelta(minutes=window_minutes)
+
+    with db_connection() as conn:
+        row = conn.execute(
+            "SELECT failed_count, first_failed_at, locked_until "
+            "FROM pin_failed_attempts WHERE mooring_id = ?",
+            (mooring_id,)
+        ).fetchone()
+
+        if row is None:
+            failed_count = 1
+            first_failed_at = now_str
+        else:
+            first_seen = dtparse_iso(row["first_failed_at"])
+            if (now - first_seen) > window:
+                # Previous window expired; start a new one.
+                failed_count = 1
+                first_failed_at = now_str
+            else:
+                failed_count = row["failed_count"] + 1
+                first_failed_at = row["first_failed_at"]
+
+        locked_until_str = None
+        if failed_count >= max_attempts:
+            locked_until_str = to_utc_str(
+                now + timedelta(minutes=lockout_minutes)
+            )
+
+        conn.execute(
+            "INSERT INTO pin_failed_attempts "
+            "(mooring_id, failed_count, first_failed_at, locked_until) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(mooring_id) DO UPDATE SET "
+            "  failed_count = excluded.failed_count, "
+            "  first_failed_at = excluded.first_failed_at, "
+            "  locked_until = excluded.locked_until",
+            (mooring_id, failed_count, first_failed_at, locked_until_str)
+        )
+
+    return {
+        "failed_count": failed_count,
+        "attempts_remaining": max(0, max_attempts - failed_count),
+        "locked_until": locked_until_str,
+    }
+
+
+def clear_failed_pin_attempts(mooring_id: int) -> None:
+    """
+    Delete the failed-attempts row for a mooring. Called after a
+    successful PIN verification.
+    """
+    with db_connection() as conn:
+        conn.execute(
+            "DELETE FROM pin_failed_attempts WHERE mooring_id = ?",
+            (mooring_id,)
+        )
+
+
+def dtparse_iso(ts: str) -> datetime:
+    """
+    Parse an ISO timestamp stored by to_utc_str (format
+    'YYYY-MM-DDTHH:MM:SSZ') back to a timezone-aware UTC datetime.
+    Local helper to avoid a top-of-file dateutil import when the rest of
+    the module uses raw datetime.
+    """
+    # The 'Z' suffix is equivalent to +00:00 in ISO 8601; fromisoformat
+    # before Python 3.11 does not accept 'Z', so normalise first.
+    if ts.endswith("Z"):
+        ts = ts[:-1] + "+00:00"
+    dt = datetime.fromisoformat(ts)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def load_classification_inputs(mooring_id: int):

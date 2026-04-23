@@ -37,6 +37,14 @@ WIND_SAMPLE_HW_OFFSET_HOURS = float(os.environ.get("WIND_SAMPLE_HW_OFFSET_HOURS"
 LOCATION_LAT = float(os.environ.get("LOCATION_LAT", "50.8185"))
 LOCATION_LON = float(os.environ.get("LOCATION_LON", "-0.9806"))
 
+# PIN protection (v2)
+# Site-wide salt used when hashing mooring PINs. Must be set in .env for
+# PIN operations to succeed. Kept separate from the database so that
+# someone with only the database file cannot independently reproduce
+# hashes without also obtaining the salt. See README for admin-reset
+# procedure.
+PIN_HASH_SALT = os.environ.get("PIN_HASH_SALT", "")
+
 # Defaults
 DEFAULT_TIMEZONE = os.environ.get("DEFAULT_TIMEZONE", "Europe/London")
 
