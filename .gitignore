@@ -6,10 +6,15 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Data (persisted via Docker volume)
-data/tides.db
-data/feeds/
-data/model_config.json
+# Data directory — bind-mounted to container at /app/data.
+# All contents are runtime/user data and must not be committed.
+# The directory itself is tracked via .gitkeep so it exists on fresh clone
+# (Docker requires the bind mount target to exist on the host before compose up).
+data/*
+!data/.gitkeep
+
+# Operational backups
+*.bak
 
 # OS
 .DS_Store
