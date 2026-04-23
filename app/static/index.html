@@ -605,6 +605,11 @@ let lastSource = '';
 // merge classifications into the observation rows without an extra fetch.
 let lastCalibration = null;
 let lastObservations = null;
+// Mooring Configs tab: tracks which mooring IDs have had their activity
+// log fetched since the tab was last opened. Used by toggleMooringPanel
+// to lazy-load activity on the first expand only, rather than on every
+// expand or up-front for every mooring.
+const mooringActivityLoaded = new Set();
 
 // --- Panel toggle ---
 function togglePanel(id) {
@@ -1418,6 +1423,11 @@ async function loadSystemLog() {
 
 async function loadMooringConfigs() {
   const container = document.getElementById('moorings-list');
+  // Reset the lazy-load cache each time the tab is (re)opened so that
+  // expanding a mooring panel always shows fresh activity rather than
+  // data cached from a previous visit. All panels render collapsed, so
+  // no activity is fetched until the user explicitly expands one.
+  mooringActivityLoaded.clear();
   try {
     const res = await fetch('/api/moorings');
     const moorings = await res.json();
@@ -1427,56 +1437,88 @@ async function loadMooringConfigs() {
     }
     let html = '';
     for (const m of moorings) {
-      const name = m.boat_name || '<span style="color:var(--text-light);">(unnamed)</span>';
-      html += `<div class="mooring-card">` +
-        `<h3>Mooring #${m.mooring_id} — ${name}</h3>` +
-        `<div class="config-grid">` +
-          `<div><span class="label">Draught:</span> <span class="value">${m.draught_m.toFixed(2)}m</span></div>` +
-          `<div><span class="label">Drying height:</span> <span class="value">${m.drying_height_m.toFixed(2)}m</span></div>` +
-          `<div><span class="label">Safety margin:</span> <span class="value">${m.safety_margin_m.toFixed(2)}m</span></div>` +
-          `<div><span class="label">Calendar feed:</span> <span class="value">${m.calendar_enabled ? 'Enabled' : 'Disabled'}</span></div>` +
-          `<div><span class="label">Observational data:</span> <span class="value">${m.use_observations ? 'Enabled' : 'Disabled'}</span></div>` +
-          `<div><span class="label">Wind offset:</span> <span class="value">${m.wind_offset_enabled ? 'Enabled' : 'Disabled'}</span></div>` +
-        `</div>`;
+      // Collapsed-state summary line, e.g.:
+      //   #42 — Kerry Dancer · 2.10m drying · calendar feed enabled
+      // Boat name is omitted if not set. The "enabled" flags are only
+      // included when true, keeping the line short when there is less
+      // to say about a mooring.
+      const nameSegment = m.boat_name
+        ? `#${m.mooring_id} — ${escapeHtml(m.boat_name)}`
+        : `#${m.mooring_id}`;
+      const extras = [`${m.drying_height_m.toFixed(2)}m drying`];
+      if (m.calendar_enabled) extras.push('calendar feed enabled');
+      const summary = `${nameSegment} · ${extras.join(' · ')}`;
+
+      html += `<div class="panel">` +
+        `<div class="panel-header" onclick="toggleMooringPanel(${m.mooring_id})">` +
+          `<span>${summary}</span>` +
+          `<span class="toggle" id="mooring-toggle-${m.mooring_id}">▶</span>` +
+        `</div>` +
+        `<div class="panel-body collapsed" id="mooring-body-${m.mooring_id}">` +
+          `<div class="config-grid">` +
+            `<div><span class="label">Draught:</span> <span class="value">${m.draught_m.toFixed(2)}m</span></div>` +
+            `<div><span class="label">Drying height:</span> <span class="value">${m.drying_height_m.toFixed(2)}m</span></div>` +
+            `<div><span class="label">Safety margin:</span> <span class="value">${m.safety_margin_m.toFixed(2)}m</span></div>` +
+            `<div><span class="label">Calendar feed:</span> <span class="value">${m.calendar_enabled ? 'Enabled' : 'Disabled'}</span></div>` +
+            `<div><span class="label">Observational data:</span> <span class="value">${m.use_observations ? 'Enabled' : 'Disabled'}</span></div>` +
+            `<div><span class="label">Wind offset:</span> <span class="value">${m.wind_offset_enabled ? 'Enabled' : 'Disabled'}</span></div>` +
+          `</div>`;
       if (m.wind_offset_enabled && m.shallow_direction) {
         html += `<div style="font-size:12px;margin-top:6px;color:var(--text-light);">` +
           `Shallow side: <b>${m.shallow_direction}</b>, extra drying: <b>+${(m.shallow_extra_depth_m || 0).toFixed(2)}m</b>` +
           `</div>`;
       }
-      html += `<div style="margin-top:10px;"><div style="font-size:12px;font-weight:600;color:var(--navy);margin-bottom:4px;">Activity (last 7 days)</div>` +
-        `<div id="mooring-activity-${m.mooring_id}" style="font-size:12px;"><em style="color:var(--text-light);">Loading...</em></div>` +
-        `</div></div>`;
+      html += `<div style="margin-top:10px;">` +
+          `<div style="font-size:12px;font-weight:600;color:var(--navy);margin-bottom:4px;">Activity (last 7 days)</div>` +
+          `<div id="mooring-activity-${m.mooring_id}" style="font-size:12px;">` +
+            `<em style="color:var(--text-light);">Expand to load activity.</em>` +
+          `</div>` +
+        `</div>` +
+        `</div>` +
+      `</div>`;
     }
     container.innerHTML = html;
-
-    // Fetch activity for each mooring in parallel
-    for (const m of moorings) {
-      fetch(`/api/activity-log?scope=mooring&mooring_id=${m.mooring_id}&limit=100`)
-        .then(r => r.json())
-        .then(entries => {
-          const target = document.getElementById(`mooring-activity-${m.mooring_id}`);
-          if (!target) return;
-          if (!entries.length) {
-            target.innerHTML = '<em style="color:var(--text-light);">No recent activity.</em>';
-            return;
-          }
-          let rows = entries.map(e => {
-            const sev = e.severity || 'info';
-            return `<div style="padding:3px 0;border-bottom:1px solid var(--border);">` +
-              `<span class="sev-badge sev-${sev}">${sev}</span> ` +
-              `<span style="color:var(--text-light);">${fmtLogTime(e.timestamp)}</span> — ` +
-              `${escapeHtml(e.message)}</div>`;
-          }).join('');
-          target.innerHTML = rows;
-        })
-        .catch(() => {
-          const target = document.getElementById(`mooring-activity-${m.mooring_id}`);
-          if (target) target.innerHTML = '<em style="color:var(--warn);">Failed to load activity.</em>';
-        });
-    }
+    // Activity is NOT fetched up front; see toggleMooringPanel().
   } catch(e) {
     container.innerHTML = `<p style="color:var(--warn);font-size:12px;">Failed: ${escapeHtml(e.message)}</p>`;
   }
+}
+
+function toggleMooringPanel(mooringId) {
+  const body = document.getElementById(`mooring-body-${mooringId}`);
+  const toggle = document.getElementById(`mooring-toggle-${mooringId}`);
+  if (!body || !toggle) return;
+  const wasCollapsed = body.classList.contains('collapsed');
+  body.classList.toggle('collapsed');
+  toggle.textContent = wasCollapsed ? '▼' : '▶';
+  if (wasCollapsed && !mooringActivityLoaded.has(mooringId)) {
+    mooringActivityLoaded.add(mooringId);
+    loadMooringActivity(mooringId);
+  }
+}
+
+function loadMooringActivity(mooringId) {
+  fetch(`/api/activity-log?scope=mooring&mooring_id=${mooringId}&limit=100`)
+    .then(r => r.json())
+    .then(entries => {
+      const target = document.getElementById(`mooring-activity-${mooringId}`);
+      if (!target) return;
+      if (!entries.length) {
+        target.innerHTML = '<em style="color:var(--text-light);">No recent activity.</em>';
+        return;
+      }
+      target.innerHTML = entries.map(e => {
+        const sev = e.severity || 'info';
+        return `<div style="padding:3px 0;border-bottom:1px solid var(--border);">` +
+          `<span class="sev-badge sev-${sev}">${sev}</span> ` +
+          `<span style="color:var(--text-light);">${fmtLogTime(e.timestamp)}</span> — ` +
+          `${escapeHtml(e.message)}</div>`;
+      }).join('');
+    })
+    .catch(() => {
+      const target = document.getElementById(`mooring-activity-${mooringId}`);
+      if (target) target.innerHTML = '<em style="color:var(--warn);">Failed to load activity.</em>';
+    });
 }
 </script>
 
