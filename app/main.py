@@ -24,8 +24,9 @@ from app.config import (
 from app.database import (
     init_db, save_mooring, get_mooring, get_all_moorings,
     add_observation, get_observations, delete_observation, clear_observations,
-    store_tide_events, get_tide_events,
+    store_tide_events, get_tide_events, get_ukho_tide_events,
     calibrate_drying_height, calibrate_wind_offset,
+    load_classification_inputs,
     get_wind_observations_in_range,
     delete_future_events, get_calendar_events, log_activity, get_activity_log,
 )
@@ -35,7 +36,7 @@ from app.khm_parser import parse_khm_paste
 from app.harmonic import predict_events as harmonic_predict_events
 from app.secondary_port import apply_offset
 from app.wind import fetch_current_wind, should_apply_offset
-from app.access_calc import compute_access_windows, generate_event_uid
+from app.access_calc import compute_access_windows, generate_event_uid, invalidate_model_config_cache
 from app.ical_manager import (
     generate_export_ics, store_windows_as_events,
     generate_feed_for_mooring,
@@ -71,29 +72,29 @@ def _build_calibration_response(mooring_id: int) -> dict:
     level (for back-compat), wind_offset sub-object, and a classifications
     map keyed by observation id. Used by GET /calibration and as the
     response body for observation mutations.
-    """
-    base = calibrate_drying_height(mooring_id)
-    wind = calibrate_wind_offset(mooring_id)
 
-    observations = get_observations(mooring_id)
-    mooring = get_mooring(mooring_id)
+    All three components (drying calibration, wind offset calibration,
+    classifications map) share a single data-loading pass via
+    load_classification_inputs, avoiding redundant DB queries and
+    classifier passes.
+    """
+    preloaded = load_classification_inputs(mooring_id)
+    base = calibrate_drying_height(mooring_id, _preloaded=preloaded)
+    wind = calibrate_wind_offset(mooring_id, _preloaded=preloaded)
+
+    # Build classifications map from the pre-loaded classifier output
     classifications_map = {}
-    if mooring and observations:
-        tide_events = get_tide_events("2000-01-01", "2099-12-31")
-        wind_obs = get_wind_observations_in_range("2000-01-01", "2099-12-31")
-        classified = classify_observations(
-            observations, mooring, tide_events, wind_obs
-        )
-        for entry in classified:
-            obs_id = entry["observation"].get("id")
-            if obs_id is None:
-                continue
-            classifications_map[str(obs_id)] = {
-                "classification": entry["classification"],
-                "reason": entry["reason"],
-                "hw_timestamp": entry["hw_timestamp"],
-                "wind_compass": entry["wind_compass"],
-            }
+    _mooring, _observations, _tide_events, _wind_obs, classified = preloaded
+    for entry in classified:
+        obs_id = entry["observation"].get("id")
+        if obs_id is None:
+            continue
+        classifications_map[str(obs_id)] = {
+            "classification": entry["classification"],
+            "reason": entry["reason"],
+            "hw_timestamp": entry["hw_timestamp"],
+            "wind_compass": entry["wind_compass"],
+        }
 
     response = dict(base)
     response["wind_offset"] = wind
@@ -108,18 +109,20 @@ def _recompute_future_windows(mooring_id: int):
     the iCal feed if calendar subscription is enabled.
 
     Does nothing if no UKHO data is available. Uses the mooring's current
-    stored configuration.
+    stored configuration. Uses get_ukho_tide_events() so that Portsmouth
+    fallback data receives the secondary port correction transparently.
     """
     m = get_mooring(mooring_id)
     if not m:
         return
 
-    now = to_utc_str(datetime.now(timezone.utc))
-    delete_future_events(mooring_id, now)
+    now = datetime.now(timezone.utc)
+    now_str = to_utc_str(now)
+    delete_future_events(mooring_id, now_str)
 
-    query_start = to_utc_str(datetime.now(timezone.utc) - timedelta(hours=13))
-    end = to_utc_str(datetime.now(timezone.utc) + timedelta(days=7))
-    tide_data = get_tide_events(query_start, end, source="ukho")
+    query_start = to_utc_str(now - timedelta(hours=13))
+    end = to_utc_str(now + timedelta(days=7))
+    tide_data = get_ukho_tide_events(query_start, end)
     if not tide_data:
         return
 
@@ -130,6 +133,10 @@ def _recompute_future_windows(mooring_id: int):
         safety_margin_m=m["safety_margin_m"],
         source="ukho",
     )
+    # Filter out windows for HW events in the 13h lookback window — those
+    # were included only for interpolation context, not as real future windows.
+    windows = [w for w in windows if w["hw_timestamp"] >= now_str]
+
     cal = calibrate_drying_height(mooring_id)
     calc_params = {
         "draught_m": m["draught_m"],
@@ -204,7 +211,6 @@ async def save_mooring_config(request: Request):
         raise HTTPException(400, "mooring_id must be between 1 and 100")
     result = save_mooring(data)
 
-    # Record configuration change to activity log
     log_activity(
         event_type="mooring_config",
         message=(
@@ -227,9 +233,6 @@ async def save_mooring_config(request: Request):
         },
     )
 
-    # If calendar is enabled and events exist, regenerate the feed.
-    # Don't generate an empty feed on first config save - let the
-    # feed be generated when events are actually added.
     if result.get("calendar_enabled"):
         existing_events = get_calendar_events(mid)
         if existing_events:
@@ -374,7 +377,6 @@ async def upload_observations_xlsx(mooring_id: int, request: Request):
         lay_dir = str(row[4]).strip() if len(row) > 4 and row[4] else ""
         notes = str(row[5]).strip() if len(row) > 5 and row[5] else ""
 
-        # Parse date and time
         try:
             if isinstance(date_val, datetime):
                 dt = date_val
@@ -393,7 +395,6 @@ async def upload_observations_xlsx(mooring_id: int, request: Request):
             errors += 1
             continue
 
-        # Parse state
         state_str = str(state_val).strip().lower()
         if state_str in ("afloat", "yes", "y", "true"):
             state = "afloat"
@@ -403,12 +404,9 @@ async def upload_observations_xlsx(mooring_id: int, request: Request):
             errors += 1
             continue
 
-        # Store with mooring_id enforced.
-        # XLSX template tells users to enter local time (BST during sailing
-        # season). If no timezone info, assume Europe/London and convert to UTC.
         if dt.tzinfo is None:
             import pytz
-            local_tz = pytz.timezone("Europe/London")
+            local_tz = pytz.timezone(DEFAULT_TIMEZONE)
             dt = local_tz.localize(dt)
         ts = to_utc_str(dt)
         add_observation({
@@ -459,7 +457,6 @@ async def download_observation_template():
         cell.fill = header_fill
         cell.alignment = Alignment(horizontal="center")
 
-    # Example row
     ws.cell(row=2, column=1, value="15/04/2026")
     ws.cell(row=2, column=2, value="10:30")
     ws.cell(row=2, column=3, value="afloat")
@@ -467,7 +464,6 @@ async def download_observation_template():
     ws.cell(row=2, column=5, value="NE")
     ws.cell(row=2, column=6, value="Spring tide, good visibility")
 
-    # Column widths
     ws.column_dimensions["A"].width = 14
     ws.column_dimensions["B"].width = 8
     ws.column_dimensions["C"].width = 10
@@ -475,14 +471,13 @@ async def download_observation_template():
     ws.column_dimensions["E"].width = 18
     ws.column_dimensions["F"].width = 30
 
-    # Add validation note
     ws2 = wb.create_sheet("Notes")
     ws2.cell(row=1, column=1, value="State: 'afloat' or 'aground'")
     ws2.cell(row=2, column=1, value="Wind Direction: N, NE, E, SE, S, SW, W, NW (optional)")
     ws2.cell(row=3, column=1, value="Direction of Lay: bow heading N, NE, E, SE, S, SW, W, NW (optional)")
     ws2.cell(row=4, column=1, value="Date format: DD/MM/YYYY")
     ws2.cell(row=5, column=1, value="Time format: HH:MM (local time)")
-    ws2.cell(row=6, column=1, value="Times are assumed to be BST during sailing season")
+    ws2.cell(row=6, column=1, value="Times are assumed to be local time (BST during sailing season)")
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -522,8 +517,6 @@ async def apply_drying_height_calibration(mooring_id: int):
     Apply the current base-drying-height suggestion to the mooring's
     stored configuration, then recompute future access windows and
     regenerate the feed.
-
-    Rejects with 400 if there is no usable suggestion.
     """
     m = get_mooring(mooring_id)
     if not m:
@@ -536,8 +529,6 @@ async def apply_drying_height_calibration(mooring_id: int):
 
     previous = m["drying_height_m"]
     if abs(best - previous) < 0.01:
-        # Already aligned; nothing to do, but still return success so the
-        # UI can dismiss the suggestion without error.
         return {
             "applied": False,
             "reason": "suggestion matches current stored value",
@@ -588,8 +579,6 @@ async def apply_wind_offset_calibration(mooring_id: int):
     Apply the current shallow-side wind offset suggestion to the mooring's
     stored configuration (updates shallow_extra_depth_m), then recompute
     future access windows and regenerate the feed.
-
-    Rejects with 400 if there is no usable suggestion.
     """
     m = get_mooring(mooring_id)
     if not m:
@@ -606,11 +595,6 @@ async def apply_wind_offset_calibration(mooring_id: int):
         previous = 0.0
 
     if suggested <= previous + 0.01:
-        # Aground observations only give a LOWER bound on the required
-        # offset. A suggestion at or below the current stored value does
-        # not justify reducing the offset - no evidence the stored value
-        # is too high. Applying would weaken the safety margin based on
-        # no data.
         return {
             "applied": False,
             "reason": (
@@ -662,7 +646,7 @@ async def apply_wind_offset_calibration(mooring_id: int):
 @app.post("/api/fetch-ukho")
 async def trigger_ukho_fetch():
     """Manually trigger UKHO data fetch."""
-    events = await fetch_tidal_events()
+    events, station_used = await fetch_tidal_events()
     if not events:
         log_activity(
             event_type="ukho_fetch",
@@ -671,19 +655,26 @@ async def trigger_ukho_fetch():
         )
         raise HTTPException(502, "Failed to fetch UKHO data")
 
-    store_tide_events(events, source="ukho", station="langstone")
+    station_label = "langstone" if station_used == UKHO_STATION_ID else "portsmouth"
+    store_tide_events(events, source="ukho", station=station_label)
+
+    fallback_note = f" (Portsmouth fallback, station {station_used})" if station_label == "portsmouth" else ""
     log_activity(
         event_type="ukho_fetch",
-        message=f"Manual UKHO fetch: {len(events)} events stored",
-        severity="success",
-        details={"event_count": len(events), "trigger": "manual"},
+        message=f"Manual UKHO fetch: {len(events)} events stored{fallback_note}",
+        severity="success" if station_label == "langstone" else "warning",
+        details={
+            "event_count": len(events),
+            "trigger": "manual",
+            "station_used": station_used,
+            "station_label": station_label,
+        },
     )
 
-    # Also schedule wind observation jobs for the newly-fetched HW events
     from app.scheduler import _schedule_wind_jobs
     await _schedule_wind_jobs(events)
 
-    return {"fetched": len(events), "source": "ukho"}
+    return {"fetched": len(events), "source": "ukho", "station": station_label}
 
 
 # --- KHM Data ---
@@ -699,12 +690,10 @@ async def parse_khm_data(request: Request):
     if not text.strip():
         raise HTTPException(400, "No text provided")
 
-    # KHM parser applies Portsmouth->Langstone correction internally
     events = parse_khm_paste(text, year, is_bst=is_bst)
     if not events:
         raise HTTPException(400, "Could not parse any tide events from the pasted text")
 
-    # Store as KHM source (corrections already applied)
     store_tide_events(events, source="khm", station="langstone")
 
     log_activity(
@@ -741,14 +730,10 @@ async def calculate_access_windows(request: Request):
     mooring_id = data.get("mooring_id")
     add_to_feed = data.get("add_to_feed", False)
 
-    # Get mooring config if specified
     mooring = None
     if mooring_id:
         mooring = get_mooring(int(mooring_id))
 
-    # Coalesce over (posted value, stored mooring value, hardcoded default)
-    # using is-None semantics so a legitimate zero or negative drying height
-    # is not replaced by the fallback. `a or b` would treat 0.0 as falsy.
     draught = _coalesce(
         data.get("draught_m"),
         mooring["draught_m"] if mooring else None,
@@ -765,12 +750,6 @@ async def calculate_access_windows(request: Request):
         default=0.3,
     )
 
-    # Determine wind offset for next tide only.
-    #
-    # Wind settings: prefer POST body values when the client supplies them
-    # (so unsaved toggle changes in the UI take effect immediately), falling
-    # back to the stored mooring configuration otherwise. `is None` checks are
-    # used deliberately - a stored value of 0/"" must not be treated as "unset".
     wind_offset = 0.0
     wind_info = None
     wind_data = None
@@ -808,25 +787,26 @@ async def calculate_access_windows(request: Request):
                 }
 
     now = datetime.now(timezone.utc)
-    # Query start: look back 13 hours to ensure we always have bracketing
-    # events (preceding LW/HW) needed for tidal curve interpolation.
-    # Without this, the first access window of the day has no preceding
-    # event to interpolate the rising tide from, producing garbage results.
+    # Look back 13 hours to ensure bracketing events for interpolation context.
     query_start = now - timedelta(hours=13)
 
     if source == "ukho":
         end = now + timedelta(days=7)
-        events = get_tide_events(to_utc_str(query_start), to_utc_str(end), source="ukho")
+        # get_ukho_tide_events handles station preference and applies the
+        # Portsmouth->Langstone offset transparently if only fallback data exists.
+        events = get_ukho_tide_events(to_utc_str(query_start), to_utc_str(end))
         if not events:
-            # Try fetching fresh
-            raw = await fetch_tidal_events()
+            # Try fetching fresh from the API
+            raw, station_used = await fetch_tidal_events()
             if raw:
-                store_tide_events(raw, source="ukho", station="langstone")
-                events = raw
+                station_label = "langstone" if station_used == UKHO_STATION_ID else "portsmouth"
+                store_tide_events(raw, source="ukho", station=station_label)
+                # Re-query via get_ukho_tide_events so the 13h lookback window
+                # is covered and the offset is applied if Portsmouth data was stored.
+                events = get_ukho_tide_events(to_utc_str(query_start), to_utc_str(end))
         tide_source = "ukho"
 
     elif source == "khm":
-        # Use stored KHM data only - no mixing with UKHO
         end = now + timedelta(days=60)
         events = get_tide_events(to_utc_str(query_start), to_utc_str(end), source="khm")
         tide_source = "khm"
@@ -835,7 +815,6 @@ async def calculate_access_windows(request: Request):
         days = int(data.get("days", 30))
         end = now + timedelta(days=days)
         events = harmonic_predict_events(now, end)
-        # Apply secondary port offset
         events = apply_offset(events)
         tide_source = "harmonic"
 
@@ -845,10 +824,6 @@ async def calculate_access_windows(request: Request):
     if not events:
         return {"windows": [], "source": source, "event_count": 0, "message": "No tide data available"}
 
-    # If wind offset applies, identify the NEXT HW so that the offset is only
-    # applied to that one window - a live wind observation is only a reasonable
-    # predictor for conditions at the immediately-following HW, not for HWs
-    # days into the future.
     next_hw_ts = None
     if wind_offset > 0:
         now_str = to_utc_str(now)
@@ -867,20 +842,13 @@ async def calculate_access_windows(request: Request):
         source=tide_source,
     )
 
-    # Filter out windows for HW events before 'now' - these were included
-    # in the query only to provide interpolation context for the first real window.
     now_str = to_utc_str(now)
     windows = [w for w in windows if w["hw_timestamp"] >= now_str]
 
-    # compute_access_windows already sets per-window `wind_adjusted` correctly;
-    # no post-processing loop needed.
-
-    # Auto-update feed when mooring has calendar enabled, or when explicitly requested
     should_store = mooring_id and mooring and (
         add_to_feed or mooring.get("calendar_enabled")
     )
     if should_store:
-        # Build metadata for event descriptions
         cal = calibrate_drying_height(int(mooring_id))
         calc_params = {
             "draught_m": float(draught),
@@ -943,7 +911,6 @@ async def export_ics(request: Request):
     boat_name = data.get("boat_name", "")
     mooring_id = data.get("mooring_id", 0)
 
-    # Include calibration and calc params if mooring has config
     cal = None
     calc_params = None
     if mooring_id:
@@ -998,8 +965,6 @@ async def serve_feed(mooring_id: int):
     if not m:
         raise HTTPException(404, "Mooring not found")
 
-    # Always regenerate from current DB state - the feed is small
-    # and this ensures calendar apps never receive stale data.
     cal = calibrate_drying_height(mooring_id)
     if cal.get("confidence") == "none":
         cal = None
@@ -1030,6 +995,9 @@ async def update_model_config(request: Request):
     """Update the model configuration."""
     data = await request.json()
     save_model_config(data)
+    # Invalidate the cached tidal curve parameters so the next calculation
+    # picks up any changes to stand_duration_minutes, stand_height_fraction, etc.
+    invalidate_model_config_cache()
     return {"status": "saved"}
 
 

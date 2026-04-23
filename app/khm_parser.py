@@ -17,8 +17,8 @@ Column layout:
 
 Times are local (GMT or BST as published by KHM).
 All data is for Portsmouth. Secondary port correction to Langstone is applied
-within this parser (HW: +9 min, +0.24m; LW: unchanged) matching the values
-validated in the previous version of this tool.
+within this parser (HW: +9 min, +0.05m; LW: unchanged), validated April 2026
+against UKHO half-hourly data for both ports.
 """
 
 import logging
@@ -119,8 +119,8 @@ def parse_khm_paste(text: str, year: int = None, is_bst: bool = True) -> list[di
 
             # Secondary port correction: KHM data is for Portsmouth.
             # Langstone HW is ~9 min later and ~0.05m higher (validated against
-            # UKHO half-hourly data for both ports, April 2026 — previously
-            # assumed +0.24m was too high). LW times/heights effectively identical.
+            # UKHO half-hourly data for both ports, April 2026). LW times/heights
+            # effectively identical between ports.
             if p["type"] == "HighWater":
                 utc_dt = utc_dt + timedelta(minutes=9)
                 adjusted_ht = round(ht + 0.05, 1)

@@ -1,10 +1,10 @@
 {
     "_comment": "Tidal Access Model Configuration. Tidal curve parameters used by access window calculator. Harmonic constants and secondary port offsets are documented here for reference but are currently implemented in harmonic.py and secondary_port.py respectively.",
-    "_version": "2.3.0",
-    "_last_updated": "2026-04-22",
+    "_version": "2.4.0",
+    "_last_updated": "2026-04-23",
 
     "secondary_port_offset": {
-        "_comment": "Portsmouth to Langstone Harbour corrections. Applied by KHM parser and secondary_port.py (for harmonic predictions). Validated April 2026 against UKHO half-hourly data for both ports: observed HW height delta 0.0-0.1m (mean +0.05m), not +0.24m as previously assumed. LW heights effectively identical between ports.",
+        "_comment": "Portsmouth to Langstone Harbour corrections. REFERENCE ONLY — these values are not read by any code at runtime. The operative constants are hardcoded in secondary_port.py (apply_offset) and khm_parser.py (parse_khm_paste). Any change to these values must also be made in those two files. Validated April 2026 against UKHO half-hourly data for both ports: observed HW height delta 0.0-0.1m (mean +0.05m), not +0.24m as previously assumed. LW heights effectively identical between ports.",
         "hw_time_offset_minutes": 9,
         "hw_height_offset_m": 0.05,
         "lw_time_offset_minutes": 0,
@@ -12,16 +12,17 @@
     },
 
     "tidal_curve": {
-        "_comment": "Parameters for Langstone Harbour asymmetric tidal curve used to interpolate heights between HW/LW events. The Solent exhibits an extended HW stand on the ebb.",
-        "flood_duration_fraction": 0.42,
-        "ebb_duration_fraction": 0.58,
+        "_comment": "Parameters for Langstone Harbour asymmetric tidal curve used to interpolate heights between HW/LW events. The Solent exhibits an extended HW stand on the ebb. Read at runtime by access_calc._get_curve_params().",
         "stand_duration_minutes": 40,
         "stand_height_fraction": 0.98,
-        "_notes": "flood_duration_fraction + ebb_duration_fraction must equal 1.0. The stand occurs near HW on the ebb. stand_height_fraction is the proportion of HW height maintained during the stand period. Calibrated against UKHO half-hourly Langstone data (21-22 April 2026): stand duration ~40min at 98% of HW height, consistent across springs and neaps. Impact: ebb threshold crossings ~10-15min later on springs, ~20-30min later on neaps where HW is close to threshold."
+        "_unused": "flood_duration_fraction and ebb_duration_fraction are retained below for documentation only. They are not applied in access_calc._curve_interpolate() — the actual HW/LW event timestamps already encode the asymmetric flood/ebb duration, so applying a further fraction correction would double-count it.",
+        "flood_duration_fraction": 0.42,
+        "ebb_duration_fraction": 0.58,
+        "_notes": "stand_height_fraction is the proportion of HW height (above CD) maintained during the stand period. Calibrated against UKHO half-hourly Langstone data (21-22 April 2026): stand duration ~40min at 98% of HW height, consistent across springs and neaps. Impact: ebb threshold crossings ~10-15min later on springs, ~20-30min later on neaps where HW is close to threshold."
     },
 
     "admiralty_convention_offset": {
-        "_comment": "Post-processing time shifts applied to harmonic predict_events output to align mathematical peaks with Admiralty published HW/LW convention. Derived April 2026 from 710 Admiralty Portsmouth reference points (355 HW + 355 LW) across 6 months between Jul 2026 and Dec 2027. The mathematical peak of the harmonic curve falls systematically later than the Admiralty published time. These offsets do not affect predict_height_at_time() - heights throughout the tidal curve remain correct.",
+        "_comment": "Post-processing time shifts applied to harmonic predict_events output to align mathematical peaks with Admiralty published HW/LW convention. REFERENCE ONLY — these values are not read by any code at runtime. The operative constants are HW_ADMIRALTY_OFFSET_MINUTES and LW_ADMIRALTY_OFFSET_MINUTES in harmonic.py. Any change must also be made there. Derived April 2026 from 710 Admiralty Portsmouth reference points (355 HW + 355 LW) across 6 months between Jul 2026 and Dec 2027. The mathematical peak of the harmonic curve falls systematically later than the Admiralty published time. These offsets do not affect predict_height_at_time() - heights throughout the tidal curve remain correct.",
         "hw_offset_minutes": 34,
         "lw_offset_minutes": 28,
         "validation_dataset_size": 710,

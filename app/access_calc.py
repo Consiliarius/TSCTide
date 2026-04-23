@@ -19,6 +19,34 @@ from app.config import load_model_config, to_utc_str
 
 logger = logging.getLogger(__name__)
 
+# Module-level cache for model config tidal curve parameters.
+# load_model_config() parses a JSON file on every call; at 3-minute
+# interpolation intervals over a 7-hour window this is called thousands
+# of times per calculation. The config is effectively static between
+# API calls, so cache it on first access.
+# Call invalidate_model_config_cache() after save_model_config() to ensure
+# the next calculation picks up any user edits.
+_cached_curve_params: Optional[dict] = None
+
+
+def invalidate_model_config_cache():
+    """
+    Clear the cached tidal curve parameters.
+    Must be called after save_model_config() so that subsequent
+    calculations use the updated values.
+    """
+    global _cached_curve_params
+    _cached_curve_params = None
+
+
+def _get_curve_params() -> dict:
+    """Return tidal curve parameters, loading from config on first call."""
+    global _cached_curve_params
+    if _cached_curve_params is None:
+        cfg = load_model_config()
+        _cached_curve_params = cfg.get("tidal_curve", {})
+    return _cached_curve_params
+
 
 def _interpolate_from_parsed(target: datetime, parsed_events: list[tuple]) -> Optional[float]:
     """
@@ -70,10 +98,13 @@ def _curve_interpolate(target: datetime, before: tuple, after: tuple) -> float:
     Interpolate height using the Langstone asymmetric tidal curve.
 
     before/after: (datetime, height_m, event_type) tuples
+
+    Note: flood_duration_fraction is present in model_config.json for
+    documentation purposes but is not applied here. The actual event
+    timestamps already encode the asymmetric flood/ebb duration, so
+    applying an additional fraction correction would double-count it.
     """
-    cfg = load_model_config()
-    curve = cfg.get("tidal_curve", {})
-    flood_frac = curve.get("flood_duration_fraction", 0.42)
+    curve = _get_curve_params()
 
     t_before, h_before, et_before = before
     t_after, h_after, et_after = after

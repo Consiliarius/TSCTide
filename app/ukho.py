@@ -11,11 +11,25 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://admiraltyapi.azure-api.net/uktidalapi/api/V1"
 
 
-async def fetch_tidal_events(station_id: str = None, duration: int = 7) -> list[dict]:
+async def fetch_tidal_events(
+    station_id: str = None, duration: int = 7
+) -> tuple[list[dict], str]:
     """
     Fetch tidal events from UKHO API.
-    Returns list of dicts with timestamp, height_m, event_type.
+
+    Returns a 2-tuple: (events, station_id_used).
+      - events: list of dicts with timestamp, height_m, event_type.
+        Raw values for the station that provided the data — no secondary
+        port correction is applied here.
+      - station_id_used: the UKHO station ID that actually supplied the
+        data. Callers must check this: if it equals UKHO_FALLBACK_STATION_ID
+        (Portsmouth) rather than UKHO_STATION_ID (Langstone), the events
+        are raw Portsmouth values and the secondary port offset must be
+        applied before use. See database.get_ukho_tide_events() which
+        handles this transparently for DB-backed callers.
+
     All timestamps from UKHO are in UTC/GMT.
+    Returns ([], "") on failure.
     """
     station = station_id or UKHO_STATION_ID
     url = f"{BASE_URL}/Stations/{station}/TidalEvents"
@@ -49,7 +63,7 @@ async def fetch_tidal_events(station_id: str = None, duration: int = 7) -> list[
             })
 
         logger.info(f"Fetched {len(events)} events from UKHO station {station}")
-        return events
+        return events, station
 
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404 and station == UKHO_STATION_ID and UKHO_FALLBACK_STATION_ID:
@@ -61,7 +75,7 @@ async def fetch_tidal_events(station_id: str = None, duration: int = 7) -> list[
                 station_id=UKHO_FALLBACK_STATION_ID, duration=duration
             )
         logger.error(f"UKHO API error: {e.response.status_code} - {e.response.text}")
-        return []
+        return [], ""
     except Exception as e:
         logger.error(f"UKHO API request failed: {e}")
-        return []
+        return [], ""

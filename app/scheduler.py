@@ -15,7 +15,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 
-from app.config import (to_utc_str, 
+from app.config import (to_utc_str,
     UKHO_FETCH_HOUR, UKHO_FETCH_MINUTE, WIND_SAMPLE_HW_OFFSET_HOURS,
     UKHO_STATION_ID, UKHO_FALLBACK_STATION_ID, DEFAULT_TIMEZONE,
 )
@@ -65,6 +65,7 @@ async def daily_ukho_fetch():
     and update calendar feeds for all enabled moorings.
     """
     from app.ukho import fetch_tidal_events
+    from app.secondary_port import apply_offset
     from app.database import (
         store_tide_events, get_calendar_enabled_moorings,
         get_mooring, calibrate_drying_height, cleanup_old_events,
@@ -75,8 +76,7 @@ async def daily_ukho_fetch():
 
     logger.info("Running daily UKHO fetch...")
 
-    # Fetch tidal events
-    events = await fetch_tidal_events()
+    events, station_used = await fetch_tidal_events()
     if not events:
         logger.error("No events returned from UKHO API")
         log_activity(
@@ -86,28 +86,40 @@ async def daily_ukho_fetch():
         )
         return
 
-    store_tide_events(events, source="ukho", station="langstone")
-    logger.info(f"Stored {len(events)} UKHO events")
+    station_label = "langstone" if station_used == UKHO_STATION_ID else "portsmouth"
+    store_tide_events(events, source="ukho", station=station_label)
+    logger.info(f"Stored {len(events)} UKHO events (station: {station_label})")
+
+    fallback_note = f" via Portsmouth fallback (station {station_used})" if station_label == "portsmouth" else ""
     log_activity(
         event_type="ukho_fetch",
-        message=f"Fetched {len(events)} tidal events from UKHO",
-        severity="success",
-        details={"event_count": len(events), "station": UKHO_STATION_ID},
+        message=f"Fetched {len(events)} tidal events from UKHO{fallback_note}",
+        severity="success" if station_label == "langstone" else "warning",
+        details={
+            "event_count": len(events),
+            "station_used": station_used,
+            "station_label": station_label,
+        },
     )
 
+    # For window calculation, apply Langstone offset if Portsmouth fallback was used.
+    # The stored events are raw Portsmouth values; calc_events are Langstone-corrected.
+    if station_label == "portsmouth":
+        calc_events = apply_offset(events)
+    else:
+        calc_events = events
+
     # Schedule wind observation jobs for today's ebbing tides
-    await _schedule_wind_jobs(events)
+    await _schedule_wind_jobs(calc_events)
 
     # Recalculate access windows for all calendar-enabled moorings
     moorings = get_calendar_enabled_moorings()
-    now = datetime.now(timezone.utc)
-    end = now + timedelta(days=7)
 
     updated_count = 0
     for m in moorings:
         try:
             windows = compute_access_windows(
-                events=events,
+                events=calc_events,
                 draught_m=m["draught_m"],
                 drying_height_m=m["drying_height_m"],
                 safety_margin_m=m["safety_margin_m"],
@@ -157,7 +169,6 @@ async def daily_ukho_fetch():
         details={"mooring_count": len(moorings), "updated": updated_count},
     )
 
-    # Housekeeping: remove calendar events older than 14 days
     cleanup_old_events(days=14)
     prune_activity_log(system_days=30, mooring_days=7)
 
@@ -184,7 +195,6 @@ async def _schedule_wind_jobs(events: list[dict]) -> list[dict]:
 
         sample_time = hw_dt + timedelta(hours=offset_hours)
 
-        # Only schedule if in the future
         if sample_time <= now:
             continue
 
@@ -196,7 +206,7 @@ async def _schedule_wind_jobs(events: list[dict]) -> list[dict]:
                 DateTrigger(run_date=sample_time),
                 id=job_id,
                 replace_existing=True,
-                name=f"Wind sample at HW+{offset_hours}h ({hw_dt.strftime('%H:%M')})",
+                name=f"Wind sample at HW+{offset_hours:g}h ({hw_dt.strftime('%H:%M')})",
                 kwargs={"hw_timestamp": hw["timestamp"]},
             )
             logger.info(f"Scheduled wind observation at {sample_time.isoformat()}")
@@ -207,9 +217,7 @@ async def _schedule_wind_jobs(events: list[dict]) -> list[dict]:
         except Exception as e:
             logger.warning(f"Could not schedule wind job: {e}")
 
-    # Summarise upcoming wind checks in activity log
     if scheduled:
-        # Display up to 4 upcoming times in local format for readability
         import pytz
         tz = pytz.timezone(DEFAULT_TIMEZONE)
         display_count = min(4, len(scheduled))
@@ -250,7 +258,7 @@ async def wind_observation_job(hw_timestamp: str):
     from app.wind import fetch_current_wind, should_apply_offset
     from app.database import (
         store_wind_observation, get_calendar_enabled_moorings,
-        get_tide_events, calibrate_drying_height, log_activity,
+        get_ukho_tide_events, calibrate_drying_height, log_activity,
     )
     from app.access_calc import compute_access_windows
     from app.ical_manager import store_windows_as_events, generate_feed_for_mooring
@@ -268,7 +276,6 @@ async def wind_observation_job(hw_timestamp: str):
         )
         return
 
-    # Store the observation
     store_wind_observation(
         timestamp=wind["timestamp"],
         direction_deg=wind["direction_deg"],
@@ -279,7 +286,7 @@ async def wind_observation_job(hw_timestamp: str):
     wind_kts = wind["speed_ms"] * 1.944
     log_activity(
         event_type="wind_check",
-        message=f"Wind at HW+4h: {wind['direction_compass']} {wind_kts:.0f}kts",
+        message=f"Wind at HW+{WIND_SAMPLE_HW_OFFSET_HOURS:g}h: {wind['direction_compass']} {wind_kts:.0f}kts",
         severity="info",
         details={
             "hw_timestamp": hw_timestamp,
@@ -290,21 +297,20 @@ async def wind_observation_job(hw_timestamp: str):
         },
     )
 
-    # Find the next HW after this one (the next flood tide)
     hw_dt = dtparse.parse(hw_timestamp)
     if hw_dt.tzinfo is None:
         hw_dt = hw_dt.replace(tzinfo=timezone.utc)
 
-    # Search for tide events around the next expected HW (~12h25m later)
+    # Use get_ukho_tide_events so Portsmouth fallback data receives the
+    # Langstone offset automatically.
     search_start = to_utc_str(hw_dt + timedelta(hours=4))
     search_end = to_utc_str(hw_dt + timedelta(hours=18))
-    next_events = get_tide_events(search_start, search_end, source="ukho")
+    next_events = get_ukho_tide_events(search_start, search_end)
 
     if not next_events:
         logger.info("No upcoming tide events found for wind adjustment")
         return
 
-    # Recalculate for wind-enabled moorings
     moorings = get_calendar_enabled_moorings()
     for m in moorings:
         if not m.get("wind_offset_enabled"):
@@ -362,8 +368,6 @@ async def wind_observation_job(hw_timestamp: str):
             )
 
         try:
-            # Only the immediately-following HW should get the offset, not
-            # every HW in the 14-hour search window.
             next_hw_ts = None
             for e in sorted(next_events, key=lambda ev: ev["timestamp"]):
                 if e["event_type"] == "HighWater":
@@ -379,7 +383,6 @@ async def wind_observation_job(hw_timestamp: str):
                 wind_offset_hw_timestamp=next_hw_ts,
                 source="ukho",
             )
-            # compute_access_windows already sets `wind_adjusted` per-window.
 
             cal = calibrate_drying_height(m["mooring_id"])
             calc_params = {

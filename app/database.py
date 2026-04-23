@@ -169,7 +169,14 @@ def db_connection():
 # --- Tide Data ---
 
 def store_tide_events(events: list[dict], source: str, station: str):
-    """Store tide events, replacing KHM data with UKHO if source is ukho."""
+    """Store tide events, replacing KHM data with UKHO if source is ukho.
+
+    The station parameter must accurately reflect which station provided the
+    data. Pass "langstone" for native Langstone UKHO data, "portsmouth" for
+    Portsmouth fallback data. Do NOT pre-apply the secondary port offset
+    before storing Portsmouth data — get_ukho_tide_events() applies it at
+    query time so that provenance is preserved in the database.
+    """
     now = to_utc_str(datetime.now(timezone.utc))
     with db_connection() as conn:
         for ev in events:
@@ -180,7 +187,11 @@ def store_tide_events(events: list[dict], source: str, station: str):
             approx_height = ev.get("is_approximate_height", False)
 
             if source == "ukho":
-                # Delete any KHM data for same timestamp/station
+                # Delete any KHM data for the same timestamp/station.
+                # Note: Portsmouth UKHO data (station="portsmouth") will NOT
+                # delete KHM Langstone data (station="langstone"), which is
+                # correct — KHM Langstone should only be superseded by native
+                # Langstone UKHO data.
                 conn.execute(
                     "DELETE FROM tide_data WHERE timestamp = ? AND station = ? AND source = 'khm'",
                     (ts, station)
@@ -212,6 +223,40 @@ def get_tide_events(start: str, end: str, station: Optional[str] = None,
         query += " ORDER BY timestamp"
         rows = conn.execute(query, params).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_ukho_tide_events(start: str, end: str) -> list[dict]:
+    """
+    Get UKHO tide events for the requested time range, applying the
+    Portsmouth→Langstone secondary port offset if only fallback data exists.
+
+    Priority:
+      1. Native Langstone UKHO data (station="langstone") — returned as-is.
+      2. Portsmouth fallback data (station="portsmouth") — secondary port
+         offset applied before returning, so callers always receive
+         Langstone-equivalent values regardless of which station provided them.
+
+    This is the correct function to use for all access window calculations.
+    Use get_tide_events() directly only when you need raw stored values or
+    need to filter by a specific station for provenance purposes.
+    """
+    from app.secondary_port import apply_offset
+
+    # Prefer native Langstone data
+    events = get_tide_events(start, end, source="ukho", station="langstone")
+    if events:
+        return events
+
+    # Fall back to Portsmouth data and apply Langstone correction
+    portsmouth_events = get_tide_events(start, end, source="ukho", station="portsmouth")
+    if portsmouth_events:
+        logger.debug(
+            f"get_ukho_tide_events: applying Portsmouth->Langstone offset to "
+            f"{len(portsmouth_events)} fallback events"
+        )
+        return apply_offset(portsmouth_events)
+
+    return []
 
 
 # --- Moorings ---
@@ -346,9 +391,9 @@ def clear_observations(mooring_id: int) -> int:
         return result.rowcount
 
 
-def _load_classification_inputs(mooring_id: int):
+def load_classification_inputs(mooring_id: int):
     """
-    Shared loader for calibration entry points. Returns a tuple:
+    Load all data needed for calibration in a single pass. Returns a tuple:
       (mooring, observations, tide_events, wind_observations, classifications)
     where classifications is a list of dicts from
     observation_classifier.classify_observations, one per observation,
@@ -356,9 +401,13 @@ def _load_classification_inputs(mooring_id: int):
 
     Returns (None, [], [], [], []) if the mooring does not exist.
 
-    Callers must not assume the data sets are bounded to a particular
-    date range - the full history is pulled so that older observations
-    can still be classified against older HW data.
+    The full historical range is queried intentionally: older observations
+    are still valid calibration data, and tide events/wind observations
+    beyond the current 7-day window are needed to classify them.
+
+    Callers that need both calibrate_drying_height and calibrate_wind_offset
+    should call this once and pass the result to both via the _preloaded
+    parameter, avoiding redundant DB queries and classifier passes.
     """
     from app.observation_classifier import classify_observations
 
@@ -377,9 +426,14 @@ def _load_classification_inputs(mooring_id: int):
     return mooring, observations, tide_events, wind_observations, classifications
 
 
-def calibrate_drying_height(mooring_id: int) -> dict:
+def calibrate_drying_height(mooring_id: int, _preloaded=None) -> dict:
     """
     Estimate base drying height from observations tied to this mooring.
+
+    Pass _preloaded=(mooring, observations, tide_events, wind_obs, classifications)
+    from load_classification_inputs() to avoid redundant DB queries when both
+    calibrate_drying_height and calibrate_wind_offset are needed in the same
+    request.
 
     Afloat observations always contribute an upper bound. Aground
     observations classified "wind_offset" by app.observation_classifier
@@ -414,9 +468,12 @@ def calibrate_drying_height(mooring_id: int) -> dict:
         "excluded_wind_offset_count": 0,
     }
 
-    mooring, observations, tide_events, _wind, classifications = (
-        _load_classification_inputs(mooring_id)
-    )
+    if _preloaded is not None:
+        mooring, observations, tide_events, _wind, classifications = _preloaded
+    else:
+        mooring, observations, tide_events, _wind, classifications = (
+            load_classification_inputs(mooring_id)
+        )
     if not mooring or not observations or not tide_events:
         return result
 
@@ -503,11 +560,16 @@ def calibrate_drying_height(mooring_id: int) -> dict:
     return result
 
 
-def calibrate_wind_offset(mooring_id: int) -> dict:
+def calibrate_wind_offset(mooring_id: int, _preloaded=None) -> dict:
     """
     Estimate the required shallow-side wind offset from aground
     observations classified as "wind_offset" by
     app.observation_classifier.
+
+    Pass _preloaded=(mooring, observations, tide_events, wind_obs, classifications)
+    from load_classification_inputs() to avoid redundant DB queries when both
+    calibrate_drying_height and calibrate_wind_offset are needed in the same
+    request.
 
     Only aground observations are used in v1. Each such observation
     implies: h(obs_time) <= draught + base_drying + wind_offset, i.e.
@@ -536,9 +598,12 @@ def calibrate_wind_offset(mooring_id: int) -> dict:
         "current_shallow_extra_depth_m": None,
     }
 
-    mooring, observations, tide_events, _wind, classifications = (
-        _load_classification_inputs(mooring_id)
-    )
+    if _preloaded is not None:
+        mooring, observations, tide_events, _wind, classifications = _preloaded
+    else:
+        mooring, observations, tide_events, _wind, classifications = (
+            load_classification_inputs(mooring_id)
+        )
     if not mooring:
         return result
 
@@ -594,7 +659,13 @@ def calibrate_wind_offset(mooring_id: int) -> dict:
 
 def upsert_calendar_event(event: dict):
     """Insert or update a calendar event, respecting data source priority."""
-    # Microsecond precision for updated_at to ensure ordering in rapid sequences
+    # Microsecond precision for updated_at to ensure ordering in rapid sequences.
+    # Note: this intentionally uses .isoformat() (microseconds, +00:00 suffix)
+    # rather than to_utc_str() (Z suffix, no microseconds) so that two events
+    # written in the same second can still be ordered correctly. All updated_at
+    # comparisons in cleanup_superseded_events use string comparison, which
+    # works correctly provided the format is consistent (which it is, since all
+    # updated_at values come through this single function).
     now = datetime.now(timezone.utc).isoformat()
     SOURCE_PRIORITY = {"ukho": 3, "khm": 2, "harmonic": 1}
 

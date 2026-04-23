@@ -41,17 +41,16 @@ LOCATION_LON = float(os.environ.get("LOCATION_LON", "-0.9806"))
 DEFAULT_TIMEZONE = os.environ.get("DEFAULT_TIMEZONE", "Europe/London")
 
 # Paths
-MOORINGS_DIR = DATA_DIR / "moorings"
+# Note: MOORINGS_DIR (legacy file-based storage) and WIND_LOG_PATH (unused)
+# were removed. All mooring and wind data is stored in SQLite.
 FEEDS_DIR = DATA_DIR / "feeds"
 DB_PATH = DATA_DIR / "tides.db"
 MODEL_CONFIG_PATH = DATA_DIR / "model_config.json"
-WIND_LOG_PATH = DATA_DIR / "wind_log.json"
 
 
 def ensure_dirs():
     """Create data directories if they don't exist."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    MOORINGS_DIR.mkdir(exist_ok=True)
     FEEDS_DIR.mkdir(exist_ok=True)
 
 
