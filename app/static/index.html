@@ -990,15 +990,20 @@ async function pinnedFetch(url, options, mooringId) {
 
 // --- Config ---
 function getConfig() {
+  const mooringOptionsHidden = document.getElementById('mooring-options').classList.contains('hidden');
   return {
     mooring_id: parseInt(document.getElementById('mooring_id').value) || null,
     boat_name: document.getElementById('boat_name').value,
     draught_m: num('draught_m', 1.0),
     drying_height_m: num('drying_height_m', 2.0),
     safety_margin_m: num('safety_margin_m', 0.3),
-    wind_offset_enabled: document.getElementById('wind_offset_enabled').checked ? 1 : 0,
-    shallow_direction: document.getElementById('shallow_direction').value,
-    shallow_extra_depth_m: num('shallow_extra_depth_m', 0),
+    // Wind offset fields are only meaningful when a mooring ID is set.
+    // When mooring-options is hidden the user has cleared the mooring ID,
+    // so zero these out so stale values from a previously-loaded mooring
+    // cannot leak into an anonymous calculation request.
+    wind_offset_enabled: mooringOptionsHidden ? 0 : (document.getElementById('wind_offset_enabled').checked ? 1 : 0),
+    shallow_direction: mooringOptionsHidden ? '' : document.getElementById('shallow_direction').value,
+    shallow_extra_depth_m: mooringOptionsHidden ? 0 : num('shallow_extra_depth_m', 0),
     calendar_enabled: document.getElementById('calendar_enabled').checked ? 1 : 0,
     use_observations: document.getElementById('use_observations').checked ? 1 : 0,
   };

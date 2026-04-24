@@ -1002,26 +1002,37 @@ async def calculate_access_windows(request: Request):
     wind_info = None
     wind_data = None
     if source == "ukho":
-        posted_enabled = data.get("wind_offset_enabled")
-        if posted_enabled is None:
-            wind_enabled = bool(mooring.get("wind_offset_enabled")) if mooring else False
+        # Wind offset is only considered when a mooring ID is present.
+        # Without a mooring ID the user is doing an anonymous calculation
+        # and there is no stored mooring config to define which side is
+        # shallow. Even if the UI sends wind-offset fields in the body
+        # (because the user previously loaded a mooring and then cleared
+        # the ID), those values must be ignored.
+        if not mooring_id:
+            wind_enabled = False
+            shallow_dir = ""
+            extra_depth = 0.0
         else:
-            wind_enabled = bool(posted_enabled)
+            posted_enabled = data.get("wind_offset_enabled")
+            if posted_enabled is None:
+                wind_enabled = bool(mooring.get("wind_offset_enabled")) if mooring else False
+            else:
+                wind_enabled = bool(posted_enabled)
 
-        posted_dir = data.get("shallow_direction")
-        if posted_dir is None:
-            shallow_dir = (mooring.get("shallow_direction", "") if mooring else "")
-        else:
-            shallow_dir = str(posted_dir)
+            posted_dir = data.get("shallow_direction")
+            if posted_dir is None:
+                shallow_dir = (mooring.get("shallow_direction", "") if mooring else "")
+            else:
+                shallow_dir = str(posted_dir)
 
-        posted_extra = data.get("shallow_extra_depth_m")
-        if posted_extra is None:
-            extra_depth = float(mooring.get("shallow_extra_depth_m", 0.0)) if mooring else 0.0
-        else:
-            try:
-                extra_depth = float(posted_extra)
-            except (TypeError, ValueError):
-                extra_depth = 0.0
+            posted_extra = data.get("shallow_extra_depth_m")
+            if posted_extra is None:
+                extra_depth = float(mooring.get("shallow_extra_depth_m", 0.0)) if mooring else 0.0
+            else:
+                try:
+                    extra_depth = float(posted_extra)
+                except (TypeError, ValueError):
+                    extra_depth = 0.0
 
         if wind_enabled and shallow_dir and extra_depth > 0:
             wind_data = await fetch_current_wind()
