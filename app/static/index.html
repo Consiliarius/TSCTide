@@ -245,6 +245,10 @@
     display: flex; align-items: center; justify-content: center;
     z-index: 1000;
   }
+  /* ID selectors beat class selectors on specificity, so the generic
+     .hidden rule below cannot hide this overlay on its own. Add an
+     element-specific rule so the hidden class works as expected. */
+  #pin-modal-overlay.hidden { display: none; }
   #pin-modal {
     background: #fff; border-radius: var(--radius);
     padding: 16px 18px; min-width: 280px; max-width: 360px;
