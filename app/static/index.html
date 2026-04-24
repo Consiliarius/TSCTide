@@ -239,6 +239,31 @@
     font-style: italic;
   }
 
+  /* PIN modal */
+  #pin-modal-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.55);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 1000;
+  }
+  #pin-modal {
+    background: #fff; border-radius: var(--radius);
+    padding: 16px 18px; min-width: 280px; max-width: 360px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+  }
+  #pin-modal-title {
+    font-size: 15px; font-weight: 600; color: var(--navy); margin-bottom: 4px;
+  }
+  #pin-modal-subtitle {
+    font-size: 12px; color: var(--text-light); margin-bottom: 10px;
+  }
+  #pin-modal-error {
+    background: #f8d7da; color: #721c24; padding: 6px 10px;
+    border-radius: var(--radius); font-size: 12px; margin-bottom: 10px;
+  }
+  #pin-modal input {
+    letter-spacing: 4px; text-align: center; font-size: 16px;
+  }
+
   .hidden { display: none; }
   .mt-8 { margin-top: 8px; }
   .mb-8 { margin-bottom: 8px; }
@@ -376,6 +401,7 @@
       <div class="btn-group">
         <button class="btn-primary" onclick="saveConfig()">Save Configuration</button>
         <button class="btn-sea" onclick="loadConfig()">Load from Mooring ID</button>
+        <button class="btn-sm" style="background:var(--sea-light);color:#fff;" onclick="changePin()">Change PIN</button>
       </div>
       <div id="cfg-status"></div>
 
@@ -535,7 +561,7 @@
       </div>
       <div class="btn-group hidden" id="results-actions">
         <button class="btn-primary" onclick="exportIcs()">Download .ICS</button>
-        <button class="btn-ok hidden" id="btn-add-feed" onclick="addToFeed()">Add to Calendar Feed</button>
+        <button class="btn-ok hidden" id="btn-add-feed" onclick="updateFeed()">Update Feed</button>
       </div>
     </div>
   </div>
@@ -597,10 +623,48 @@
 
 </div><!-- end container -->
 
+<!-- PIN modal (v2) -->
+<div id="pin-modal-overlay" class="hidden">
+  <div id="pin-modal">
+    <div id="pin-modal-title">Enter PIN</div>
+    <div id="pin-modal-subtitle"></div>
+    <div id="pin-modal-error" class="hidden"></div>
+
+    <div id="pin-field-current-wrap" class="hidden">
+      <label>Current PIN</label>
+      <input type="password" id="pin-field-current"
+             inputmode="numeric" pattern="[0-9]{6}" maxlength="6"
+             autocomplete="off">
+    </div>
+
+    <div id="pin-field-new-wrap">
+      <label id="pin-field-new-label">PIN</label>
+      <input type="password" id="pin-field-new"
+             inputmode="numeric" pattern="[0-9]{6}" maxlength="6"
+             autocomplete="off">
+    </div>
+
+    <div id="pin-field-confirm-wrap" class="hidden">
+      <label>Confirm PIN</label>
+      <input type="password" id="pin-field-confirm"
+             inputmode="numeric" pattern="[0-9]{6}" maxlength="6"
+             autocomplete="off">
+    </div>
+
+    <div class="btn-group">
+      <button class="btn-primary" onclick="pinModalSubmit()">Submit</button>
+      <button class="btn-sm" style="background:var(--border);color:var(--text);" onclick="pinModalCancel()">Cancel</button>
+    </div>
+  </div>
+</div>
+
 <script>
 // State
 let lastWindows = [];
 let lastSource = '';
+// v2: wind_info preserved from last /calculate response so the Update Feed
+// button can pass wind metadata through to the feed-update endpoint.
+let lastWindInfo = null;
 // Calibration and observation list cached so renderObservations can
 // merge classifications into the observation rows without an extra fetch.
 let lastCalibration = null;
@@ -610,6 +674,12 @@ let lastObservations = null;
 // to lazy-load activity on the first expand only, rather than on every
 // expand or up-front for every mooring.
 const mooringActivityLoaded = new Set();
+
+// v2 PIN protection. currentPin is the PIN the user most recently entered
+// that successfully authenticated against currentPinMooringId. Cleared on
+// mooring-ID change and on page reload. Never persisted to storage.
+let currentPin = null;
+let currentPinMooringId = null;
 
 // --- Panel toggle ---
 function togglePanel(id) {
@@ -625,8 +695,14 @@ function toggleWindConfig() {
 }
 
 function updateMooringOptions() {
-  const mid = document.getElementById('mooring_id').value;
-  document.getElementById('mooring-options').classList.toggle('hidden', !mid);
+  const midStr = document.getElementById('mooring_id').value;
+  const mid = parseInt(midStr) || null;
+  document.getElementById('mooring-options').classList.toggle('hidden', !midStr);
+  // v2: invalidate the cached PIN if the mooring ID has changed. A PIN
+  // is only valid for the mooring against which it was verified.
+  if (currentPinMooringId !== null && currentPinMooringId !== mid) {
+    setCurrentPin(null, null);
+  }
 }
 
 function hideAllSourceSections() {
@@ -657,6 +733,255 @@ function num(id, def) {
   if (raw === '' || raw === null || raw === undefined) return def;
   const n = parseFloat(raw);
   return isNaN(n) ? def : n;
+}
+
+// --- PIN protection (v2) ---
+
+function setCurrentPin(pin, mooringId) {
+  currentPin = pin || null;
+  currentPinMooringId = (pin && mooringId) ? mooringId : null;
+}
+
+// Modal state. The resolver/rejector of the currently-open prompt Promise
+// and the mode string are kept in module scope because the modal is a
+// singleton in the DOM - only one prompt can be active at a time.
+let pinModalResolver = null;
+let pinModalRejector = null;
+let pinModalMode = null;
+
+function promptForPin(opts) {
+  pinModalMode = opts.mode || 'verify';
+  const mooringId = opts.mooringId;
+
+  document.getElementById('pin-field-current').value = '';
+  document.getElementById('pin-field-new').value = '';
+  document.getElementById('pin-field-confirm').value = '';
+
+  // Field visibility per mode:
+  //   verify: new only (label becomes "PIN")
+  //   claim:  new + confirm
+  //   change: current + new + confirm
+  document.getElementById('pin-field-current-wrap')
+    .classList.toggle('hidden', pinModalMode !== 'change');
+  document.getElementById('pin-field-confirm-wrap')
+    .classList.toggle('hidden', pinModalMode === 'verify');
+
+  const titles = {
+    claim: 'Set PIN for mooring #' + mooringId,
+    verify: 'Enter PIN for mooring #' + mooringId,
+    change: 'Change PIN for mooring #' + mooringId,
+  };
+  const subtitles = {
+    claim: 'Choose a 6-digit PIN. You will need it for future changes to this mooring.',
+    verify: 'Enter the 6-digit PIN for this mooring.',
+    change: 'Enter your current PIN, then choose a new 6-digit PIN.',
+  };
+  document.getElementById('pin-modal-title').textContent = titles[pinModalMode];
+  document.getElementById('pin-modal-subtitle').textContent = subtitles[pinModalMode];
+  document.getElementById('pin-field-new-label').textContent =
+    pinModalMode === 'verify' ? 'PIN' : 'New PIN';
+
+  const errEl = document.getElementById('pin-modal-error');
+  if (opts.errorMsg) {
+    errEl.textContent = opts.errorMsg;
+    errEl.classList.remove('hidden');
+  } else {
+    errEl.classList.add('hidden');
+  }
+
+  document.getElementById('pin-modal-overlay').classList.remove('hidden');
+
+  // Focus first relevant input once the overlay is visible.
+  setTimeout(() => {
+    const first = pinModalMode === 'change'
+      ? document.getElementById('pin-field-current')
+      : document.getElementById('pin-field-new');
+    if (first) first.focus();
+  }, 50);
+
+  return new Promise((resolve, reject) => {
+    pinModalResolver = resolve;
+    pinModalRejector = reject;
+  });
+}
+
+function setPinModalError(msg) {
+  const errEl = document.getElementById('pin-modal-error');
+  errEl.textContent = msg;
+  errEl.classList.remove('hidden');
+}
+
+function pinModalSubmit() {
+  const current = document.getElementById('pin-field-current').value;
+  const newVal = document.getElementById('pin-field-new').value;
+  const confirmVal = document.getElementById('pin-field-confirm').value;
+  const digits6 = /^\d{6}$/;
+
+  if (pinModalMode === 'verify') {
+    if (!digits6.test(newVal)) {
+      setPinModalError('PIN must be exactly 6 digits.');
+      return;
+    }
+    const resolver = pinModalResolver;
+    closePinModal();
+    resolver({ pin: newVal });
+  } else if (pinModalMode === 'claim') {
+    if (!digits6.test(newVal)) {
+      setPinModalError('PIN must be exactly 6 digits.');
+      return;
+    }
+    if (newVal !== confirmVal) {
+      setPinModalError('PINs do not match.');
+      return;
+    }
+    const resolver = pinModalResolver;
+    closePinModal();
+    resolver({ pin: newVal });
+  } else if (pinModalMode === 'change') {
+    if (!digits6.test(current)) {
+      setPinModalError('Current PIN must be 6 digits.');
+      return;
+    }
+    if (!digits6.test(newVal)) {
+      setPinModalError('New PIN must be 6 digits.');
+      return;
+    }
+    if (newVal !== confirmVal) {
+      setPinModalError('New PINs do not match.');
+      return;
+    }
+    const resolver = pinModalResolver;
+    closePinModal();
+    resolver({ currentPin: current, newPin: newVal });
+  }
+}
+
+function pinModalCancel() {
+  const rejector = pinModalRejector;
+  closePinModal();
+  if (rejector) rejector(new Error('PIN prompt cancelled'));
+}
+
+function closePinModal() {
+  document.getElementById('pin-modal-overlay').classList.add('hidden');
+  pinModalResolver = null;
+  pinModalRejector = null;
+}
+
+// Keyboard: Enter submits, Escape cancels when modal is open.
+document.addEventListener('keydown', (e) => {
+  const overlay = document.getElementById('pin-modal-overlay');
+  if (!overlay || overlay.classList.contains('hidden')) return;
+  if (e.key === 'Enter') { pinModalSubmit(); e.preventDefault(); }
+  else if (e.key === 'Escape') { pinModalCancel(); e.preventDefault(); }
+});
+
+// pinnedFetch wraps a write request with automatic PIN-prompt handling.
+// On 401 with pin_required=verify, prompts the user to enter a PIN and
+// retries. On 403 with pin_required=claim, prompts the user to set a PIN
+// via the /pin endpoint, then retries. On 429 (lockout) gives up and
+// surfaces the lockout to the user. Other error statuses are returned
+// as-is for the caller to handle with its existing error logic.
+//
+// The caller's trialPin (the PIN the user most recently typed into a
+// verify prompt) is kept local to this function and only promoted to
+// currentPin on successful 200. This prevents a cancelled or
+// MAX_PROMPTS-exhausted sequence from leaving a wrong PIN cached, which
+// would silently burn a server-side retry slot on the next write.
+async function pinnedFetch(url, options, mooringId) {
+  // Aligned with server-side MAX_PIN_ATTEMPTS so the UI does not give up
+  // before the server does. With lower values the user had to re-click
+  // their write button partway through their retry allowance, which was
+  // confusing for no benefit.
+  const MAX_PROMPTS = 5;
+  let promptCount = 0;
+  let errMsgForNextPrompt = null;
+  let trialPin = null;
+
+  while (true) {
+    const reqOpts = { ...(options || {}) };
+    reqOpts.headers = { ...((options && options.headers) || {}) };
+    // Prefer the trial PIN (just typed by the user) over the cached one.
+    // If neither is available, send no header and let the server respond
+    // with pin_required=verify for the UI to handle.
+    const headerPin = trialPin ||
+      (currentPin && currentPinMooringId === mooringId ? currentPin : null);
+    if (headerPin) {
+      reqOpts.headers['X-Mooring-PIN'] = headerPin;
+    }
+
+    const res = await fetch(url, reqOpts);
+    if (res.ok) {
+      // Only promote the trial PIN to the cache once the server has
+      // actually accepted it.
+      if (trialPin) setCurrentPin(trialPin, mooringId);
+      return res;
+    }
+
+    let errBody = null;
+    try { errBody = await res.clone().json(); } catch (e) { /* not JSON */ }
+    const detail = errBody && errBody.detail;
+    const detailIsDict = detail && typeof detail === 'object';
+    const pinRequired = detailIsDict ? detail.pin_required : null;
+
+    if (res.status === 429) {
+      const sec = detailIsDict ? (detail.seconds_remaining || 0) : 0;
+      const min = Math.ceil(sec / 60);
+      setCurrentPin(null, null);
+      throw new Error(
+        `Too many failed PIN attempts. Locked out for ${min || 1} more minute(s).`
+      );
+    }
+
+    if (res.status === 403 && pinRequired === 'claim') {
+      if (promptCount >= MAX_PROMPTS) return res;
+      promptCount++;
+      const result = await promptForPin({
+        mode: 'claim', mooringId, errorMsg: errMsgForNextPrompt,
+      });
+      // Claim is a separate endpoint; direct fetch avoids recursion.
+      const claimRes = await fetch(`/api/moorings/${mooringId}/pin`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ new_pin: result.pin }),
+      });
+      if (!claimRes.ok) {
+        let errData = {};
+        try { errData = await claimRes.json(); } catch (e) {}
+        errMsgForNextPrompt =
+          (errData.detail && (errData.detail.message || errData.detail)) ||
+          'Failed to set PIN';
+        continue;
+      }
+      // The server has confirmed the claim so caching is safe. Clear
+      // any trialPin from a preceding verify attempt - it is no longer
+      // meaningful now the mooring has been (re-)claimed with a new PIN.
+      setCurrentPin(result.pin, mooringId);
+      trialPin = null;
+      errMsgForNextPrompt = null;
+      continue;
+    }
+
+    if (res.status === 401 && pinRequired === 'verify') {
+      if (promptCount >= MAX_PROMPTS) return res;
+      promptCount++;
+      const attemptsMsg = detailIsDict && detail.attempts_remaining !== undefined
+        ? `Incorrect PIN. ${detail.attempts_remaining} attempt(s) remaining.`
+        : null;
+      const result = await promptForPin({
+        mode: 'verify', mooringId,
+        errorMsg: attemptsMsg || errMsgForNextPrompt,
+      });
+      // Hold the user's input in trialPin only; do NOT touch currentPin.
+      // The cache is updated only if the server accepts this PIN on the
+      // next iteration.
+      trialPin = result.pin;
+      errMsgForNextPrompt = null;
+      continue;
+    }
+
+    return res;
+  }
 }
 
 // --- Config ---
@@ -711,17 +1036,96 @@ async function saveConfig() {
     showStatus('cfg-status', 'Mooring ID is required to save configuration.', 'err');
     return;
   }
+  // v2: track whether we had a PIN cached for this mooring before the save.
+  // If not AND the save succeeds without pinnedFetch triggering a verify
+  // prompt (i.e. the mooring was new or unclaimed), prompt the user to
+  // claim a PIN immediately.
+  const hadPinBefore = !!(currentPin && currentPinMooringId === cfg.mooring_id);
   try {
-    const res = await fetch('/api/moorings', {
+    const res = await pinnedFetch('/api/moorings', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(cfg)
-    });
+    }, cfg.mooring_id);
     const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || 'Save failed');
+    if (!res.ok) {
+      const msg = (data.detail && (data.detail.message || data.detail)) || 'Save failed';
+      throw new Error(msg);
+    }
     showStatus('cfg-status', `Configuration saved for Mooring ${cfg.mooring_id}.`, 'ok');
     updateFeedUrl(cfg);
     toggleObsPanel();
+
+    // Prompt to claim a PIN if the mooring is unclaimed (we didn't have a
+    // PIN before, and pinnedFetch didn't set one during the save).
+    const hasPinNow = !!(currentPin && currentPinMooringId === cfg.mooring_id);
+    if (!hadPinBefore && !hasPinNow) {
+      await _promptToClaim(cfg.mooring_id);
+    }
   } catch(e) {
+    showStatus('cfg-status', e.message, 'err');
+  }
+}
+
+async function _promptToClaim(mooringId) {
+  try {
+    const result = await promptForPin({ mode: 'claim', mooringId });
+    const res = await fetch(`/api/moorings/${mooringId}/pin`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ new_pin: result.pin }),
+    });
+    let data = {};
+    try { data = await res.json(); } catch (e) {}
+    if (res.ok) {
+      setCurrentPin(result.pin, mooringId);
+      showStatus('cfg-status',
+        'PIN claimed. Keep it safe - you will need it for future changes.', 'ok');
+    } else {
+      const msg = (data.detail && (data.detail.message || data.detail)) ||
+        'PIN claim failed';
+      showStatus('cfg-status', 'Configuration saved, but PIN claim failed: ' + msg, 'err');
+    }
+  } catch(e) {
+    if (e.message === 'PIN prompt cancelled') {
+      // Save succeeded but the mooring is still unclaimed. The ONLY path
+      // back to claiming is another Save - the Change PIN flow requires
+      // a current PIN, which does not exist yet. Do NOT suggest Change
+      // PIN here, it would be misleading.
+      showStatus('cfg-status',
+        'Configuration saved without a PIN. Save again to set a PIN.',
+        'info');
+    } else {
+      showStatus('cfg-status', e.message, 'err');
+    }
+  }
+}
+
+async function changePin() {
+  const cfg = getConfig();
+  if (!cfg.mooring_id) {
+    showStatus('cfg-status', 'Enter a Mooring ID first.', 'err');
+    return;
+  }
+  try {
+    const result = await promptForPin({ mode: 'change', mooringId: cfg.mooring_id });
+    const res = await fetch(`/api/moorings/${cfg.mooring_id}/pin`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        current_pin: result.currentPin,
+        new_pin: result.newPin,
+      }),
+    });
+    let data = {};
+    try { data = await res.json(); } catch (e) {}
+    if (!res.ok) {
+      const msg = (data.detail && (data.detail.message || data.detail)) || 'Change failed';
+      throw new Error(msg);
+    }
+    setCurrentPin(result.newPin, cfg.mooring_id);
+    showStatus('cfg-status', 'PIN changed successfully.', 'ok');
+  } catch(e) {
+    if (e.message === 'PIN prompt cancelled') return;
     showStatus('cfg-status', e.message, 'err');
   }
 }
@@ -736,9 +1140,11 @@ async function loadConfig() {
     const res = await fetch('/api/moorings/' + mid);
     if (res.status === 404) throw new Error('Mooring not found');
     const data = await res.json();
+    // setConfig invokes toggleObsPanel() internally; no need to call it
+    // again here - doing so would double-fire the observations and
+    // calibration fetches.
     setConfig(data);
     showStatus('cfg-status', `Loaded configuration for Mooring ${mid}.`, 'ok');
-    toggleObsPanel();
   } catch(e) {
     showStatus('cfg-status', e.message, 'err');
   }
@@ -774,9 +1180,12 @@ async function calculate(source) {
 
     lastWindows = data.windows;
     lastSource = source;
+    lastWindInfo = data.wind_info || null;
     renderResults(data);
     let msg = `${data.event_count} access window(s) from ${source.toUpperCase()} data.`;
-    if (data.feed_updated) msg += ' Calendar feed updated.';
+    // v2: feed is no longer auto-updated by calculation. When the mooring
+    // has calendar subscription enabled, the Update Feed button in the
+    // results panel lets the user push the results to the feed.
     showStatus('calc-status', msg, 'ok');
   } catch(e) {
     showStatus('calc-status', e.message, 'err');
@@ -896,9 +1305,13 @@ function renderResults(data) {
   // Show action buttons
   actionsDiv.classList.remove('hidden');
   const cfg = getConfig();
-  // "Add to Calendar Feed" only needed when mooring is set but calendar subscription
-  // is not enabled — when enabled, the feed auto-updates on every calculation.
-  if (cfg.mooring_id && !cfg.calendar_enabled) {
+  // v2: "Update Feed" is shown when the mooring has calendar subscription
+  // enabled. Previously "Add to Calendar Feed" was shown only when it was
+  // NOT enabled, because calculation auto-updated the feed. Calculation is
+  // now read-only and the user must press Update Feed explicitly. When
+  // calendar is disabled, per user preference, no feed is generated at
+  // all, so the button is hidden.
+  if (cfg.mooring_id && cfg.calendar_enabled) {
     addBtn.classList.remove('hidden');
   } else {
     addBtn.classList.add('hidden');
@@ -930,25 +1343,45 @@ async function exportIcs() {
   }
 }
 
-async function addToFeed() {
+async function updateFeed() {
   const cfg = getConfig();
   if (!cfg.mooring_id) return;
+  if (!lastWindows || !lastWindows.length) {
+    showStatus('calc-status', 'Calculate access windows first before updating the feed.', 'err');
+    return;
+  }
   try {
-    const res = await fetch('/api/calculate', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({
-        source: lastSource,
+    // Push the last calculated windows into the mooring's stored events
+    // and regenerate the .ics feed (PIN-gated). The body shape matches
+    // what /api/calculate returned so the backend can reconstruct event
+    // descriptions with the same parameters and wind info.
+    const body = {
+      source: lastSource,
+      windows: lastWindows,
+      parameters: {
         draught_m: cfg.draught_m,
         drying_height_m: cfg.drying_height_m,
         safety_margin_m: cfg.safety_margin_m,
-        mooring_id: cfg.mooring_id,
-        add_to_feed: true,
-        days: lastSource === 'harmonic' ? (parseInt(document.getElementById('harmonic_days').value) || 30) : undefined,
-      })
-    });
+      },
+      wind_info: lastWindInfo,
+    };
+    const res = await pinnedFetch(`/api/moorings/${cfg.mooring_id}/feed/update`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    }, cfg.mooring_id);
     const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || 'Failed');
-    showStatus('calc-status', 'Events added to calendar feed.', 'ok');
+    if (!res.ok) {
+      const msg = (data.detail && (data.detail.message || data.detail)) || 'Update failed';
+      throw new Error(msg);
+    }
+    if (data.feed_generated) {
+      showStatus('calc-status',
+        `Calendar feed updated (${data.window_count} windows).`, 'ok');
+    } else {
+      showStatus('calc-status',
+        'Events stored but feed not regenerated (calendar subscription is disabled).',
+        'info');
+    }
   } catch(e) {
     showStatus('calc-status', e.message, 'err');
   }
@@ -989,10 +1422,10 @@ async function submitObservation() {
     direction_of_lay: document.getElementById('obs_lay').value,
   };
   try {
-    const res = await fetch(`/api/moorings/${cfg.mooring_id}/observations`, {
+    const res = await pinnedFetch(`/api/moorings/${cfg.mooring_id}/observations`, {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(body)
-    });
+    }, cfg.mooring_id);
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || 'Failed');
     // Auto-apply of drying height was removed deliberately - calibration
@@ -1020,11 +1453,11 @@ async function uploadObsXlsx() {
   showStatus('obs-status', 'Uploading...', 'info');
   try {
     const buf = await file.arrayBuffer();
-    const res = await fetch(`/api/moorings/${cfg.mooring_id}/observations/upload`, {
+    const res = await pinnedFetch(`/api/moorings/${cfg.mooring_id}/observations/upload`, {
       method: 'POST',
       headers: {'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'},
       body: buf
-    });
+    }, cfg.mooring_id);
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || 'Upload failed');
     // Auto-apply of drying height was removed - see submitObservation().
@@ -1193,9 +1626,10 @@ async function applyDryingHeight() {
   const cfg = getConfig();
   if (!cfg.mooring_id) return;
   try {
-    const res = await fetch(
+    const res = await pinnedFetch(
       `/api/moorings/${cfg.mooring_id}/calibration/apply-drying-height`,
-      {method: 'POST'}
+      {method: 'POST'},
+      cfg.mooring_id
     );
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || 'Apply failed');
@@ -1221,9 +1655,10 @@ async function applyWindOffset() {
   const cfg = getConfig();
   if (!cfg.mooring_id) return;
   try {
-    const res = await fetch(
+    const res = await pinnedFetch(
       `/api/moorings/${cfg.mooring_id}/calibration/apply-wind-offset`,
-      {method: 'POST'}
+      {method: 'POST'},
+      cfg.mooring_id
     );
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || 'Apply failed');
@@ -1294,9 +1729,9 @@ async function deleteObservation(obsId) {
   const cfg = getConfig();
   if (!cfg.mooring_id) return;
   try {
-    const res = await fetch(`/api/moorings/${cfg.mooring_id}/observations/${obsId}`, {
+    const res = await pinnedFetch(`/api/moorings/${cfg.mooring_id}/observations/${obsId}`, {
       method: 'DELETE'
-    });
+    }, cfg.mooring_id);
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || 'Failed');
     showStatus('obs-status', 'Observation deleted.', 'ok');
@@ -1312,9 +1747,9 @@ async function clearAllObservations() {
   if (!cfg.mooring_id) return;
   if (!confirm('Delete all observations for this mooring? This cannot be undone.')) return;
   try {
-    const res = await fetch(`/api/moorings/${cfg.mooring_id}/observations`, {
+    const res = await pinnedFetch(`/api/moorings/${cfg.mooring_id}/observations`, {
       method: 'DELETE'
-    });
+    }, cfg.mooring_id);
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || 'Failed');
     showStatus('obs-status', `Cleared ${data.deleted_count} observations.`, 'ok');

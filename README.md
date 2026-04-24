@@ -2,6 +2,8 @@
 
 A Docker-containerised application for predicting when a boat on a swing mooring in Langstone Harbour has sufficient water depth to depart and arrive.
 
+**Version 2** — adds per-mooring 6-digit PIN protection, decouples iCal feed updates from calculation, and restructures the calibration system to split base drying height from shallow-side wind offset. The v1.0 release is preserved on the tag `v1.0`.
+
 ## Overview
 
 The tool computes access windows — the periods around each high water when the tide height exceeds the sum of the mooring's drying height, the boat's draught, and a safety margin. It uses three data sources in priority order:
@@ -15,6 +17,7 @@ The tool computes access windows — the periods around each high water when the
 ### Key Features
 
 - **Per-mooring configuration** with persistent storage keyed by mooring number (1–100)
+- **6-digit PIN protection** — each mooring is protected against casual alteration by third parties; see **PIN Protection** below for the full model
 - **Empirical calibration** — record observations (afloat/aground) to refine the drying height estimate, with confidence rating
 - **Subscribable iCal feed** per mooring, auto-updated daily, with proper subscription metadata
 - **Wind offset** — adjusts the next tide's access window based on observed wind direction and the mooring's shallow-water geometry
@@ -118,6 +121,7 @@ tidal-access/
 | `WIND_SAMPLE_HW_OFFSET_HOURS` | Hours after HW to sample wind | `4` |
 | `LOCATION_LAT` | Latitude for OWM queries | `50.8185` |
 | `LOCATION_LON` | Longitude for OWM queries | `-0.9806` |
+| `PIN_HASH_SALT` | Site-wide salt used when hashing mooring PINs (set to any long random string; must stay stable or all PINs are invalidated) | (required for PIN operations) |
 | `PORT` | Web interface port | `8866` |
 
 ## Event Titles
@@ -156,6 +160,83 @@ Observations that qualify for wind-offset calibration (see **Wind Offset** below
 
 **Applying calibration**. Suggested values from observations are displayed in the Calibration Status card as proposals only: they are not written to the mooring configuration automatically. When a suggestion differs from the currently stored value, an **Apply** button appears next to it; clicking Apply updates the mooring config, recomputes future access windows, and regenerates the iCal feed. Individual observations can be deleted, or all observations for a mooring can be cleared; either action also updates the suggestion, but never the stored config.
 
+## PIN Protection
+
+Each mooring is protected by a 6-digit PIN. Once a mooring has been claimed, any change to its configuration, observations, calibration, or iCal feed requires the PIN.
+
+### What the PIN gates
+
+PIN verification is **required** for:
+
+- Saving changes to a claimed mooring's configuration
+- Adding, deleting, or uploading observations
+- Applying calibration suggestions (base drying height, wind offset)
+- Pushing calculated windows into the mooring's iCal feed
+
+PIN verification is **not required** for:
+
+- Reading a mooring's configuration (the stored hash is never returned to clients)
+- Calculating access windows — calculation is read-only, so any visitor can compute windows against any mooring without authentication
+- Downloading a one-shot `.ics` export of a calculation result
+- Subscribing to a mooring's public iCal feed at `/feeds/mooring_{id}.ics`
+
+### Claim-on-first-save
+
+A newly-created mooring has no PIN. The first **Save Configuration** on a new or unclaimed mooring is permitted without authentication, and the UI then prompts the user to set a 6-digit PIN immediately. If the claim prompt is cancelled, the mooring remains unclaimed; the next save triggers the claim prompt again.
+
+**Claim promptly.** An unclaimed mooring can be claimed by anyone who reaches the `/api/moorings/{id}/pin` endpoint first. This is a deliberate first-write-wins design — simpler than any alternative — but it means that leaving a mooring in the unclaimed state creates a small window during which a third party who knows or guesses the mooring ID can claim it.
+
+### Rate limiting
+
+Failed PIN attempts are tracked per mooring:
+
+- Up to **5 failed attempts within 10 minutes** are permitted
+- The 5th consecutive failure **locks the mooring for 15 minutes**
+- Successful verification resets the counter
+- The lockout covers all PIN operations on the mooring — including Change PIN
+
+While locked, all PIN-gated operations on the affected mooring return HTTP 429 with a `Retry-After` header.
+
+### Changing a PIN
+
+Use the **Change PIN** button in the Configuration panel. The current PIN is required to set a new one. Forgotten PINs cannot be recovered through the UI — see the admin reset procedure below.
+
+### Admin PIN reset
+
+PIN resets require direct database access. Two mechanisms are supported:
+
+**Option A — Clear the PIN** (returns the mooring to unclaimed state; user then sets a new PIN on their next save via the claim flow):
+
+```
+sqlite3 data/tides.db "UPDATE moorings SET pin_hash = '' WHERE mooring_id = 42;"
+```
+
+**Option B — Set a known PIN** (e.g. `000000`, so the user can log in with the known value and then use Change PIN to rotate it):
+
+```
+# Compute hash against the configured salt:
+python3 -c "import hashlib, os; s=os.environ['PIN_HASH_SALT']; p='000000'; print(hashlib.sha256((s+p).encode()).hexdigest())"
+
+# Apply to the database:
+sqlite3 data/tides.db "UPDATE moorings SET pin_hash = '<hex_digest_from_above>' WHERE mooring_id = 42;"
+```
+
+The hashing scheme is deterministic (SHA-256 of `salt + pin` with the site-wide `PIN_HASH_SALT`), so precomputed hashes for any known PIN value can be reused across moorings without per-row salts.
+
+### Threat model
+
+The PIN system is designed to deter **casual misuse** — accidental edits, opportunistic changes by a third party who guesses or is told a mooring ID. It is **not** designed to resist:
+
+- **An attacker with filesystem access to the database and `.env`.** A 6-digit PIN has only 1,000,000 possible values; any hash scheme, salted or not, is exhaustively reversible in under a second on commodity hardware given the salt. If someone can read the database file, the PIN system does not meaningfully slow them down.
+- **Attackers observing PIN entry over an unencrypted connection.** Deploy the app behind HTTPS (Cloudflare Tunnel or a TLS-terminating reverse proxy) for any public-facing use.
+- **Timing races during the claim window.** Described under Claim-on-first-save above.
+
+For the intended use case — a handful of friends sharing a tool, protected from each other's keyboard mistakes and from an unknown third party stumbling onto the public URL — the threat model is appropriate. Anything stronger would require user accounts and TLS client auth, which is out of scope for this tool.
+
+### The scheduler bypasses the PIN
+
+The daily UKHO refresh (02:00 local) and the HW+4h wind observation job update stored events and regenerate feeds by calling internal functions directly, not through the HTTP API. They therefore bypass PIN gating by design. This is consistent with the threat model: the scheduler executes work that the mooring owner has already authorised at configuration time (by enabling calendar subscription and/or wind offset). An attacker who can reach the scheduler has already broken into the host.
+
 ## iCal Feeds
 
 Each mooring with calendar subscription enabled gets a stable URL:
@@ -165,6 +246,16 @@ https://tsctide.uk/feeds/mooring_42.ics
 On the local network, `http://localhost:8866/feeds/mooring_42.ics` also works.
 
 The feed includes `REFRESH-INTERVAL` and `X-PUBLISHED-TTL` metadata for proper calendar app subscription behaviour. Events use cycle-based UIDs that are stable across data sources — upgrading from harmonic to UKHO data replaces events rather than duplicating them.
+
+### How feeds are updated (v2)
+
+Calculating access windows in the UI is a **read-only** operation. It returns windows for display or `.ics` download but does **not** alter the subscribed feed. The feed is updated in three distinct ways:
+
+1. **Automatically, daily at 02:00 local time.** The scheduler fetches fresh UKHO data, recomputes windows for every calendar-enabled mooring, and regenerates their `.ics` files. This runs without a PIN (see *The scheduler bypasses the PIN* under **PIN Protection**).
+2. **On Apply of a calibration suggestion.** Applying a drying-height or wind-offset suggestion from the Calibration Status card implicitly recomputes future windows and regenerates the feed. Apply actions are PIN-gated.
+3. **Manually via the Update Feed button.** After calculating windows the user can click **Update Feed** to push those specific windows into the mooring's stored events and regenerate the `.ics` file. This is PIN-gated. The button is shown only when calendar subscription is enabled for the mooring — calendar-disabled moorings do not have a feed file to update.
+
+The split between calculation (ungated) and feed update (PIN-gated) exists so that anyone — including the mooring owner experimenting with different parameters — can calculate windows without accidentally overwriting what the subscribed feed serves. One-shot `.ics` downloads from the results panel are similarly ungated.
 
 ### Calendar App Compatibility
 

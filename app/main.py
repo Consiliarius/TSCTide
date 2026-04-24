@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import HTMLResponse, Response, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from dateutil import parser as dtparse
@@ -29,6 +29,12 @@ from app.database import (
     load_classification_inputs,
     get_wind_observations_in_range,
     delete_future_events, get_calendar_events, log_activity, get_activity_log,
+    get_mooring_pin_hash, set_mooring_pin_hash,
+    check_pin_lockout, record_failed_pin_attempt, clear_failed_pin_attempts,
+)
+from app.pin import (
+    hash_pin, verify_pin, is_valid_pin_format,
+    MAX_PIN_ATTEMPTS, PIN_ATTEMPT_WINDOW_MINUTES, PIN_LOCKOUT_MINUTES,
 )
 from app.observation_classifier import classify_observations
 from app.ukho import fetch_tidal_events
@@ -64,6 +70,133 @@ def _coalesce(*values, default):
         if v is not None:
             return v
     return default
+
+
+def _public_mooring(m):
+    """
+    Return a copy of a mooring dict with the sensitive pin_hash field
+    stripped out. Use this when returning mooring data to API clients.
+    A None input returns None so call sites can use this uniformly.
+    """
+    if m is None:
+        return None
+    return {k: v for k, v in m.items() if k != "pin_hash"}
+
+
+def _verify_pin_from_request(
+    mooring_id: int,
+    request: Request,
+    allow_unclaimed: bool = False,
+    allow_nonexistent: bool = False,
+) -> None:
+    """
+    Verify the X-Mooring-PIN header against the stored hash for the given
+    mooring. Raises HTTPException on any failure path; returns None on
+    success.
+
+    Failure responses (as HTTPException with structured detail):
+      - 429 if the mooring is currently locked out. Sends Retry-After.
+      - 404 if the mooring does not exist and allow_nonexistent is False.
+      - 403 with pin_required=claim if the mooring exists but has no PIN
+        set and allow_unclaimed is False. The UI interprets this as a
+        prompt to call POST /pin to claim.
+      - 401 with pin_required=verify if the header is missing.
+      - 401 with pin_required=verify and attempts_remaining on PIN
+        mismatch. The failed-attempt counter is incremented.
+      - 429 if the wrong-PIN attempt is the one that trips the lockout.
+
+    Side effects:
+      - On success: clears any stored failed-attempt counter.
+      - On PIN mismatch: increments the failed-attempt counter and may
+        start a lockout window per the policy in app.pin.
+
+    The two allow_* flags exist to support POST /api/moorings:
+      - allow_nonexistent=True lets the first-ever save on a fresh
+        mooring_id pass through (there is no row yet to read a hash from).
+      - allow_unclaimed=True lets a save on an existing-but-unclaimed
+        mooring pass through (the UI will follow up with a claim call).
+    All other callers use the strict defaults.
+    """
+    lockout = check_pin_lockout(mooring_id)
+    if lockout:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "message": "Too many failed PIN attempts",
+                "locked_until": lockout["locked_until"],
+                "seconds_remaining": lockout["seconds_remaining"],
+            },
+            headers={"Retry-After": str(lockout["seconds_remaining"])},
+        )
+
+    stored_hash = get_mooring_pin_hash(mooring_id)
+    if stored_hash is None:
+        if allow_nonexistent:
+            return
+        raise HTTPException(404, "Mooring not found")
+
+    if stored_hash == "":
+        if allow_unclaimed:
+            return
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "message": "Mooring has no PIN set",
+                "pin_required": "claim",
+            },
+        )
+
+    pin = request.headers.get("X-Mooring-PIN")
+    if not pin:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "message": "PIN required",
+                "pin_required": "verify",
+            },
+        )
+
+    if verify_pin(pin, stored_hash):
+        clear_failed_pin_attempts(mooring_id)
+        return
+
+    state = record_failed_pin_attempt(
+        mooring_id,
+        MAX_PIN_ATTEMPTS,
+        PIN_ATTEMPT_WINDOW_MINUTES,
+        PIN_LOCKOUT_MINUTES,
+    )
+    if state["locked_until"]:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "message": "Too many failed attempts; locked out",
+                "locked_until": state["locked_until"],
+                "attempts_remaining": 0,
+            },
+            headers={"Retry-After": str(PIN_LOCKOUT_MINUTES * 60)},
+        )
+    raise HTTPException(
+        status_code=401,
+        detail={
+            "message": "Incorrect PIN",
+            "pin_required": "verify",
+            "attempts_remaining": state["attempts_remaining"],
+        },
+    )
+
+
+async def require_mooring_pin(mooring_id: int, request: Request) -> None:
+    """
+    FastAPI dependency wrapping _verify_pin_from_request with the strict
+    defaults: rejects non-existent moorings (404) and unclaimed moorings
+    (403 with pin_required=claim). Use via
+    `dependencies=[Depends(require_mooring_pin)]` on write endpoints
+    where the mooring must already exist and already be claimed.
+    """
+    _verify_pin_from_request(
+        mooring_id, request, allow_unclaimed=False, allow_nonexistent=False
+    )
 
 
 def _build_calibration_response(mooring_id: int) -> dict:
@@ -187,28 +320,44 @@ async def index():
 
 @app.get("/api/moorings")
 async def list_moorings():
-    """List all configured moorings."""
-    return get_all_moorings()
+    """List all configured moorings with sensitive fields (pin_hash) stripped."""
+    return [_public_mooring(m) for m in get_all_moorings()]
 
 
 @app.get("/api/moorings/{mooring_id}")
 async def get_mooring_config(mooring_id: int):
-    """Get a specific mooring configuration."""
+    """Get a specific mooring configuration with pin_hash stripped."""
     m = get_mooring(mooring_id)
     if not m:
         raise HTTPException(404, "Mooring not found")
-    return m
+    return _public_mooring(m)
 
 
 @app.post("/api/moorings")
 async def save_mooring_config(request: Request):
-    """Save (create or update) a mooring configuration."""
+    """
+    Save (create or update) a mooring configuration.
+
+    PIN gating: Existing moorings with a non-empty pin_hash require a
+    valid X-Mooring-PIN header. New moorings (no row yet) and existing
+    moorings with no PIN set (unclaimed) are allowed through; the UI
+    should follow up with a call to POST /api/moorings/{id}/pin to
+    claim the PIN.
+    """
     data = await request.json()
     if "mooring_id" not in data:
         raise HTTPException(400, "mooring_id is required")
     mid = int(data["mooring_id"])
     if mid < 1 or mid > 100:
         raise HTTPException(400, "mooring_id must be between 1 and 100")
+
+    # PIN gate for claimed moorings only. Brand-new mooring_ids and
+    # unclaimed existing ones pass through so the UI can immediately
+    # prompt to claim via POST /pin.
+    _verify_pin_from_request(
+        mid, request, allow_unclaimed=True, allow_nonexistent=True
+    )
+
     result = save_mooring(data)
 
     log_activity(
@@ -241,7 +390,103 @@ async def save_mooring_config(request: Request):
                 cal = None
             generate_feed_for_mooring(mid, result.get("boat_name", ""), cal)
 
-    return result
+    return _public_mooring(result)
+
+
+@app.post("/api/moorings/{mooring_id}/pin")
+async def set_or_change_pin(mooring_id: int, request: Request):
+    """
+    Claim or change the PIN for a mooring.
+
+    For unclaimed moorings (no PIN set): only new_pin is required.
+    For claimed moorings: both current_pin (for verification) and new_pin
+    are required. The same rate-limit policy applies as for other PIN
+    operations - a wrong current_pin counts toward the lockout.
+
+    Body: {"new_pin": "123456", "current_pin": "654321" (optional)}
+    Returns: {"status": "ok", "was_claimed": bool}
+    """
+    data = await request.json()
+    new_pin = data.get("new_pin", "") or ""
+    current_pin = data.get("current_pin", "") or ""
+
+    m = get_mooring(mooring_id)
+    if not m:
+        raise HTTPException(404, "Mooring not found")
+
+    if not is_valid_pin_format(new_pin):
+        raise HTTPException(400, "PIN must be exactly six numeric digits")
+
+    # Respect the lockout timer for any PIN operation.
+    lockout = check_pin_lockout(mooring_id)
+    if lockout:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "message": "Too many failed PIN attempts",
+                "locked_until": lockout["locked_until"],
+                "seconds_remaining": lockout["seconds_remaining"],
+            },
+            headers={"Retry-After": str(lockout["seconds_remaining"])},
+        )
+
+    stored_hash = get_mooring_pin_hash(mooring_id) or ""
+    was_claimed = bool(stored_hash)
+
+    if was_claimed:
+        if not current_pin:
+            raise HTTPException(
+                status_code=401,
+                detail={
+                    "message": "current_pin is required to change an existing PIN",
+                    "pin_required": "verify",
+                },
+            )
+        if not verify_pin(current_pin, stored_hash):
+            state = record_failed_pin_attempt(
+                mooring_id,
+                MAX_PIN_ATTEMPTS,
+                PIN_ATTEMPT_WINDOW_MINUTES,
+                PIN_LOCKOUT_MINUTES,
+            )
+            if state["locked_until"]:
+                raise HTTPException(
+                    status_code=429,
+                    detail={
+                        "message": "Too many failed attempts; locked out",
+                        "locked_until": state["locked_until"],
+                        "attempts_remaining": 0,
+                    },
+                    headers={"Retry-After": str(PIN_LOCKOUT_MINUTES * 60)},
+                )
+            raise HTTPException(
+                status_code=401,
+                detail={
+                    "message": "Incorrect current PIN",
+                    "pin_required": "verify",
+                    "attempts_remaining": state["attempts_remaining"],
+                },
+            )
+        clear_failed_pin_attempts(mooring_id)
+
+    new_hash = hash_pin(new_pin)
+    if not set_mooring_pin_hash(mooring_id, new_hash):
+        # Should not happen - we just confirmed the row exists above.
+        raise HTTPException(500, "Failed to update PIN")
+
+    log_activity(
+        event_type="pin_changed" if was_claimed else "pin_claimed",
+        message=(
+            f"PIN changed for mooring #{mooring_id}"
+            if was_claimed
+            else f"PIN claimed for mooring #{mooring_id}"
+        ),
+        severity="success",
+        scope="mooring",
+        mooring_id=mooring_id,
+    )
+
+    return {"status": "ok", "was_claimed": was_claimed}
 
 
 # --- Observations ---
@@ -252,7 +497,8 @@ async def list_observations(mooring_id: int):
     return get_observations(mooring_id)
 
 
-@app.delete("/api/moorings/{mooring_id}/observations/{observation_id}")
+@app.delete("/api/moorings/{mooring_id}/observations/{observation_id}",
+            dependencies=[Depends(require_mooring_pin)])
 async def remove_observation(mooring_id: int, observation_id: int):
     """
     Delete a single observation. Does NOT auto-apply calibration changes -
@@ -276,7 +522,8 @@ async def remove_observation(mooring_id: int, observation_id: int):
     }
 
 
-@app.delete("/api/moorings/{mooring_id}/observations")
+@app.delete("/api/moorings/{mooring_id}/observations",
+            dependencies=[Depends(require_mooring_pin)])
 async def clear_all_observations(mooring_id: int):
     """
     Delete all observations for a mooring. Does NOT auto-apply calibration
@@ -299,7 +546,8 @@ async def clear_all_observations(mooring_id: int):
     }
 
 
-@app.post("/api/moorings/{mooring_id}/observations")
+@app.post("/api/moorings/{mooring_id}/observations",
+          dependencies=[Depends(require_mooring_pin)])
 async def add_mooring_observation(mooring_id: int, request: Request):
     """
     Add an observation. Does NOT auto-apply calibration changes; the
@@ -309,10 +557,8 @@ async def add_mooring_observation(mooring_id: int, request: Request):
     data = await request.json()
     data["mooring_id"] = mooring_id
 
-    m = get_mooring(mooring_id)
-    if not m:
-        raise HTTPException(404, "Mooring not found")
-
+    # Existence check is handled by the require_mooring_pin dependency,
+    # which returns 404 before this handler runs.
     obs = add_observation(data)
 
     log_activity(
@@ -336,7 +582,8 @@ async def add_mooring_observation(mooring_id: int, request: Request):
     }
 
 
-@app.post("/api/moorings/{mooring_id}/observations/upload")
+@app.post("/api/moorings/{mooring_id}/observations/upload",
+          dependencies=[Depends(require_mooring_pin)])
 async def upload_observations_xlsx(mooring_id: int, request: Request):
     """
     Import observations from an XLSX file. Observations are tied to this
@@ -349,10 +596,7 @@ async def upload_observations_xlsx(mooring_id: int, request: Request):
     import io
     from openpyxl import load_workbook
 
-    m = get_mooring(mooring_id)
-    if not m:
-        raise HTTPException(404, "Mooring not found")
-
+    # Existence check is handled by the require_mooring_pin dependency.
     body = await request.body()
     if not body:
         raise HTTPException(400, "No file uploaded")
@@ -511,7 +755,8 @@ async def get_calibration_status(mooring_id: int):
     return _build_calibration_response(mooring_id)
 
 
-@app.post("/api/moorings/{mooring_id}/calibration/apply-drying-height")
+@app.post("/api/moorings/{mooring_id}/calibration/apply-drying-height",
+          dependencies=[Depends(require_mooring_pin)])
 async def apply_drying_height_calibration(mooring_id: int):
     """
     Apply the current base-drying-height suggestion to the mooring's
@@ -534,7 +779,7 @@ async def apply_drying_height_calibration(mooring_id: int):
             "reason": "suggestion matches current stored value",
             "previous": previous,
             "new": previous,
-            "mooring": m,
+            "mooring": _public_mooring(m),
             "calibration": _build_calibration_response(mooring_id),
         }
 
@@ -568,12 +813,13 @@ async def apply_drying_height_calibration(mooring_id: int):
         "applied": True,
         "previous": previous,
         "new": best,
-        "mooring": get_mooring(mooring_id),
+        "mooring": _public_mooring(get_mooring(mooring_id)),
         "calibration": _build_calibration_response(mooring_id),
     }
 
 
-@app.post("/api/moorings/{mooring_id}/calibration/apply-wind-offset")
+@app.post("/api/moorings/{mooring_id}/calibration/apply-wind-offset",
+          dependencies=[Depends(require_mooring_pin)])
 async def apply_wind_offset_calibration(mooring_id: int):
     """
     Apply the current shallow-side wind offset suggestion to the mooring's
@@ -603,7 +849,7 @@ async def apply_wind_offset_calibration(mooring_id: int):
             ),
             "previous": previous,
             "new": previous,
-            "mooring": m,
+            "mooring": _public_mooring(m),
             "calibration": _build_calibration_response(mooring_id),
         }
 
@@ -636,7 +882,7 @@ async def apply_wind_offset_calibration(mooring_id: int):
         "applied": True,
         "previous": previous,
         "new": suggested,
-        "mooring": get_mooring(mooring_id),
+        "mooring": _public_mooring(get_mooring(mooring_id)),
         "calibration": _build_calibration_response(mooring_id),
     }
 
@@ -712,15 +958,18 @@ async def parse_khm_data(request: Request):
 async def calculate_access_windows(request: Request):
     """
     Calculate access windows for given parameters and data source.
+    READ-ONLY: returns windows but does NOT store events or regenerate
+    the feed. To push a calculation result into the mooring's stored
+    events and iCal feed, call POST /api/moorings/{id}/feed/update
+    afterwards (PIN-gated).
 
     Body:
         source: "ukho" | "khm" | "harmonic"
         draught_m: float
         drying_height_m: float
         safety_margin_m: float
-        mooring_id: int (optional - for persistent config)
+        mooring_id: int (optional - loads stored params when fields omitted)
         days: int (for harmonic, how far ahead)
-        add_to_feed: bool (optional - add to mooring's iCal feed)
         wind_offset_enabled: bool (optional - overrides stored mooring setting)
         shallow_direction: str (optional - overrides stored mooring setting)
         shallow_extra_depth_m: float (optional - overrides stored mooring setting)
@@ -728,7 +977,6 @@ async def calculate_access_windows(request: Request):
     data = await request.json()
     source = data.get("source", "ukho")
     mooring_id = data.get("mooring_id")
-    add_to_feed = data.get("add_to_feed", False)
 
     mooring = None
     if mooring_id:
@@ -784,6 +1032,11 @@ async def calculate_access_windows(request: Request):
                     "direction": wind_data["direction_compass"],
                     "shallow_side": shallow_dir,
                     "offset_m": extra_depth,
+                    # speed_ms round-trips to /feed/update so that calendar
+                    # event descriptions generated later can include wind
+                    # speed, matching v1 behaviour. The UI preserves this
+                    # value verbatim between /calculate and /feed/update.
+                    "speed_ms": wind_data.get("speed_ms"),
                 }
 
     now = datetime.now(timezone.utc)
@@ -845,45 +1098,10 @@ async def calculate_access_windows(request: Request):
     now_str = to_utc_str(now)
     windows = [w for w in windows if w["hw_timestamp"] >= now_str]
 
-    should_store = mooring_id and mooring and (
-        add_to_feed or mooring.get("calendar_enabled")
-    )
-    if should_store:
-        cal = calibrate_drying_height(int(mooring_id))
-        calc_params = {
-            "draught_m": float(draught),
-            "drying_height_m": float(drying),
-            "safety_margin_m": float(margin),
-            "obs_calibrated": 1 if cal.get("confidence", "none") != "none" else 0,
-        }
-        wind_details = None
-        if wind_info and wind_info.get("applied"):
-            wind_details = {
-                "direction": wind_info["direction"],
-                "speed_ms": wind_data.get("speed_ms") if wind_data else None,
-                "offset_m": wind_info["offset_m"],
-            }
-
-        store_windows_as_events(
-            windows, int(mooring_id), tide_source, mooring.get("boat_name", ""),
-            calc_params=calc_params, wind_details=wind_details,
-        )
-        if mooring.get("calendar_enabled"):
-            if cal.get("confidence") == "none":
-                cal = None
-            generate_feed_for_mooring(int(mooring_id), mooring.get("boat_name", ""), cal)
-            log_activity(
-                event_type="feed_generation",
-                message=f"Calendar feed updated ({len(windows)} windows from {tide_source.upper()})",
-                severity="info",
-                scope="mooring",
-                mooring_id=int(mooring_id),
-                details={
-                    "window_count": len(windows),
-                    "source": tide_source,
-                    "trigger": "user_calculate",
-                },
-            )
+    # v2: This endpoint is read-only. Storing events and regenerating the
+    # iCal feed now happens via POST /api/moorings/{id}/feed/update, which
+    # is PIN-gated. The UI passes this response body back to that endpoint
+    # verbatim when the user clicks "Update Feed".
 
     return {
         "windows": windows,
@@ -896,7 +1114,6 @@ async def calculate_access_windows(request: Request):
         },
         "wind_info": wind_info,
         "event_count": len([w for w in windows if not w.get("below_threshold")]),
-        "feed_updated": bool(should_store and mooring.get("calendar_enabled")),
     }
 
 
@@ -933,6 +1150,103 @@ async def export_ics(request: Request):
         media_type="text/calendar",
         headers={"Content-Disposition": "attachment; filename=tidal_access.ics"},
     )
+
+
+# --- Feed Update (v2: decoupled from calculate) ---
+
+@app.post("/api/moorings/{mooring_id}/feed/update",
+          dependencies=[Depends(require_mooring_pin)])
+async def update_mooring_feed(mooring_id: int, request: Request):
+    """
+    PIN-gated. Push a set of previously-calculated windows into the
+    mooring's stored events, and regenerate the .ics feed file if the
+    mooring has calendar_enabled. Separated from POST /api/calculate so
+    that calculation can be a read-only operation: anyone can calculate
+    windows or export a one-shot .ics, but only the PIN-holder can
+    overwrite what the subscribed calendar feed serves.
+
+    If calendar_enabled is false on the mooring, events are still stored
+    (so a later re-enable picks them up) but the .ics file is not
+    regenerated. The UI should hide the "Update Feed" button in this
+    case; a direct call that bypasses the UI returns a feed_generated
+    flag of False so the caller knows.
+
+    Body (matches the shape returned by /api/calculate):
+        source: str (ukho | khm | harmonic)
+        windows: [{...}, ...]
+        parameters: {draught_m, drying_height_m, safety_margin_m, ...}
+        wind_info: {direction, offset_m, shallow_side, applied} or null
+    """
+    data = await request.json()
+    source = data.get("source", "")
+    windows = data.get("windows", [])
+    params = data.get("parameters", {}) or {}
+    wind_info = data.get("wind_info") or None
+
+    m = get_mooring(mooring_id)
+    if not m:
+        raise HTTPException(404, "Mooring not found")
+
+    if not windows:
+        raise HTTPException(400, "No windows supplied to update feed")
+    if source not in ("ukho", "khm", "harmonic"):
+        raise HTTPException(400, f"Invalid source: {source}")
+
+    cal = calibrate_drying_height(mooring_id)
+    calc_params = {
+        "draught_m": params.get("draught_m", m["draught_m"]),
+        "drying_height_m": params.get("drying_height_m", m["drying_height_m"]),
+        "safety_margin_m": params.get("safety_margin_m", m["safety_margin_m"]),
+        "obs_calibrated": 1 if cal.get("confidence", "none") != "none" else 0,
+    }
+    wind_details = None
+    if wind_info and wind_info.get("applied"):
+        wind_details = {
+            "direction": wind_info.get("direction"),
+            # Forwarded from /calculate so calendar event descriptions can
+            # include wind speed. Only present if the originating /calculate
+            # call actually fetched wind data.
+            "speed_ms": wind_info.get("speed_ms"),
+            "offset_m": wind_info.get("offset_m"),
+        }
+
+    # Always store events - they are internal state, used by serve_feed
+    # on every request, and preserved across calendar_enabled toggles.
+    store_windows_as_events(
+        windows, mooring_id, source, m.get("boat_name", ""),
+        calc_params=calc_params, wind_details=wind_details,
+    )
+
+    feed_generated = False
+    if m.get("calendar_enabled"):
+        feed_cal = cal if cal.get("confidence") != "none" else None
+        generate_feed_for_mooring(mooring_id, m.get("boat_name", ""), feed_cal)
+        feed_generated = True
+
+    log_activity(
+        event_type="feed_generation",
+        message=(
+            f"Calendar feed updated ({len(windows)} windows from {source.upper()})"
+            if feed_generated
+            else f"Events stored but feed file not regenerated - calendar disabled for mooring #{mooring_id}"
+        ),
+        severity="info" if feed_generated else "warning",
+        scope="mooring",
+        mooring_id=mooring_id,
+        details={
+            "window_count": len(windows),
+            "source": source,
+            "trigger": "user_update_feed",
+            "feed_generated": feed_generated,
+        },
+    )
+
+    return {
+        "status": "ok",
+        "window_count": len(windows),
+        "source": source,
+        "feed_generated": feed_generated,
+    }
 
 
 # --- Activity Log ---
