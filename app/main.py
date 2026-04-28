@@ -22,7 +22,7 @@ from app.config import (
     to_utc_str,
 )
 from app.database import (
-    init_db, save_mooring, get_mooring, get_all_moorings,
+    init_db, save_mooring, get_mooring, get_all_moorings, delete_mooring,
     add_observation, get_observations, delete_observation, clear_observations,
     store_tide_events, get_tide_events, get_ukho_tide_events,
     calibrate_drying_height, calibrate_wind_offset,
@@ -487,6 +487,71 @@ async def set_or_change_pin(mooring_id: int, request: Request):
     )
 
     return {"status": "ok", "was_claimed": was_claimed}
+
+
+@app.delete("/api/moorings/{mooring_id}",
+            dependencies=[Depends(require_mooring_pin)])
+async def delete_mooring_config(mooring_id: int):
+    """
+    Permanently delete a mooring and its associated per-mooring data.
+    PIN-gated. Returns 404 if the mooring does not exist (the dependency
+    handles this before the handler runs).
+
+    Database state cleared: moorings row, observations, calendar_events,
+    pin_failed_attempts. Activity log entries are preserved as an audit
+    trail (and age out automatically per prune_activity_log retention).
+
+    On-disk state cleared: feeds/mooring_NN.ics if present.
+
+    Returns a summary dict with deletion counts.
+    """
+    m = get_mooring(mooring_id)
+    boat_name = m.get("boat_name") if m else ""
+
+    counts = delete_mooring(mooring_id)
+
+    # Remove the on-disk feed file. Filename pattern matches
+    # generate_feed_for_mooring (zero-padded to 3 digits, hence :03d).
+    # If the file does not exist, this is a no-op - users may have
+    # never enabled calendar subscription.
+    feed_path = FEEDS_DIR / f"mooring_{mooring_id:03d}.ics"
+    feed_removed = False
+    try:
+        if feed_path.exists():
+            feed_path.unlink()
+            feed_removed = True
+    except OSError as e:
+        # Log but do not fail the deletion - the database row is gone, the
+        # feed file is now orphaned, and serve_feed will 404 since the
+        # mooring no longer exists. Manual cleanup of the file is possible
+        # if needed.
+        logger.warning(
+            f"Failed to remove feed file {feed_path} during mooring delete: {e}"
+        )
+
+    log_activity(
+        event_type="mooring_deleted",
+        message=(
+            f"Mooring #{mooring_id}"
+            + (f" ({boat_name})" if boat_name else "")
+            + " permanently deleted"
+        ),
+        severity="warning",
+        scope="mooring",
+        mooring_id=mooring_id,
+        details={
+            "boat_name": boat_name,
+            "db_counts": counts,
+            "feed_file_removed": feed_removed,
+        },
+    )
+
+    return {
+        "deleted": True,
+        "mooring_id": mooring_id,
+        "db_counts": counts,
+        "feed_file_removed": feed_removed,
+    }
 
 
 # --- Observations ---
@@ -1336,6 +1401,48 @@ async def get_stored_tide_data(start: str = None, end: str = None):
     if not end:
         end = to_utc_str(datetime.now(timezone.utc) + timedelta(days=7))
     return get_tide_events(start, end)
+
+
+@app.get("/api/tides")
+async def get_tides(range: str = "forecast"):
+    """
+    Return UKHO tide events for the Tides tab.
+
+    range='forecast' (default): events from now to now+7 days.
+    range='history':              events from now-365 days up to now.
+
+    Each event is returned with its `station` field intact ('langstone' or
+    'portsmouth') so the UI can show a per-row source badge. The Portsmouth
+    secondary-port offset is NOT applied here - the UI shows raw stored
+    values from each station, with a badge indicating which one. This is
+    different from get_ukho_tide_events() which applies the offset for
+    calculation purposes.
+
+    Note: this endpoint is intentionally ungated - tide data is public.
+    """
+    if range not in ("forecast", "history"):
+        raise HTTPException(400, "range must be 'forecast' or 'history'")
+
+    now = datetime.now(timezone.utc)
+    if range == "forecast":
+        start = now
+        end = now + timedelta(days=7)
+    else:
+        # Rolling 12-month window. The cleanup_old_tide_data scheduled job
+        # prevents data older than this from accumulating, so the upper
+        # limit of the query is effectively bounded by retention.
+        start = now - timedelta(days=365)
+        end = now
+
+    events = get_tide_events(
+        to_utc_str(start), to_utc_str(end), source="ukho"
+    )
+
+    return {
+        "range": range,
+        "events": events,
+        "count": len(events),
+    }
 
 
 # --- Wind ---

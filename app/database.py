@@ -402,6 +402,61 @@ def clear_observations(mooring_id: int) -> int:
         return result.rowcount
 
 
+def delete_mooring(mooring_id: int) -> dict:
+    """
+    Permanently remove a mooring and its associated per-mooring data.
+
+    Cascades into:
+      - observations (per-mooring)
+      - calendar_events (per-mooring)
+      - pin_failed_attempts (per-mooring)
+
+    Intentionally NOT touched:
+      - activity_log: kept as audit trail per design decision. Old entries
+        age out via prune_activity_log within 7 days for mooring scope.
+      - wind_observations: not per-mooring, shared across all moorings.
+      - tide_data: not per-mooring.
+
+    The on-disk feed file (.ics under FEEDS_DIR) is the responsibility of
+    the caller (see app.main.delete_mooring_config) - this function only
+    handles database state.
+
+    Returns a dict of deletion counts:
+        {"mooring": 0|1, "observations": int, "calendar_events": int,
+         "pin_failed_attempts": 0|1}
+    """
+    counts = {
+        "mooring": 0,
+        "observations": 0,
+        "calendar_events": 0,
+        "pin_failed_attempts": 0,
+    }
+    with db_connection() as conn:
+        r = conn.execute(
+            "DELETE FROM observations WHERE mooring_id = ?", (mooring_id,)
+        )
+        counts["observations"] = r.rowcount
+
+        r = conn.execute(
+            "DELETE FROM calendar_events WHERE mooring_id = ?", (mooring_id,)
+        )
+        counts["calendar_events"] = r.rowcount
+
+        r = conn.execute(
+            "DELETE FROM pin_failed_attempts WHERE mooring_id = ?", (mooring_id,)
+        )
+        counts["pin_failed_attempts"] = r.rowcount
+
+        # Delete the mooring row last so that if any of the above fails,
+        # the orphan rows can still be cleaned up by re-running.
+        r = conn.execute(
+            "DELETE FROM moorings WHERE mooring_id = ?", (mooring_id,)
+        )
+        counts["mooring"] = r.rowcount
+
+    return counts
+
+
 # --- PIN Protection (v2) ---
 #
 # PIN hashes are stored on the moorings table in column pin_hash. An
@@ -741,10 +796,22 @@ def calibrate_drying_height(mooring_id: int, _preloaded=None) -> dict:
             result["best_estimate"] = round((lower + upper) / 2.0, 2)
             result["confidence"] = "inconsistent"
     elif lower is not None:
-        result["best_estimate"] = round(lower + 0.15, 2)
+        # Aground-only observations give a lower bound but no upper bound:
+        # the drying height could be anywhere from `lower` upwards. There is
+        # no principled point estimate from a one-sided constraint, so we
+        # do NOT suggest a value. The UI shows the lower bound as a fact
+        # and presents no Apply button. Adding a fudge factor (e.g.
+        # `lower + 0.15`) was wrong here: it made the system suggest
+        # reductions in the stored drying height that the data did not
+        # actually support, sometimes lowering it below known-grounded
+        # observations.
+        result["best_estimate"] = None
         result["confidence"] = "partial-low"
     elif upper is not None:
-        result["best_estimate"] = round(upper - 0.15, 2)
+        # Symmetric reasoning to the partial-low branch: afloat-only
+        # observations give an upper bound but no lower bound. No point
+        # estimate is offered.
+        result["best_estimate"] = None
         result["confidence"] = "partial-high"
 
     return result
@@ -940,7 +1007,7 @@ def delete_future_events(mooring_id: int, after: str):
 def cleanup_old_events(days: int = 14):
     """Remove calendar events with HW times older than the given number of days.
     Only cleans calendar_events (computed windows); tide_data is preserved
-    for observation calibration."""
+    for observation calibration and the historical Tides tab view."""
     cutoff = to_utc_str(datetime.now(timezone.utc) - timedelta(days=days))
     with db_connection() as conn:
         result = conn.execute(
@@ -948,6 +1015,33 @@ def cleanup_old_events(days: int = 14):
         )
         if result.rowcount:
             logger.info(f"Cleaned up {result.rowcount} calendar events older than {days} days")
+
+
+def cleanup_old_tide_data(days: int = 365):
+    """
+    Remove tide_data rows older than the given number of days.
+
+    Default 365 days matches the rolling 12-month retention policy for the
+    historical Tides tab view. tide_data is otherwise written-once-and-kept,
+    so without this cleanup the table would grow unbounded.
+
+    Note: observation calibration relies on having tide events that bracket
+    each observation. If observations older than `days` exist, they will
+    become un-matchable to tide data and will count as `unmatched` in
+    calibration responses. With the default 12-month window this is a
+    non-issue in practice - the calibrate functions only consider
+    observations the user has recorded, and observations more than a year
+    old are unlikely to be representative of current mooring conditions.
+    """
+    cutoff = to_utc_str(datetime.now(timezone.utc) - timedelta(days=days))
+    with db_connection() as conn:
+        result = conn.execute(
+            "DELETE FROM tide_data WHERE timestamp < ?", (cutoff,)
+        )
+        if result.rowcount:
+            logger.info(
+                f"Cleaned up {result.rowcount} tide_data rows older than {days} days"
+            )
 
 
 def cleanup_superseded_events(mooring_id: int):

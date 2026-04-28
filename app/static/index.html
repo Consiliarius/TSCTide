@@ -239,6 +239,44 @@
     font-style: italic;
   }
 
+  /* Tides tab */
+  .tide-event-table {
+    width: 100%; border-collapse: collapse; font-size: 13px;
+    margin-bottom: 4px;
+  }
+  .tide-event-table th {
+    background: var(--navy); color: #fff; padding: 6px 10px;
+    text-align: left; font-weight: 600;
+    position: sticky; top: 0;
+  }
+  .tide-event-table td {
+    padding: 6px 10px; border-bottom: 1px solid var(--sand-dark);
+  }
+  .tide-event-table tr:nth-child(even) { background: var(--sand); }
+  .tide-event-table tr.tide-hw td { font-weight: 600; }
+  .tide-event-table tr.tide-lw { color: var(--text-light); }
+  .station-badge {
+    display: inline-block; padding: 1px 6px; border-radius: 3px;
+    font-size: 10px; font-weight: 700; text-transform: uppercase;
+    color: #fff;
+  }
+  .station-langstone { background: var(--ok); }
+  .station-portsmouth { background: var(--est); }
+
+  /* Tides view: history month grouping */
+  .tide-month-panel {
+    background: #fff; border: 1px solid var(--border);
+    border-radius: var(--radius); margin-bottom: 8px; overflow: hidden;
+  }
+  .tide-month-header {
+    background: var(--sand-dark); color: var(--navy);
+    padding: 6px 12px; font-weight: 600; font-size: 13px;
+    cursor: pointer; user-select: none;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .tide-month-header .toggle { font-size: 11px; opacity: 0.7; }
+  .tide-month-body.collapsed { display: none; }
+
   /* PIN modal */
   #pin-modal-overlay {
     position: fixed; inset: 0; background: rgba(0,0,0,0.55);
@@ -292,6 +330,7 @@
   <!-- Tab navigation -->
   <div class="tabs">
     <button class="tab active" data-view="main" onclick="switchView('main')">Access Windows</button>
+    <button class="tab" data-view="tides" onclick="switchView('tides')">Tides</button>
     <button class="tab" data-view="system" onclick="switchView('system')">System Activity</button>
     <button class="tab" data-view="moorings" onclick="switchView('moorings')">Mooring Configs</button>
   </div>
@@ -409,6 +448,7 @@
         <button class="btn-primary" onclick="saveConfig()">Save Configuration</button>
         <button class="btn-sea" onclick="loadConfig()">Load from Mooring ID</button>
         <button class="btn-sm" style="background:var(--sea-light);color:#fff;" onclick="changePin()">Change PIN</button>
+        <button class="btn-sm" style="background:var(--warn);color:#fff;" onclick="deleteMooring()">Delete Mooring</button>
       </div>
       <div id="cfg-status"></div>
 
@@ -574,6 +614,38 @@
   </div>
 
   </div><!-- end #view-main -->
+
+  <!-- Tides view -->
+  <div class="view" id="view-tides">
+    <div class="panel">
+      <div class="panel-header" style="cursor:default;">Tides at Langstone Harbour</div>
+      <div class="panel-body">
+        <div class="row" style="margin-bottom:10px;align-items:end;">
+          <div>
+            <label>View</label>
+            <select id="tides-range" onchange="onTidesRangeChange()">
+              <option value="forecast" selected>Forecast (next 7 days)</option>
+              <option value="history">History (last 12 months)</option>
+            </select>
+          </div>
+          <div>
+            <label>Time zone</label>
+            <select id="tides-tz" onchange="renderTides()">
+              <option value="local" selected>Local (BST/GMT)</option>
+              <option value="utc">GMT/UTC</option>
+            </select>
+          </div>
+          <div style="flex:0;">
+            <button class="btn-sm btn-primary" id="tides-refresh-btn" onclick="refreshTidesFromUKHO()">Refresh from UKHO</button>
+          </div>
+        </div>
+        <div id="tides-status"></div>
+        <div id="tides-content">
+          <p style="color:var(--text-light);font-size:12px;">Loading...</p>
+        </div>
+      </div>
+    </div>
+  </div>
 
   <!-- System Activity view -->
   <div class="view" id="view-system">
@@ -1157,6 +1229,60 @@ async function loadConfig() {
     // calibration fetches.
     setConfig(data);
     showStatus('cfg-status', `Loaded configuration for Mooring ${mid}.`, 'ok');
+  } catch(e) {
+    showStatus('cfg-status', e.message, 'err');
+  }
+}
+
+async function deleteMooring() {
+  const cfg = getConfig();
+  if (!cfg.mooring_id) {
+    showStatus('cfg-status', 'Enter a Mooring ID first.', 'err');
+    return;
+  }
+  // Friction beyond the PIN: require the user to type the mooring ID
+  // back to confirm. Prevents an accidentally-cached PIN session from
+  // wiping out a mooring with one click.
+  const typed = prompt(
+    `This will permanently delete mooring #${cfg.mooring_id}, all its ` +
+    `observations, and its calendar feed file. This cannot be undone.\n\n` +
+    `Type the mooring ID (${cfg.mooring_id}) to confirm:`
+  );
+  if (typed === null) return; // user cancelled
+  if (parseInt(typed) !== cfg.mooring_id) {
+    showStatus('cfg-status', 'Mooring ID did not match. Deletion cancelled.', 'err');
+    return;
+  }
+  try {
+    const res = await pinnedFetch(`/api/moorings/${cfg.mooring_id}`, {
+      method: 'DELETE'
+    }, cfg.mooring_id);
+    const data = await res.json();
+    if (!res.ok) {
+      const msg = (data.detail && (data.detail.message || data.detail)) || 'Delete failed';
+      throw new Error(msg);
+    }
+    // Wipe the form and PIN cache - the mooring no longer exists.
+    setCurrentPin(null, null);
+    document.getElementById('mooring_id').value = '';
+    document.getElementById('boat_name').value = '';
+    document.getElementById('drying_height_m').value = '2.0';
+    document.getElementById('shallow_extra_depth_m').value = '0.0';
+    document.getElementById('shallow_direction').value = '';
+    document.getElementById('wind_offset_enabled').checked = false;
+    document.getElementById('calendar_enabled').checked = false;
+    document.getElementById('use_observations').checked = false;
+    updateMooringOptions();
+    toggleWindConfig();
+    toggleObsPanel();
+    document.getElementById('feed-url-section').classList.add('hidden');
+    showStatus('cfg-status',
+      `Mooring ${data.mooring_id} deleted. ` +
+      `Removed ${data.db_counts.observations} observation(s), ` +
+      `${data.db_counts.calendar_events} stored event(s)` +
+      (data.feed_file_removed ? ', and the feed file' : '') +
+      `.`,
+      'ok');
   } catch(e) {
     showStatus('cfg-status', e.message, 'err');
   }
@@ -1795,6 +1921,15 @@ document.getElementById('obs_timestamp').value =
   } catch(e) { /* wind section stays hidden */ }
 })();
 
+// Tides tab state. Cached so range/timezone toggles re-render without
+// hitting the backend every time.
+let tidesData = null;
+let tidesRange = 'forecast';
+// Tracks which history month panels the user has expanded. Default is
+// only the current month expanded; user-expanded panels persist for
+// the lifetime of the page.
+const expandedMonths = new Set();
+
 // --- Tab switching ---
 function switchView(viewName) {
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -1803,6 +1938,210 @@ function switchView(viewName) {
   document.getElementById(`view-${viewName}`).classList.add('active');
   if (viewName === 'system') loadSystemLog();
   if (viewName === 'moorings') loadMooringConfigs();
+  if (viewName === 'tides') loadTides();
+}
+
+// --- Tides tab ---
+
+async function loadTides() {
+  tidesRange = document.getElementById('tides-range').value;
+  // Show or hide the Refresh button - it only makes sense for the
+  // forecast view since the UKHO API does not deliver historical data.
+  const refreshBtn = document.getElementById('tides-refresh-btn');
+  refreshBtn.classList.toggle('hidden', tidesRange !== 'forecast');
+
+  document.getElementById('tides-content').innerHTML =
+    '<p style="color:var(--text-light);font-size:12px;">Loading...</p>';
+  try {
+    const res = await fetch(`/api/tides?range=${tidesRange}`);
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.detail || 'Failed to load tides');
+    }
+    tidesData = data;
+    renderTides();
+  } catch(e) {
+    document.getElementById('tides-content').innerHTML =
+      `<p style="color:var(--warn);font-size:12px;">Failed to load tides: ${escapeHtml(e.message)}</p>`;
+  }
+}
+
+function onTidesRangeChange() {
+  // Clear the cache and reload from the appropriate range.
+  tidesData = null;
+  expandedMonths.clear();
+  loadTides();
+}
+
+async function refreshTidesFromUKHO() {
+  showStatus('tides-status', 'Fetching latest UKHO data...', 'info');
+  try {
+    const res = await fetch('/api/fetch-ukho', {method:'POST'});
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Refresh failed');
+    showStatus('tides-status',
+      `Fetched ${data.fetched} events from UKHO (${data.station}).`, 'ok');
+    await loadTides();
+  } catch(e) {
+    showStatus('tides-status', e.message, 'err');
+  }
+}
+
+function formatTideTime(iso) {
+  if (!iso) return '—';
+  const useUtc = document.getElementById('tides-tz').value === 'utc';
+  const d = new Date(iso);
+  const opts = useUtc
+    ? {hour:'2-digit', minute:'2-digit', timeZone:'UTC'}
+    : {hour:'2-digit', minute:'2-digit'};
+  return d.toLocaleTimeString('en-GB', opts);
+}
+
+function formatTideDate(iso) {
+  if (!iso) return '—';
+  const useUtc = document.getElementById('tides-tz').value === 'utc';
+  const d = new Date(iso);
+  const opts = useUtc
+    ? {weekday:'short', day:'numeric', month:'short', timeZone:'UTC'}
+    : {weekday:'short', day:'numeric', month:'short'};
+  return d.toLocaleDateString('en-GB', opts);
+}
+
+// Header label for the time column. The UKHO data is provided in local
+// time; calendar widgets render in the user's browser TZ. For UK users
+// this is GMT in winter and BST in summer; rather than try to detect
+// per-row, the column header reflects the user's selection.
+function tideTimeHeader() {
+  const useUtc = document.getElementById('tides-tz').value === 'utc';
+  return useUtc ? 'Time (GMT)' : 'Time (Local)';
+}
+
+// Determine which station a given row came from. The /api/tides endpoint
+// returns events with the raw `station` field intact - either 'langstone'
+// or 'portsmouth'.
+function stationBadge(stationName) {
+  if (stationName === 'portsmouth') {
+    return `<span class="station-badge station-portsmouth" title="UKHO Portsmouth, secondary port offset applies">P</span>`;
+  }
+  return `<span class="station-badge station-langstone" title="UKHO Langstone, native data">L</span>`;
+}
+
+function renderTidesForecast(events) {
+  if (!events.length) {
+    return '<p style="color:var(--text-light);font-size:13px;">No forecast data available. Click Refresh to fetch from UKHO.</p>';
+  }
+  // Header note about the source: forecast events are normally all from
+  // a single source (whichever the most recent fetch returned), so a
+  // single line above the table is sufficient.
+  const stations = new Set(events.map(e => e.station));
+  let sourceNote = '';
+  if (stations.size === 1) {
+    const s = events[0].station;
+    if (s === 'portsmouth') {
+      sourceNote = `<p style="font-size:12px;color:var(--est);margin-bottom:6px;">` +
+        `Source: UKHO Portsmouth (Langstone-native data unavailable; secondary port offset is applied when computing access windows).</p>`;
+    } else {
+      sourceNote = `<p style="font-size:12px;color:var(--text-light);margin-bottom:6px;">` +
+        `Source: UKHO Langstone.</p>`;
+    }
+  }
+  return sourceNote + renderTideTable(events);
+}
+
+function renderTideTable(events) {
+  let html = '<table class="tide-event-table"><thead><tr>' +
+    '<th>Date</th>' +
+    `<th>${tideTimeHeader()}</th>` +
+    '<th>Type</th><th>Height</th><th title="Station">Src</th>' +
+    '</tr></thead><tbody>';
+  for (const e of events) {
+    const isHw = e.event_type === 'HighWater';
+    const cls = isHw ? 'tide-hw' : 'tide-lw';
+    const typeLabel = isHw ? 'HW' : 'LW';
+    html += `<tr class="${cls}">` +
+      `<td>${formatTideDate(e.timestamp)}</td>` +
+      `<td>${formatTideTime(e.timestamp)}</td>` +
+      `<td>${typeLabel}</td>` +
+      `<td>${e.height_m.toFixed(1)}m</td>` +
+      `<td>${stationBadge(e.station)}</td>` +
+      `</tr>`;
+  }
+  html += '</tbody></table>';
+  return html;
+}
+
+function renderTidesHistory(events) {
+  if (!events.length) {
+    return '<p style="color:var(--text-light);font-size:13px;">No historical UKHO data available yet. Once daily fetches have run for a few days, this view will populate.</p>';
+  }
+  // Group by year-month. Use UTC for grouping so a single tide event near
+  // midnight does not jump months under user TZ choice. Display labels
+  // honour the TZ choice though - i.e. "April 2026" is unambiguous either
+  // way; the choice only affects per-row time display.
+  const groups = new Map();
+  const useUtc = document.getElementById('tides-tz').value === 'utc';
+  for (const e of events) {
+    const d = new Date(e.timestamp);
+    const y = useUtc ? d.getUTCFullYear() : d.getFullYear();
+    const m = useUtc ? d.getUTCMonth() : d.getMonth();
+    const key = `${y}-${String(m+1).padStart(2,'0')}`;
+    if (!groups.has(key)) groups.set(key, {year: y, month: m, events: []});
+    groups.get(key).events.push(e);
+  }
+
+  // Sort newest first.
+  const sortedKeys = [...groups.keys()].sort().reverse();
+
+  // The most recent month is expanded by default; older months default
+  // to collapsed. User-expanded months are tracked in expandedMonths so
+  // expansion state survives a re-render (e.g. after toggling time zone).
+  if (expandedMonths.size === 0 && sortedKeys.length > 0) {
+    expandedMonths.add(sortedKeys[0]);
+  }
+
+  const monthNames = ['January','February','March','April','May','June',
+    'July','August','September','October','November','December'];
+
+  let html = '';
+  for (const key of sortedKeys) {
+    const g = groups.get(key);
+    const expanded = expandedMonths.has(key);
+    const label = `${monthNames[g.month]} ${g.year}`;
+    const eventCount = g.events.length;
+    html += `<div class="tide-month-panel">` +
+      `<div class="tide-month-header" onclick="toggleTideMonth('${key}')">` +
+        `<span>${label} <span style="font-weight:normal;color:var(--text-light);font-size:12px;">(${eventCount} events)</span></span>` +
+        `<span class="toggle" id="tide-month-toggle-${key}">${expanded ? '▼' : '▶'}</span>` +
+      `</div>` +
+      `<div class="tide-month-body${expanded ? '' : ' collapsed'}" id="tide-month-body-${key}">` +
+        renderTideTable(g.events) +
+      `</div>` +
+    `</div>`;
+  }
+  return html;
+}
+
+function toggleTideMonth(key) {
+  const body = document.getElementById(`tide-month-body-${key}`);
+  const toggle = document.getElementById(`tide-month-toggle-${key}`);
+  if (!body || !toggle) return;
+  const wasCollapsed = body.classList.contains('collapsed');
+  body.classList.toggle('collapsed');
+  toggle.textContent = wasCollapsed ? '▼' : '▶';
+  if (wasCollapsed) expandedMonths.add(key);
+  else expandedMonths.delete(key);
+}
+
+function renderTides() {
+  if (!tidesData) {
+    document.getElementById('tides-content').innerHTML =
+      '<p style="color:var(--text-light);font-size:12px;">No data loaded.</p>';
+    return;
+  }
+  const html = tidesData.range === 'forecast'
+    ? renderTidesForecast(tidesData.events)
+    : renderTidesHistory(tidesData.events);
+  document.getElementById('tides-content').innerHTML = html;
 }
 
 // --- Time formatting for logs ---

@@ -69,6 +69,7 @@ async def daily_ukho_fetch():
     from app.database import (
         store_tide_events, get_calendar_enabled_moorings,
         get_mooring, calibrate_drying_height, cleanup_old_events,
+        cleanup_old_tide_data,
         log_activity, prune_activity_log,
     )
     from app.access_calc import compute_access_windows
@@ -170,6 +171,10 @@ async def daily_ukho_fetch():
     )
 
     cleanup_old_events(days=14)
+    # Tide data retained for 12 months for the historical Tides tab view.
+    # Without this cleanup, tide_data would grow unbounded since events
+    # are written-once and never updated by routine operation.
+    cleanup_old_tide_data(days=365)
     prune_activity_log(system_days=30, mooring_days=7)
 
 
