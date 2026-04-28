@@ -223,6 +223,24 @@ sqlite3 data/tides.db "UPDATE moorings SET pin_hash = '<hex_digest_from_above>' 
 
 The hashing scheme is deterministic (SHA-256 of `salt + pin` with the site-wide `PIN_HASH_SALT`), so precomputed hashes for any known PIN value can be reused across moorings without per-row salts.
 
+### Admin tools
+
+A Windows PowerShell helper script is bundled at the repo root for operator convenience.
+
+**`delete-mooring.ps1`** — Permanently removes a mooring from the database, bypassing the PIN-gated UI flow. Useful when a user has lost their PIN, when test moorings need cleaning up, or when the UI is unreachable. Cascades into observations, calendar events and PIN lockout state, removes the on-disk feed file, and inserts a `mooring_deleted` audit row into the activity log so the deletion is traceable.
+
+Usage:
+
+```
+.\delete-mooring.ps1 -MooringId 42
+.\delete-mooring.ps1 -MooringId 42 -Force          # skip the confirmation prompt
+.\delete-mooring.ps1 -MooringId 42 -Container my-container-name
+```
+
+By default the script asks the operator to type the mooring ID back as confirmation before any database changes are made; deletions run inside a single SQL transaction so a partial failure leaves the database unchanged. The script requires Docker Desktop to be running and the `tidal-access` container to be up.
+
+If this is the first PowerShell script run on the machine, Windows may need execution policy adjusting once with `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` from an admin PowerShell, or invocations can be wrapped with `powershell -ExecutionPolicy Bypass -File .\delete-mooring.ps1 ...`.
+
 ### Threat model
 
 The PIN system is designed to deter **casual misuse** — accidental edits, opportunistic changes by a third party who guesses or is told a mooring ID. It is **not** designed to resist:
