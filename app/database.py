@@ -117,6 +117,17 @@ CREATE TABLE IF NOT EXISTS pin_failed_attempts (
     locked_until TEXT,
     FOREIGN KEY (mooring_id) REFERENCES moorings(mooring_id)
 );
+
+CREATE TABLE IF NOT EXISTS harmonic_predictions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,           -- target tide event time, ISO UTC, Langstone-corrected
+    height_m REAL NOT NULL,            -- predicted height in metres above CD
+    event_type TEXT NOT NULL,          -- 'HighWater' or 'LowWater'
+    generated_at TEXT NOT NULL,        -- ISO UTC time when this row was created
+    UNIQUE (timestamp, event_type, generated_at)
+);
+CREATE INDEX IF NOT EXISTS idx_harm_timestamp ON harmonic_predictions(timestamp);
+CREATE INDEX IF NOT EXISTS idx_harm_generated ON harmonic_predictions(generated_at);
 """
 
 
@@ -1041,6 +1052,112 @@ def cleanup_old_tide_data(days: int = 365):
         if result.rowcount:
             logger.info(
                 f"Cleaned up {result.rowcount} tide_data rows older than {days} days"
+            )
+
+
+# --- Harmonic Predictions ---
+#
+# Stores the harmonic model's predicted tide events for the next N days,
+# regenerated daily by the scheduler. Two purposes:
+#   1. Powers the 180-day Forecast view and the Langstone_Harmonic_180d.ics
+#      feed without recomputing the harmonic model on every page load.
+#   2. Preserves a record of past predictions so that, periodically, the
+#      delta between predicted-on-day-X and actual-UKHO-on-day-X can be
+#      analysed to refine the harmonic constants. Hence the per-row
+#      generated_at column rather than overwriting on each daily run.
+#
+# This table is intentionally separate from tide_data:
+#   - tide_data holds authoritative UKHO/KHM observations used by
+#     observation calibration; harmonic predictions must NOT contaminate
+#     the calibration inputs.
+#   - get_ukho_tide_events / get_tide_events / load_classification_inputs
+#     all query tide_data only and never see harmonic_predictions.
+
+def store_harmonic_predictions(events: list[dict]) -> int:
+    """
+    Insert a batch of harmonic predictions, all tagged with the current
+    UTC time as generated_at. Each input event is a dict with at least
+    timestamp (ISO UTC string), height_m (float), event_type (string).
+
+    Returns the count of rows actually inserted. If a row with the same
+    (timestamp, event_type, generated_at) tuple already exists (e.g. the
+    scheduler runs twice within the same second), the duplicate is
+    silently ignored thanks to the UNIQUE constraint.
+    """
+    if not events:
+        return 0
+    now = to_utc_str(datetime.now(timezone.utc))
+    inserted = 0
+    with db_connection() as conn:
+        for ev in events:
+            try:
+                conn.execute(
+                    "INSERT OR IGNORE INTO harmonic_predictions "
+                    "(timestamp, height_m, event_type, generated_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (ev["timestamp"], ev["height_m"], ev["event_type"], now),
+                )
+                inserted += 1
+            except (sqlite3.IntegrityError, KeyError) as e:
+                logger.warning(f"Skipped malformed harmonic event: {e}")
+    return inserted
+
+
+def get_harmonic_predictions(start: str, end: str,
+                              latest_only: bool = True) -> list[dict]:
+    """
+    Return harmonic predictions whose target timestamp falls in [start, end].
+
+    With latest_only=True (default), returns only the most recently generated
+    row for each (timestamp, event_type) pair. This is what the Forecast view
+    and the 180d feed need - the freshest prediction available.
+
+    With latest_only=False, returns every stored prediction including older
+    versions for the same target time. Used for historical delta analysis
+    (compare predictions made at various lead times against actual UKHO).
+    """
+    with db_connection() as conn:
+        if latest_only:
+            rows = conn.execute(
+                "SELECT * FROM harmonic_predictions h1 "
+                "WHERE timestamp >= ? AND timestamp <= ? "
+                "AND generated_at = ("
+                "  SELECT MAX(generated_at) FROM harmonic_predictions h2 "
+                "  WHERE h2.timestamp = h1.timestamp AND h2.event_type = h1.event_type"
+                ") "
+                "ORDER BY timestamp",
+                (start, end),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM harmonic_predictions "
+                "WHERE timestamp >= ? AND timestamp <= ? "
+                "ORDER BY timestamp, generated_at",
+                (start, end),
+            ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def cleanup_old_harmonic_predictions(days: int = 365):
+    """
+    Remove harmonic_predictions rows whose target timestamp is older than
+    the given number of days. Matches the tide_data retention policy.
+
+    A prediction made today for a tide 200 days in the future will not be
+    pruned until that target tide is itself >365 days in the past. This is
+    intentional: while the prediction sits in the future, it remains useful
+    as a forecast; once the tide has happened and a year has passed, the
+    delta-vs-actual analysis is no longer relevant.
+    """
+    cutoff = to_utc_str(datetime.now(timezone.utc) - timedelta(days=days))
+    with db_connection() as conn:
+        result = conn.execute(
+            "DELETE FROM harmonic_predictions WHERE timestamp < ?", (cutoff,)
+        )
+        if result.rowcount:
+            logger.info(
+                f"Cleaned up {result.rowcount} harmonic prediction rows "
+                f"older than {days} days"
             )
 
 

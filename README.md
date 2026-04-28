@@ -2,7 +2,7 @@
 
 A Docker-containerised application for predicting when a boat on a swing mooring in Langstone Harbour has sufficient water depth to depart and arrive.
 
-**Version 2** — adds per-mooring 6-digit PIN protection, decouples iCal feed updates from calculation, and restructures the calibration system to split base drying height from shallow-side wind offset. The v1.0 release is preserved on the tag `v1.0`.
+**Version 2** — adds per-mooring 6-digit PIN protection, decouples iCal feed updates from calculation, restructures the calibration system to split base drying height from shallow-side wind offset, and adds standalone Langstone tide feeds (UKHO 7-day and combined UKHO+harmonic 180-day). The v1.0 release is preserved on the tag `v1.0`.
 
 ## Overview
 
@@ -20,6 +20,7 @@ The tool computes access windows — the periods around each high water when the
 - **6-digit PIN protection** — each mooring is protected against casual alteration by third parties; see **PIN Protection** below for the full model
 - **Empirical calibration** — record observations (afloat/aground) to refine the drying height estimate, with confidence rating
 - **Subscribable iCal feed** per mooring, auto-updated daily, with proper subscription metadata
+- **Standalone Langstone tide feeds** — two non-mooring feeds providing HW/LW times and heights at Langstone Harbour: a 7-day UKHO feed and a 180-day combined UKHO+harmonic feed
 - **Wind offset** — adjusts the next tide's access window based on observed wind direction and the mooring's shallow-water geometry
 - **ICS export** from any data source, with harmonic-derived events prefixed "est."
 - **XLSX batch import** for observations recorded on a phone over time
@@ -274,6 +275,21 @@ Calculating access windows in the UI is a **read-only** operation. It returns wi
 3. **Manually via the Update Feed button.** After calculating windows the user can click **Update Feed** to push those specific windows into the mooring's stored events and regenerate the `.ics` file. This is PIN-gated. The button is shown only when calendar subscription is enabled for the mooring — calendar-disabled moorings do not have a feed file to update.
 
 The split between calculation (ungated) and feed update (PIN-gated) exists so that anyone — including the mooring owner experimenting with different parameters — can calculate windows without accidentally overwriting what the subscribed feed serves. One-shot `.ics` downloads from the results panel are similarly ungated.
+
+## Standalone Langstone Tide Feeds
+
+In addition to the per-mooring access-window feeds, two non-mooring feeds publish raw HW/LW tide events at Langstone Harbour. They are intended for users who simply want tide times in their calendar without configuring a mooring.
+
+| Feed | URL | Range | Source |
+|------|-----|-------|--------|
+| Langstone UKHO 7d | `/feeds/Langstone_UKHO_7d.ics` | next 7 days | UKHO Admiralty data only |
+| Langstone 180d | `/feeds/Langstone_Harmonic_180d.ics` | next 180 days | UKHO for days 0–7, harmonic model for days 8–180 |
+
+Both feeds are publicly accessible (no PIN required) and refresh daily at 02:00 alongside the per-mooring feeds. Each calendar event is rendered as a 1-hour slot centred on the tide event time, with a title like `⚓ HW 4.2m` for measured data or `⚓ est. LW ~1.0m` for harmonic estimates. The event description records the source (`UKHO Langstone`, `UKHO Portsmouth (Langstone offset applied)`, or `Harmonic model (Langstone)`).
+
+The 180-day feed merges UKHO refinements as they become available: when a tide that was previously a harmonic estimate falls within the next 7 days, the next daily refresh replaces it with the UKHO version under the same UID, so calendar apps update the existing event rather than showing a delete-and-add. Harmonic estimates carry a typical accuracy of ±15–20 minutes on time and ±0.15m on height; UKHO data is to the published Admiralty resolution.
+
+Harmonic predictions are stored separately from UKHO data (in a dedicated `harmonic_predictions` table) so they cannot contaminate observation calibration. A 12-month rolling history of past predictions is retained to support periodic comparison between predicted and observed values for model refinement; this history is not surfaced in the UI.
 
 ### Calendar App Compatibility
 

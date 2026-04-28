@@ -22,7 +22,10 @@ from dateutil import parser as dtparse
 import pytz
 
 from app.config import FEEDS_DIR, DEFAULT_TIMEZONE, ensure_dirs
-from app.database import get_calendar_events, upsert_calendar_event, cleanup_superseded_events
+from app.database import (
+    get_calendar_events, upsert_calendar_event, cleanup_superseded_events,
+    get_ukho_tide_events, get_harmonic_predictions,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -414,3 +417,255 @@ def store_windows_as_events(windows: list[dict], mooring_id: int,
     # Clean up any lower-priority events that were superseded but got
     # different cycle-based UIDs due to timing differences across sources
     cleanup_superseded_events(mooring_id)
+
+
+# --- Standalone Langstone tide feeds (not per-mooring) ---
+#
+# Two feeds, both regenerated daily by the scheduler:
+#   - Langstone_UKHO_7d.ics       UKHO Admiralty data, next 7 days
+#   - Langstone_Harmonic_180d.ics UKHO for days 0-7, harmonic for days 7-180
+#
+# These differ from per-mooring feeds in three ways:
+#   1. They list tide events (HW/LW), not access windows.
+#   2. Each event is rendered as a 1-hour calendar slot centred on the tide
+#      event time. Zero-duration events render poorly in many calendar apps;
+#      a 1-hour slot is short enough to read "around now" and long enough
+#      to be visible.
+#   3. Event UIDs use cycle-number-since-epoch (matching the existing
+#      access_calc.generate_event_uid pattern) so that when an event
+#      transitions from harmonic to UKHO at the day-7 boundary, calendar
+#      apps see an updated event rather than a delete-and-add.
+
+# Epoch for cycle numbering. Must match access_calc.generate_event_uid so
+# that any future cross-feed UID work is consistent.
+_TIDE_UID_EPOCH = datetime(2026, 1, 1, tzinfo=timezone.utc)
+_AVG_CYCLE_HOURS = 12.4167
+
+
+def _tide_event_uid(timestamp_iso: str, event_type: str) -> str:
+    """
+    Build a stable UID for a Langstone tide event.
+
+    Uses tide-cycle number since the fixed epoch, dividing hours-since-epoch
+    by the average cycle length and rounding. Tolerant to source drift of up
+    to about half a cycle (~6h) before the rounded cycle number changes;
+    UKHO vs harmonic typically differ by a few tens of minutes at most, so
+    the UID is stable across the harmonic->UKHO refinement.
+
+    HW and LW within the same cycle share the same cycle number but get
+    distinct UIDs via the event_type tag in the local part.
+    """
+    dt = dtparse.parse(timestamp_iso)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    hours_since_epoch = (dt - _TIDE_UID_EPOCH).total_seconds() / 3600.0
+    cycle = round(hours_since_epoch / _AVG_CYCLE_HOURS)
+    et_short = "hw" if event_type == "HighWater" else "lw"
+    return f"langstone-{et_short}-c{cycle:05d}@langstone"
+
+
+def _build_tide_event(ev: dict, source_label: str, tz, is_estimate: bool = False) -> Event:
+    """
+    Build a single iCal Event for an HW/LW tide event.
+
+    source_label: short string for the description body, e.g.
+        'UKHO Langstone', 'UKHO Portsmouth (offset applied)', 'Harmonic model'.
+    is_estimate: when True, the title is prefixed with 'est.' so the user
+        can see at a glance which events are model-derived.
+    """
+    ical_event = Event()
+    ts_iso = ev["timestamp"]
+    dt = dtparse.parse(ts_iso)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+
+    et = ev["event_type"]
+    et_label = "HW" if et == "HighWater" else "LW"
+    height = ev["height_m"]
+
+    # Title format: "⚓ HW 4.2m" or "⚓ est. LW ~1.0m".
+    # The tilde and 'est.' prefix make the harmonic-derived events visually
+    # distinct in the user's calendar without lengthening the title.
+    if is_estimate:
+        title = f"⚓ est. {et_label} ~{height:.1f}m"
+    else:
+        title = f"⚓ {et_label} {height:.1f}m"
+    ical_event.add("summary", title)
+    ical_event["uid"] = _tide_event_uid(ts_iso, et)
+
+    # Event window: 1 hour centred on the tide event time. Calendar apps
+    # render zero-duration events poorly; 30 minutes either side gives the
+    # event a visible block that approximates "slack water either side of HW".
+    start = dt - timedelta(minutes=30)
+    end = dt + timedelta(minutes=30)
+    ical_event.add("dtstart", start)
+    ical_event.add("dtend", end)
+
+    # Description: include local time, height, source. Keep it brief.
+    local_dt = dt.astimezone(tz)
+    tz_label = "BST" if local_dt.utcoffset().total_seconds() == 3600 else "GMT"
+    desc_lines = [
+        f"{et_label} at {local_dt.strftime('%H:%M')} {tz_label}",
+        f"Height: {height:.1f}m",
+        f"Source: {source_label}",
+    ]
+    if is_estimate:
+        desc_lines.append(
+            "Times typically accurate to +/-15-20min, heights to +/-0.15m."
+        )
+    ical_event.add("description", "\n".join(desc_lines))
+    ical_event.add("dtstamp", datetime.now(timezone.utc))
+    ical_event.add("transp", "TRANSPARENT")
+    ical_event.add("status", "CONFIRMED")
+    return ical_event
+
+
+def generate_langstone_ukho_7d_feed() -> Path:
+    """
+    Regenerate the Langstone_UKHO_7d.ics feed file from stored UKHO data.
+
+    Always returns the path; if no UKHO data is stored, the feed is written
+    with no events but valid metadata so subscribers don't see a 404.
+
+    Source-station handling:
+      - get_ukho_tide_events() prefers native Langstone data.
+      - If only Portsmouth fallback data is stored, the secondary-port offset
+        is already applied by get_ukho_tide_events. The description string
+        records which station the data originated from so the user can see
+        whether their feed reflects native or fallback data.
+    """
+    ensure_dirs()
+    from app.config import to_utc_str
+    from app.database import get_tide_events
+
+    now = datetime.now(timezone.utc)
+    start = to_utc_str(now)
+    end = to_utc_str(now + timedelta(days=7))
+
+    # Determine which station provided the data (for the description string).
+    # get_ukho_tide_events transparently applies the Portsmouth offset, but
+    # we want the *user-visible* source label to be honest about provenance.
+    native_check = get_tide_events(start, end, source="ukho", station="langstone")
+    if native_check:
+        source_label = "UKHO Langstone"
+        events = native_check
+    else:
+        portsmouth = get_tide_events(start, end, source="ukho", station="portsmouth")
+        if portsmouth:
+            source_label = "UKHO Portsmouth (Langstone offset applied)"
+            events = get_ukho_tide_events(start, end)  # applies the offset
+        else:
+            source_label = "UKHO"
+            events = []
+
+    cal = Calendar()
+    cal.add("prodid", "-//Tidal Access Langstone UKHO 7d//EN")
+    cal.add("version", "2.0")
+    cal.add("calscale", "GREGORIAN")
+    cal.add("x-wr-calname", "Langstone Tides - UKHO 7d")
+    cal.add("x-wr-timezone", DEFAULT_TIMEZONE)
+    cal.add("refresh-interval;value=duration", "PT12H")
+    cal.add("x-published-ttl", "PT12H")
+
+    tz = pytz.timezone(DEFAULT_TIMEZONE)
+    for ev in events:
+        cal.add_component(_build_tide_event(ev, source_label, tz, is_estimate=False))
+
+    feed_path = FEEDS_DIR / "Langstone_UKHO_7d.ics"
+    with open(feed_path, "wb") as f:
+        f.write(cal.to_ical())
+    logger.info(
+        f"Generated Langstone_UKHO_7d.ics: {len(events)} events ({source_label})"
+    )
+    return feed_path
+
+
+def generate_langstone_harmonic_180d_feed() -> Path:
+    """
+    Regenerate the Langstone_Harmonic_180d.ics feed file.
+
+    Composition:
+      - Days 0..7:   UKHO data (preferred via get_ukho_tide_events).
+      - Days 7..180: Latest stored harmonic predictions (Langstone-corrected
+        already, since the scheduler applies the offset before storage).
+
+    Where a harmonic event lies within 90 minutes of a UKHO event of the
+    same type, the UKHO event wins (deduplicated). This handles the boundary
+    fuzz where a tide ~7 days out is covered by both sources.
+
+    Always returns the path. Empty data still produces a valid (empty) feed.
+    """
+    ensure_dirs()
+    from app.config import to_utc_str
+
+    now = datetime.now(timezone.utc)
+    start = to_utc_str(now)
+    end_ukho = to_utc_str(now + timedelta(days=7))
+    end_180 = to_utc_str(now + timedelta(days=180))
+
+    # Use get_ukho_tide_events so Portsmouth fallback is offset-corrected.
+    ukho_events = get_ukho_tide_events(start, end_ukho)
+    # Determine source label for UKHO portion as in the 7d feed.
+    from app.database import get_tide_events
+    native_check = get_tide_events(start, end_ukho, source="ukho", station="langstone")
+    if native_check:
+        ukho_label = "UKHO Langstone"
+    elif get_tide_events(start, end_ukho, source="ukho", station="portsmouth"):
+        ukho_label = "UKHO Portsmouth (Langstone offset applied)"
+    else:
+        ukho_label = "UKHO"
+
+    # Harmonic predictions: pull only days 7..180 to avoid double-feeding
+    # the days-0..7 region. Sort and de-duplicate against UKHO afterwards.
+    harmonic_start = to_utc_str(now + timedelta(days=7))
+    harmonic_events = get_harmonic_predictions(harmonic_start, end_180, latest_only=True)
+
+    # Defensive deduplication: drop any harmonic event whose timestamp is
+    # within 90 minutes of a UKHO event of the same type. UKHO wins.
+    ukho_index = []
+    for ue in ukho_events:
+        ue_dt = dtparse.parse(ue["timestamp"])
+        if ue_dt.tzinfo is None:
+            ue_dt = ue_dt.replace(tzinfo=timezone.utc)
+        ukho_index.append((ue_dt, ue["event_type"]))
+
+    filtered_harmonic = []
+    for he in harmonic_events:
+        he_dt = dtparse.parse(he["timestamp"])
+        if he_dt.tzinfo is None:
+            he_dt = he_dt.replace(tzinfo=timezone.utc)
+        clash = False
+        for ukho_dt, ukho_et in ukho_index:
+            if ukho_et != he["event_type"]:
+                continue
+            if abs((he_dt - ukho_dt).total_seconds()) < 5400:  # 90 min
+                clash = True
+                break
+        if not clash:
+            filtered_harmonic.append(he)
+
+    cal = Calendar()
+    cal.add("prodid", "-//Tidal Access Langstone Harmonic 180d//EN")
+    cal.add("version", "2.0")
+    cal.add("calscale", "GREGORIAN")
+    cal.add("x-wr-calname", "Langstone Tides - 180d (UKHO + Harmonic est.)")
+    cal.add("x-wr-timezone", DEFAULT_TIMEZONE)
+    cal.add("refresh-interval;value=duration", "PT12H")
+    cal.add("x-published-ttl", "PT12H")
+
+    tz = pytz.timezone(DEFAULT_TIMEZONE)
+    for ev in ukho_events:
+        cal.add_component(_build_tide_event(ev, ukho_label, tz, is_estimate=False))
+    for ev in filtered_harmonic:
+        cal.add_component(_build_tide_event(
+            ev, "Harmonic model (Langstone)", tz, is_estimate=True
+        ))
+
+    feed_path = FEEDS_DIR / "Langstone_Harmonic_180d.ics"
+    with open(feed_path, "wb") as f:
+        f.write(cal.to_ical())
+    logger.info(
+        f"Generated Langstone_Harmonic_180d.ics: "
+        f"{len(ukho_events)} UKHO + {len(filtered_harmonic)} harmonic events"
+    )
+    return feed_path

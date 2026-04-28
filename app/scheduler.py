@@ -70,10 +70,15 @@ async def daily_ukho_fetch():
         store_tide_events, get_calendar_enabled_moorings,
         get_mooring, calibrate_drying_height, cleanup_old_events,
         cleanup_old_tide_data,
+        store_harmonic_predictions, cleanup_old_harmonic_predictions,
         log_activity, prune_activity_log,
     )
+    from app.harmonic import predict_events as harmonic_predict_events
     from app.access_calc import compute_access_windows
-    from app.ical_manager import store_windows_as_events, generate_feed_for_mooring
+    from app.ical_manager import (
+        store_windows_as_events, generate_feed_for_mooring,
+        generate_langstone_ukho_7d_feed, generate_langstone_harmonic_180d_feed,
+    )
 
     logger.info("Running daily UKHO fetch...")
 
@@ -170,11 +175,58 @@ async def daily_ukho_fetch():
         details={"mooring_count": len(moorings), "updated": updated_count},
     )
 
+    # --- Harmonic prediction refresh + standalone Langstone feeds ---
+    # The Langstone tide feeds (UKHO 7d + 180d) are not per-mooring and run
+    # once per day regardless of how many moorings are configured. They live
+    # at the bottom of the daily job so a per-mooring failure above does not
+    # block them.
+    try:
+        harmonic_start = datetime.now(timezone.utc)
+        harmonic_end = harmonic_start + timedelta(days=180)
+        # predict_events returns Portsmouth values; apply Langstone offset
+        # before storing so consumers (feed + UI) work with corrected values.
+        raw_harmonic = harmonic_predict_events(harmonic_start, harmonic_end)
+        langstone_harmonic = apply_offset(raw_harmonic) if raw_harmonic else []
+        inserted = store_harmonic_predictions(langstone_harmonic)
+        log_activity(
+            event_type="harmonic_refresh",
+            message=f"Stored {inserted} harmonic predictions for the next 180 days",
+            severity="success" if inserted else "warning",
+            details={
+                "event_count": inserted,
+                "window_days": 180,
+            },
+        )
+    except Exception as e:
+        logger.error(f"Harmonic prediction refresh failed: {e}")
+        log_activity(
+            event_type="harmonic_refresh",
+            message=f"Harmonic prediction refresh failed: {e}",
+            severity="error",
+        )
+
+    try:
+        generate_langstone_ukho_7d_feed()
+        generate_langstone_harmonic_180d_feed()
+        log_activity(
+            event_type="langstone_feed_refresh",
+            message="Regenerated Langstone_UKHO_7d.ics and Langstone_Harmonic_180d.ics",
+            severity="info",
+        )
+    except Exception as e:
+        logger.error(f"Langstone feed regeneration failed: {e}")
+        log_activity(
+            event_type="langstone_feed_refresh",
+            message=f"Langstone feed regeneration failed: {e}",
+            severity="error",
+        )
+
     cleanup_old_events(days=14)
     # Tide data retained for 12 months for the historical Tides tab view.
     # Without this cleanup, tide_data would grow unbounded since events
     # are written-once and never updated by routine operation.
     cleanup_old_tide_data(days=365)
+    cleanup_old_harmonic_predictions(days=365)
     prune_activity_log(system_days=30, mooring_days=7)
 
 

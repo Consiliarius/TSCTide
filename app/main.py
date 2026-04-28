@@ -31,6 +31,7 @@ from app.database import (
     delete_future_events, get_calendar_events, log_activity, get_activity_log,
     get_mooring_pin_hash, set_mooring_pin_hash,
     check_pin_lockout, record_failed_pin_attempt, clear_failed_pin_attempts,
+    get_harmonic_predictions,
 )
 from app.pin import (
     hash_pin, verify_pin, is_valid_pin_format,
@@ -46,6 +47,7 @@ from app.access_calc import compute_access_windows, generate_event_uid, invalida
 from app.ical_manager import (
     generate_export_ics, store_windows_as_events,
     generate_feed_for_mooring,
+    generate_langstone_ukho_7d_feed, generate_langstone_harmonic_180d_feed,
 )
 from app.scheduler import start_scheduler, shutdown_scheduler
 
@@ -985,6 +987,17 @@ async def trigger_ukho_fetch():
     from app.scheduler import _schedule_wind_jobs
     await _schedule_wind_jobs(events)
 
+    # Regenerate the standalone Langstone tide feeds so manual refresh has
+    # the same effect on those feeds as the daily 02:00 job. The harmonic
+    # 180d feed regenerates from currently-stored harmonic predictions, so
+    # it picks up the new UKHO data for days 0-7 even though the harmonic
+    # set has not been recomputed by this manual trigger.
+    try:
+        generate_langstone_ukho_7d_feed()
+        generate_langstone_harmonic_180d_feed()
+    except Exception as e:
+        logger.warning(f"Langstone feed regeneration after manual fetch failed: {e}")
+
     return {"fetched": len(events), "source": "ukho", "station": station_label}
 
 
@@ -1406,43 +1419,162 @@ async def get_stored_tide_data(start: str = None, end: str = None):
 @app.get("/api/tides")
 async def get_tides(range: str = "forecast"):
     """
-    Return UKHO tide events for the Tides tab.
+    Return tide events for the Tides tab.
 
-    range='forecast' (default): events from now to now+7 days.
-    range='history':              events from now-365 days up to now.
+    range='forecast' (default): UKHO events from now to now+7 days.
+    range='extended':            UKHO events for days 0-7 plus harmonic
+                                  predictions for days 7-180. Each event
+                                  carries an extra `data_source` field set
+                                  to 'ukho' or 'harmonic' so the UI can
+                                  show a per-row badge and insert a
+                                  visible break between sources.
+    range='history':              UKHO events from now-365 days up to now.
 
     Each event is returned with its `station` field intact ('langstone' or
     'portsmouth') so the UI can show a per-row source badge. The Portsmouth
-    secondary-port offset is NOT applied here - the UI shows raw stored
-    values from each station, with a badge indicating which one. This is
-    different from get_ukho_tide_events() which applies the offset for
-    calculation purposes.
+    secondary-port offset is NOT applied here for stored UKHO events - the
+    UI shows raw stored values from each station, with a badge indicating
+    which one. Harmonic events have already been Langstone-corrected at
+    storage time (scheduler applies the offset before write), so they need
+    no further correction here; their station field is set to 'langstone'
+    for consistency.
 
     Note: this endpoint is intentionally ungated - tide data is public.
     """
-    if range not in ("forecast", "history"):
-        raise HTTPException(400, "range must be 'forecast' or 'history'")
+    if range not in ("forecast", "extended", "history"):
+        raise HTTPException(400, "range must be 'forecast', 'extended', or 'history'")
 
     now = datetime.now(timezone.utc)
     if range == "forecast":
         start = now
         end = now + timedelta(days=7)
-    else:
+        events = get_tide_events(
+            to_utc_str(start), to_utc_str(end), source="ukho"
+        )
+        for ev in events:
+            ev["data_source"] = "ukho"
+        return {"range": range, "events": events, "count": len(events)}
+
+    if range == "history":
         # Rolling 12-month window. The cleanup_old_tide_data scheduled job
         # prevents data older than this from accumulating, so the upper
         # limit of the query is effectively bounded by retention.
         start = now - timedelta(days=365)
         end = now
+        events = get_tide_events(
+            to_utc_str(start), to_utc_str(end), source="ukho"
+        )
+        for ev in events:
+            ev["data_source"] = "ukho"
+        return {"range": range, "events": events, "count": len(events)}
 
-    events = get_tide_events(
-        to_utc_str(start), to_utc_str(end), source="ukho"
+    # range == 'extended': UKHO days 0-7 + harmonic days 7-180.
+    ukho_end = now + timedelta(days=7)
+    harmonic_end = now + timedelta(days=180)
+
+    ukho_events = get_tide_events(
+        to_utc_str(now), to_utc_str(ukho_end), source="ukho"
     )
+    for ev in ukho_events:
+        ev["data_source"] = "ukho"
 
+    # Harmonic predictions are already Langstone-corrected (scheduler applies
+    # the offset before storing). They include neither station nor source
+    # columns from get_tide_events shape; tag them so the UI sees a uniform
+    # event dict.
+    harmonic_start = now + timedelta(days=7)
+    harmonic_rows = get_harmonic_predictions(
+        to_utc_str(harmonic_start), to_utc_str(harmonic_end), latest_only=True
+    )
+    harmonic_events = []
+    for h in harmonic_rows:
+        harmonic_events.append({
+            "timestamp": h["timestamp"],
+            "height_m": h["height_m"],
+            "event_type": h["event_type"],
+            "station": "langstone",  # post-offset; for badge consistency
+            "source": "harmonic",
+            "data_source": "harmonic",
+            "is_approximate_time": True,
+            "is_approximate_height": True,
+        })
+
+    # Defensive deduplication: drop any harmonic event whose timestamp is
+    # within 90 minutes of a UKHO event of the same type. UKHO wins. Same
+    # rule as in the 180d feed generator.
+    ukho_index = []
+    for ue in ukho_events:
+        ue_dt = dtparse.parse(ue["timestamp"])
+        if ue_dt.tzinfo is None:
+            ue_dt = ue_dt.replace(tzinfo=timezone.utc)
+        ukho_index.append((ue_dt, ue["event_type"]))
+    filtered_harmonic = []
+    for he in harmonic_events:
+        he_dt = dtparse.parse(he["timestamp"])
+        if he_dt.tzinfo is None:
+            he_dt = he_dt.replace(tzinfo=timezone.utc)
+        clash = any(
+            ukho_et == he["event_type"]
+            and abs((he_dt - ukho_dt).total_seconds()) < 5400
+            for ukho_dt, ukho_et in ukho_index
+        )
+        if not clash:
+            filtered_harmonic.append(he)
+
+    combined = ukho_events + filtered_harmonic
+    combined.sort(key=lambda e: e["timestamp"])
     return {
         "range": range,
-        "events": events,
-        "count": len(events),
+        "events": combined,
+        "count": len(combined),
+        "ukho_count": len(ukho_events),
+        "harmonic_count": len(filtered_harmonic),
     }
+
+
+# --- Standalone Langstone tide feeds ---
+#
+# These two feeds are unaffiliated with any mooring and serve UKHO tide
+# events (next 7 days) and a UKHO+harmonic merge (next 180 days). They are
+# regenerated daily by the scheduler at 02:00. Both routes regenerate the
+# file on demand if it is missing or stale - this covers first deployment
+# (no scheduler run yet) and any in-day regeneration triggered by a manual
+# UKHO refresh.
+
+@app.get("/feeds/Langstone_UKHO_7d.ics")
+async def serve_langstone_ukho_7d():
+    """Serve the Langstone UKHO 7-day tide feed. Regenerates if missing."""
+    feed_path = FEEDS_DIR / "Langstone_UKHO_7d.ics"
+    if not feed_path.exists():
+        feed_path = generate_langstone_ukho_7d_feed()
+    return Response(
+        content=feed_path.read_bytes(),
+        media_type="text/calendar",
+        headers={
+            "Content-Type": "text/calendar; charset=utf-8",
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
+
+
+@app.get("/feeds/Langstone_Harmonic_180d.ics")
+async def serve_langstone_harmonic_180d():
+    """Serve the Langstone 180-day tide feed. Regenerates if missing."""
+    feed_path = FEEDS_DIR / "Langstone_Harmonic_180d.ics"
+    if not feed_path.exists():
+        feed_path = generate_langstone_harmonic_180d_feed()
+    return Response(
+        content=feed_path.read_bytes(),
+        media_type="text/calendar",
+        headers={
+            "Content-Type": "text/calendar; charset=utf-8",
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
 
 
 # --- Wind ---

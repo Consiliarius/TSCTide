@@ -262,6 +262,35 @@
   }
   .station-langstone { background: var(--ok); }
   .station-portsmouth { background: var(--est); }
+  /* Harmonic predictions are model-derived, not measured. The dashed
+     border and warm hue distinguish them from the solid UKHO badges so
+     the user is always aware which rows are estimates. */
+  .station-harmonic {
+    background: #fce8c8; color: #7a5020; border: 1px dashed #b07a30;
+    padding: 0 5px;
+  }
+
+  /* Tides Forecast: source-break separator row inserted between the last
+     UKHO event and the first harmonic event in the extended view. */
+  .tide-source-break td {
+    background: #fff8e8; color: #7a5020;
+    font-style: italic; text-align: center;
+    padding: 8px 10px; font-weight: 600; border: 1px solid #ffc107;
+  }
+
+  /* Subscribe links shown in the Tides tab toolbar. */
+  .subscribe-block {
+    background: var(--sand); border: 1px dashed var(--border);
+    border-radius: var(--radius); padding: 8px 10px; margin-bottom: 12px;
+    font-size: 12px; color: var(--text);
+  }
+  .subscribe-block .subscribe-row { margin: 3px 0; }
+  .subscribe-block .subscribe-row a {
+    color: var(--sea); font-family: monospace; word-break: break-all;
+  }
+  .subscribe-block .subscribe-note {
+    color: var(--text-light); font-style: italic; margin-top: 4px;
+  }
 
   /* Tides view: history month grouping */
   .tide-month-panel {
@@ -625,6 +654,7 @@
             <label>View</label>
             <select id="tides-range" onchange="onTidesRangeChange()">
               <option value="forecast" selected>Forecast (next 7 days)</option>
+              <option value="extended">Forecast (next 180 days)</option>
               <option value="history">History (last 12 months)</option>
             </select>
           </div>
@@ -640,6 +670,21 @@
           </div>
         </div>
         <div id="tides-status"></div>
+
+        <!-- Subscribable Langstone tide feeds. Both regenerate daily at 02:00. -->
+        <div class="subscribe-block">
+          <div style="font-weight:600;color:var(--navy);margin-bottom:4px;">Subscribable tide feeds</div>
+          <div class="subscribe-row">
+            7-day UKHO: <a id="langstone-ukho-7d-url" href="/feeds/Langstone_UKHO_7d.ics">Langstone_UKHO_7d.ics</a>
+          </div>
+          <div class="subscribe-row">
+            180-day extended: <a id="langstone-180d-url" href="/feeds/Langstone_Harmonic_180d.ics">Langstone_Harmonic_180d.ics</a>
+          </div>
+          <div class="subscribe-note">
+            The 7-day feed is UKHO Admiralty data only. The 180-day feed uses UKHO for the next 7 days and the built-in harmonic model for days 8–180; harmonic events are marked “est.” in their title and are accurate to roughly +/-15-20min on time and +/-0.15m on height. Both feeds refresh daily at 02:00.
+          </div>
+        </div>
+
         <div id="tides-content">
           <p style="color:var(--text-light);font-size:12px;">Loading...</p>
         </div>
@@ -1946,9 +1991,12 @@ function switchView(viewName) {
 async function loadTides() {
   tidesRange = document.getElementById('tides-range').value;
   // Show or hide the Refresh button - it only makes sense for the
-  // forecast view since the UKHO API does not deliver historical data.
+  // forecast (and extended forecast) views since the UKHO API does not
+  // deliver historical data. For the extended view, refresh updates the
+  // UKHO portion (next 7 days). The harmonic portion only refreshes via
+  // the daily 02:00 scheduler job.
   const refreshBtn = document.getElementById('tides-refresh-btn');
-  refreshBtn.classList.toggle('hidden', tidesRange !== 'forecast');
+  refreshBtn.classList.toggle('hidden', tidesRange === 'history');
 
   document.getElementById('tides-content').innerHTML =
     '<p style="color:var(--text-light);font-size:12px;">Loading...</p>';
@@ -2026,6 +2074,18 @@ function stationBadge(stationName) {
   return `<span class="station-badge station-langstone" title="UKHO Langstone, native data">L</span>`;
 }
 
+// Source badge for the extended Forecast view: distinguishes UKHO
+// (measured/Admiralty data, days 0-7) from harmonic (model-derived
+// estimate, days 8-180). Stations from UKHO still show L/P; harmonic
+// rows show H. The data_source field is added by /api/tides for the
+// extended range and uniquely identifies the row's origin.
+function tideRowBadge(ev) {
+  if (ev.data_source === 'harmonic') {
+    return `<span class="station-badge station-harmonic" title="Harmonic model estimate, less accurate than UKHO">H</span>`;
+  }
+  return stationBadge(ev.station);
+}
+
 function renderTidesForecast(events) {
   if (!events.length) {
     return '<p style="color:var(--text-light);font-size:13px;">No forecast data available. Click Refresh to fetch from UKHO.</p>';
@@ -2054,16 +2114,36 @@ function renderTideTable(events) {
     `<th>${tideTimeHeader()}</th>` +
     '<th>Type</th><th>Height</th><th title="Station">Src</th>' +
     '</tr></thead><tbody>';
+  let lastSourceTag = null;
   for (const e of events) {
+    // Insert a visual break row between the UKHO portion and the harmonic
+    // portion of an extended forecast. This only triggers when both kinds
+    // are present (extended view) and we're transitioning from one to the
+    // other; the regular forecast and history views never see this branch.
+    const sourceTag = e.data_source || 'ukho';
+    if (lastSourceTag === 'ukho' && sourceTag === 'harmonic') {
+      html += `<tr class="tide-source-break"><td colspan="5">` +
+        `─── Beyond this point: harmonic model estimates ` +
+        `(less accurate; refined to UKHO data within 7 days) ───` +
+        `</td></tr>`;
+    }
+    lastSourceTag = sourceTag;
+
     const isHw = e.event_type === 'HighWater';
     const cls = isHw ? 'tide-hw' : 'tide-lw';
     const typeLabel = isHw ? 'HW' : 'LW';
+    // Harmonic events get a tilde prefix on the height to remind that the
+    // value is estimated. Time and date are not tilde-prefixed (would be
+    // visually noisy and the H badge is already present).
+    const heightStr = sourceTag === 'harmonic'
+      ? `~${e.height_m.toFixed(1)}m`
+      : `${e.height_m.toFixed(1)}m`;
     html += `<tr class="${cls}">` +
       `<td>${formatTideDate(e.timestamp)}</td>` +
       `<td>${formatTideTime(e.timestamp)}</td>` +
       `<td>${typeLabel}</td>` +
-      `<td>${e.height_m.toFixed(1)}m</td>` +
-      `<td>${stationBadge(e.station)}</td>` +
+      `<td>${heightStr}</td>` +
+      `<td>${tideRowBadge(e)}</td>` +
       `</tr>`;
   }
   html += '</tbody></table>';
@@ -2132,15 +2212,78 @@ function toggleTideMonth(key) {
   else expandedMonths.delete(key);
 }
 
+function renderTidesExtended(data) {
+  const events = data.events || [];
+  if (!events.length) {
+    return '<p style="color:var(--text-light);font-size:13px;">' +
+      'No data yet. The 180-day forecast populates after the first daily ' +
+      'scheduler run at 02:00 (or after a manual UKHO refresh).</p>';
+  }
+  // Group by year-month for collapsibility, same UI as the History view.
+  // The current month is expanded by default; older user-expansion state
+  // persists across re-renders (e.g. timezone toggle).
+  const groups = new Map();
+  const useUtc = document.getElementById('tides-tz').value === 'utc';
+  for (const e of events) {
+    const d = new Date(e.timestamp);
+    const y = useUtc ? d.getUTCFullYear() : d.getFullYear();
+    const m = useUtc ? d.getUTCMonth() : d.getMonth();
+    const key = `${y}-${String(m+1).padStart(2,'0')}`;
+    if (!groups.has(key)) groups.set(key, {year: y, month: m, events: []});
+    groups.get(key).events.push(e);
+  }
+  // Sort oldest first - extended FORECAST is forward-looking, so the
+  // current month should appear at the top, then chronological months
+  // following. (History view sorts newest-first; this is the inverse.)
+  const sortedKeys = [...groups.keys()].sort();
+  if (expandedMonths.size === 0 && sortedKeys.length > 0) {
+    expandedMonths.add(sortedKeys[0]);
+  }
+  const monthNames = ['January','February','March','April','May','June',
+    'July','August','September','October','November','December'];
+
+  let html = '';
+  // Optional summary line at the top so the user knows the size and
+  // composition of what they're scrolling through.
+  const ukhoCount = data.ukho_count || 0;
+  const harmCount = data.harmonic_count || 0;
+  if (ukhoCount + harmCount > 0) {
+    html += `<p style="font-size:12px;color:var(--text-light);margin-bottom:8px;">` +
+      `Showing ${ukhoCount} UKHO event(s) for the next 7 days, ` +
+      `then ${harmCount} harmonic estimate(s) out to 180 days.</p>`;
+  }
+  for (const key of sortedKeys) {
+    const g = groups.get(key);
+    const expanded = expandedMonths.has(key);
+    const label = `${monthNames[g.month]} ${g.year}`;
+    const eventCount = g.events.length;
+    html += `<div class="tide-month-panel">` +
+      `<div class="tide-month-header" onclick="toggleTideMonth('${key}')">` +
+        `<span>${label} <span style="font-weight:normal;color:var(--text-light);font-size:12px;">(${eventCount} events)</span></span>` +
+        `<span class="toggle" id="tide-month-toggle-${key}">${expanded ? '▼' : '▶'}</span>` +
+      `</div>` +
+      `<div class="tide-month-body${expanded ? '' : ' collapsed'}" id="tide-month-body-${key}">` +
+        renderTideTable(g.events) +
+      `</div>` +
+    `</div>`;
+  }
+  return html;
+}
+
 function renderTides() {
   if (!tidesData) {
     document.getElementById('tides-content').innerHTML =
       '<p style="color:var(--text-light);font-size:12px;">No data loaded.</p>';
     return;
   }
-  const html = tidesData.range === 'forecast'
-    ? renderTidesForecast(tidesData.events)
-    : renderTidesHistory(tidesData.events);
+  let html;
+  if (tidesData.range === 'forecast') {
+    html = renderTidesForecast(tidesData.events);
+  } else if (tidesData.range === 'extended') {
+    html = renderTidesExtended(tidesData);
+  } else {
+    html = renderTidesHistory(tidesData.events);
+  }
   document.getElementById('tides-content').innerHTML = html;
 }
 
