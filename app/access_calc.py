@@ -118,7 +118,23 @@ def _curve_interpolate(target: datetime, before: tuple, after: tuple) -> float:
 
     # Determine if this is a flooding or ebbing phase
     if et_before == "LowWater" and et_after == "HighWater":
-        # Flooding tide
+        # Flooding tide - pure cosine.
+        #
+        # An earlier attempt added a symmetric pre-HW stand (matching the
+        # ebb branch) on the basis that published Langstone tidal curves
+        # show a flat top on both sides of HW. The 16-day calibration
+        # corpus revealed this was wrong: adding the stand made flood RMS
+        # error rise from 0.29m to 0.60m. The visible flatness near HW
+        # in published curves is partly an artefact of the cosine's own
+        # natural slowdown near its peak; adding an explicit linear stand
+        # on top double-counts that flatness AND compresses the cosine
+        # portion to be too steep through the mid-flood. Pure cosine is
+        # the better approximation, even though it has a residual +0.13m
+        # mid-flood bias that a different curve shape would address.
+        #
+        # The 'stand_duration_minutes' and 'stand_height_fraction'
+        # parameters in model_config.json apply only to the ebb branch
+        # below.
         return _cosine_interp(fraction, h_before, h_after)
     elif et_before == "HighWater" and et_after == "LowWater":
         # Ebbing tide - apply asymmetry via stand effect

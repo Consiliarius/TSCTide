@@ -4,9 +4,20 @@ Secondary port offset: converts Portsmouth predictions to Langstone Harbour.
 Applied to harmonic model predictions only. KHM data has corrections applied
 within the KHM parser itself. UKHO Langstone data is native and needs no offset.
 
-Correction values (validated April 2026 against UKHO half-hourly data):
-  HW: +9 minutes, +0.05m
+Correction values (validated April 2026 against UKHO half-hourly data,
+refined April 2026 against the 16-day calibration corpus):
+  HW: +9 minutes timing offset, no height offset
   LW: no time or height correction
+
+The HW height offset was previously 0.05m. The 16-day calibration analysis
+(scripts/calibrate_from_ukho_week.py) showed that propagating this offset
+through curve interpolation gave a +0.05m mean bias in the production path
+versus raw harmonic output, with no improvement in RMS - and a meaningful
+worsening in the mid-tide band where the curve interpolator was most
+affected. The 0.0-0.1m delta observed at six HW events in the original
+validation appears to have been within the noise of half-hourly resolution
+rather than a systematic offset. Removing it brings the production-path
+harmonic mean bias close to zero.
 """
 
 from datetime import timedelta
@@ -15,14 +26,23 @@ from dateutil import parser as dtparse
 from app.config import to_utc_str
 
 
-# Langstone corrections relative to Portsmouth
-# Validated against April 2026 half-hourly UKHO data for both ports:
-# Height delta observed at six HW events ranged 0.0-0.1m (mean +0.05m), not +0.24m
-# as previously assumed. LW heights effectively identical (both ports 0.7-1.0m range).
-# Timing: Langstone HW lags Portsmouth HW by roughly 0-30min at half-hour resolution;
-# the +9min figure is consistent with this and retained.
+# Langstone corrections relative to Portsmouth.
+#
+# Timing offset (HW: +9 min) is supported by both the original April 2026
+# half-hourly comparison and the 16-day calibration corpus.
+#
+# Height offset (HW: 0.0m) was previously 0.05m. The 16-day calibration
+# analysis showed that propagating a +0.05m HW height bump through the
+# curve interpolation yielded a +0.05m mean bias in the production-path
+# harmonic test variant (scripts/calibrate_from_ukho_week.py), with no
+# offsetting RMS improvement. The 0.0-0.1m HW height delta observed in
+# the original 6-event validation appears to have been within the noise
+# of half-hourly height resolution rather than a systematic offset.
+#
+# LW: no offset on either timing or height. Original validation showed
+# both ports' LW heights effectively identical (0.7-1.0m range).
 HW_TIME_OFFSET_MINUTES = 9
-HW_HEIGHT_OFFSET_M = 0.05
+HW_HEIGHT_OFFSET_M = 0.0
 LW_TIME_OFFSET_MINUTES = 0
 LW_HEIGHT_OFFSET_M = 0.0
 
