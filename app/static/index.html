@@ -661,8 +661,8 @@
           <div>
             <label>Time zone</label>
             <select id="tides-tz" onchange="renderTides()">
-              <option value="local" selected>Local (BST/GMT)</option>
-              <option value="utc">GMT/UTC</option>
+              <option value="local" selected>Local (Europe/London)</option>
+              <option value="utc">UTC</option>
             </select>
           </div>
           <div style="flex:0;">
@@ -2039,9 +2039,13 @@ function formatTideTime(iso) {
   if (!iso) return '—';
   const useUtc = document.getElementById('tides-tz').value === 'utc';
   const d = new Date(iso);
+  // "Local" means Europe/London for this app, NOT the browser's timezone.
+  // Tide data is for Langstone Harbour; users overseas should still see
+  // BST/GMT, not their local clock. Forcing the timezone explicitly also
+  // means the column-header label "Time (Europe/London)" is always honest.
   const opts = useUtc
     ? {hour:'2-digit', minute:'2-digit', timeZone:'UTC'}
-    : {hour:'2-digit', minute:'2-digit'};
+    : {hour:'2-digit', minute:'2-digit', timeZone:'Europe/London'};
   return d.toLocaleTimeString('en-GB', opts);
 }
 
@@ -2049,19 +2053,21 @@ function formatTideDate(iso) {
   if (!iso) return '—';
   const useUtc = document.getElementById('tides-tz').value === 'utc';
   const d = new Date(iso);
+  // See formatTideTime: Europe/London, not browser TZ.
   const opts = useUtc
     ? {weekday:'short', day:'numeric', month:'short', timeZone:'UTC'}
-    : {weekday:'short', day:'numeric', month:'short'};
+    : {weekday:'short', day:'numeric', month:'short', timeZone:'Europe/London'};
   return d.toLocaleDateString('en-GB', opts);
 }
 
-// Header label for the time column. The UKHO data is provided in local
-// time; calendar widgets render in the user's browser TZ. For UK users
-// this is GMT in winter and BST in summer; rather than try to detect
-// per-row, the column header reflects the user's selection.
+// Header label for the time column. "Local" in this app always means
+// Europe/London (BST in summer, GMT in winter). Across a 12-month or
+// 180-day window the column will straddle DST transitions and contain
+// mixed-offset rows, so the header cannot legitimately say BST or GMT;
+// the explicit zone name removes ambiguity.
 function tideTimeHeader() {
   const useUtc = document.getElementById('tides-tz').value === 'utc';
-  return useUtc ? 'Time (GMT)' : 'Time (Local)';
+  return useUtc ? 'Time (UTC)' : 'Time (Europe/London)';
 }
 
 // Determine which station a given row came from. The /api/tides endpoint
@@ -2150,6 +2156,33 @@ function renderTideTable(events) {
   return html;
 }
 
+// Helper: extract the year and month integers for an event timestamp,
+// using either UTC or Europe/London as the reference timezone. Used by
+// the history and extended-forecast views to bucket events by month.
+// Crucially this is NOT browser-TZ-dependent: "Local" always means
+// Europe/London, so a user in another timezone sees the same buckets
+// as a UK user.
+function tideEventYearMonth(iso, useUtc) {
+  const d = new Date(iso);
+  if (useUtc) {
+    return {year: d.getUTCFullYear(), month: d.getUTCMonth()};
+  }
+  // Use Intl.DateTimeFormat to extract Europe/London year and month
+  // independent of the browser's locale. The 'en-GB' locale gives
+  // numeric outputs which we parse back to integers.
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Europe/London',
+    year: 'numeric',
+    month: 'numeric',
+  }).formatToParts(d);
+  let y = 0, m = 0;
+  for (const p of parts) {
+    if (p.type === 'year') y = parseInt(p.value, 10);
+    else if (p.type === 'month') m = parseInt(p.value, 10) - 1;  // 0-indexed
+  }
+  return {year: y, month: m};
+}
+
 function renderTidesHistory(events) {
   if (!events.length) {
     return '<p style="color:var(--text-light);font-size:13px;">No historical UKHO data available yet. Once daily fetches have run for a few days, this view will populate.</p>';
@@ -2161,11 +2194,9 @@ function renderTidesHistory(events) {
   const groups = new Map();
   const useUtc = document.getElementById('tides-tz').value === 'utc';
   for (const e of events) {
-    const d = new Date(e.timestamp);
-    const y = useUtc ? d.getUTCFullYear() : d.getFullYear();
-    const m = useUtc ? d.getUTCMonth() : d.getMonth();
-    const key = `${y}-${String(m+1).padStart(2,'0')}`;
-    if (!groups.has(key)) groups.set(key, {year: y, month: m, events: []});
+    const ym = tideEventYearMonth(e.timestamp, useUtc);
+    const key = `${ym.year}-${String(ym.month + 1).padStart(2, '0')}`;
+    if (!groups.has(key)) groups.set(key, {year: ym.year, month: ym.month, events: []});
     groups.get(key).events.push(e);
   }
 
@@ -2225,11 +2256,9 @@ function renderTidesExtended(data) {
   const groups = new Map();
   const useUtc = document.getElementById('tides-tz').value === 'utc';
   for (const e of events) {
-    const d = new Date(e.timestamp);
-    const y = useUtc ? d.getUTCFullYear() : d.getFullYear();
-    const m = useUtc ? d.getUTCMonth() : d.getMonth();
-    const key = `${y}-${String(m+1).padStart(2,'0')}`;
-    if (!groups.has(key)) groups.set(key, {year: y, month: m, events: []});
+    const ym = tideEventYearMonth(e.timestamp, useUtc);
+    const key = `${ym.year}-${String(ym.month + 1).padStart(2, '0')}`;
+    if (!groups.has(key)) groups.set(key, {year: ym.year, month: ym.month, events: []});
     groups.get(key).events.push(e);
   }
   // Sort oldest first - extended FORECAST is forward-looking, so the
