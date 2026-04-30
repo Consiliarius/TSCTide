@@ -1,8 +1,9 @@
 # Calibration notes
 
 State of the tidal model and harmonic prediction calibration as of
-29 April 2026. Records what has been refined, what has not, and the
-tradeoffs that remain open.
+30 April 2026, post-v2.5.4 (continuous monitoring deployment).
+Records what has been refined, what has not, and the tradeoffs that
+remain open.
 
 ## Calibration corpus
 
@@ -27,7 +28,126 @@ Adding new weeks is a matter of dropping a new CSV into
 `app/calibration_data/` and re-running. The script auto-discovers
 all CSVs in the directory.
 
-## Calibration accuracy as of v2.5.2
+## Continuous monitoring (v2.5.4)
+
+As of v2.5.4 the daily scheduler computes harmonic-vs-UKHO residuals
+at HW/LW level and writes the result to `activity_log` with
+`event_type="harmonic_residuals"`. Three rolling windows are reported
+in the structured details JSON: 7d, 30d, and 90d. Each window contains
+separate HW and LW stats with both height and timing residuals (count,
+mean, RMS, max-abs).
+
+The purpose is to detect drift in the harmonic model over time -
+particularly the per-day drift documented in item 3 below. With
+daily logging, items 3 and 4 are now observable from the activity log
+rather than only by re-running the calibration corpus script.
+
+### Sign convention
+
+`residual = predicted - actual`. Positive = harmonic over-predicts.
+Matches `scripts/calibrate_from_ukho_week.py` so the numbers are
+directly comparable.
+
+### Why HW/LW only
+
+The production UKHO API endpoint `/Stations/{station}/TidalEvents`
+returns only HW and LW points with their heights. There is no
+half-hourly observation in the API. The 16-day half-hourly
+calibration corpus came from the UKHO Easy Tide web portal, which is
+a one-off manual download not available to the running container.
+
+Consequence: continuous monitoring covers items 3 (per-day drift)
+and 4 (HW peak undershoot) but cannot observe item 2 (mid-tide
+bias), since item 2's symptom is between HW and LW points and the
+harmonic model would need half-hourly comparison data to evaluate.
+
+### Threshold logic
+
+The scheduler raises the activity-log severity to `warning` if the
+30-day window contains at least 20 matched events AND any of:
+
+  - HW height mean bias |x| > 0.10 m
+  - HW height RMS > 0.25 m
+  - LW height mean bias |x| > 0.10 m
+  - LW height RMS > 0.25 m
+
+Thresholds are kept in `app/scheduler.py` as named constants
+(`HEIGHT_MEAN_THRESHOLD`, `HEIGHT_RMS_THRESHOLD`,
+`MIN_30D_MATCHES_FOR_WARNING`). They live there rather than in
+`model_config.json` because they are operational ("when should the
+operator look"), not model parameters ("what does the model
+produce"). Move into config if a UI for tuning them is added.
+
+The threshold values are calibrated to be loose enough to not warn
+on v2.5.3's expected residuals (HW mean -0.12m would breach, but
+in the 30-day window the bias is averaged across HWs and LWs and
+is expected to come in below 0.10m absolute) and tight enough to
+flag a real drift larger than ~0.10m mean. They are working
+estimates, not data-derived; revisit after 30+ days of real
+residuals have accumulated.
+
+### What the residual log does NOT do
+
+  - **Does not recalibrate.** Fitting a new set of harmonic
+    constituents requires `scipy.optimize` machinery and a
+    deliberate window choice (recommend 6+ months, M2/S2/N2
+    parameters only). That is a separate workstream when residual
+    history justifies it.
+  - **Does not alert externally.** Warnings appear in the activity
+    log only. No email/SMS/webhook integration. Add when it becomes
+    necessary.
+  - **Does not gate predictions.** Even if residuals breach the
+    threshold, predictions and access-window calculations continue
+    unchanged. The signal is for human-in-the-loop review.
+
+### How to inspect
+
+```
+docker exec tidal-access sqlite3 /app/data/tides.db \
+  "SELECT timestamp, severity, message FROM activity_log \
+   WHERE event_type='harmonic_residuals' \
+   ORDER BY timestamp DESC LIMIT 30;"
+```
+
+For the structured stats:
+
+```
+docker exec tidal-access sqlite3 /app/data/tides.db \
+  "SELECT timestamp, details FROM activity_log \
+   WHERE event_type='harmonic_residuals' \
+   ORDER BY timestamp DESC LIMIT 1;"
+```
+
+The `details` column is JSON; pretty-print with `python -m json.tool`
+or any JSON-aware tool.
+
+## Calibration accuracy
+
+### v2.5.3 (current, validated 30 April 2026)
+
+| Path                           | Mean bias  | RMS error | Max error |
+|--------------------------------|-----------:|----------:|----------:|
+| UKHO curve, overall            | +0.010 m   | 0.190 m   | 0.66 m    |
+| UKHO curve, flood phase        | +0.016 m   | 0.219 m   | 0.66 m    |
+| UKHO curve, ebb phase          | +0.002 m   | 0.139 m   | 0.44 m    |
+| Harmonic, raw                  | -0.068 m   | 0.218 m   | 0.60 m    |
+| Harmonic, production path      | -0.036 m   | 0.207 m   | 0.58 m    |
+
+Improvement vs v2.5.2 (which used pure-cosine flood):
+
+  - UKHO curve overall: RMS 0.255m -> 0.190m (25% reduction); mean
+    bias +0.121m -> +0.010m (effectively zeroed).
+  - Harmonic production path: RMS 0.222m -> 0.207m (7% reduction);
+    mean bias +0.024m -> -0.036m (smaller in magnitude but flipped
+    sign).
+
+The harmonic production path inherits the flood-side improvement
+because it goes through `_curve_interpolate` for half-hourly sample
+prediction. The residual mean shift and the per-day drift documented
+in item 3 are harmonic-side issues that the curve change does not
+reach.
+
+### v2.5.2 (preserved for reference)
 
 | Path                           | Mean bias  | RMS error | Max error |
 |--------------------------------|-----------:|----------:|----------:|
@@ -37,136 +157,153 @@ all CSVs in the directory.
 | Harmonic, raw                  | -0.068 m   | 0.218 m   | 0.60 m    |
 | Harmonic, production path      | +0.024 m   | 0.222 m   | 0.68 m    |
 
-The production path now tracks raw harmonic output to within 4mm RMS
-across the full corpus.
+Under v2.5.2 the production path tracked raw harmonic output to within
+4mm RMS across the full corpus.
 
 ## Items remaining to be addressed
 
-### 0. Harmonic-prediction duplicate-rows on within-day refresh
+### 0. Harmonic-prediction duplicate-rows on within-day refresh  **[RESOLVED v2.5.3]**
 
-**Current state**: each call to the harmonic refresh path
-(`harmonic_predict_events -> apply_offset -> store_harmonic_predictions`)
-inserts a fresh row per predicted tide event tagged with the current
-`generated_at` time. The row's primary deduplication key includes the
-exact `timestamp`, which drifts by seconds across runs as the harmonic
-synthesis is re-evaluated. Consequence: two refreshes of the harmonic
-feed within the same day produce two rows for what is the same tide
-cycle, with timestamps that differ by tens of seconds.
+**Original symptom**: Tides tab "Forecast (next 180 days)" showed
+duplicate HW/LW entries for the same tide cycle, times differing by
+tens of seconds. `get_harmonic_predictions(latest_only=True)`
+deduplicated on exact `(timestamp, event_type)` and could not
+collapse near-duplicates from independent harmonic batches.
 
-**Symptom**: Tides tab "Forecast (next 180 days)" view shows duplicate
-HW/LW entries for the same tide cycle - times appearing twice with
-slight differences. The deduplication in `get_harmonic_predictions(
-latest_only=True)` is per exact `(timestamp, event_type)` key and
-cannot collapse near-duplicates from independent runs.
+**Correction to original framing**: the notes attributed duplicates
+to "multiple refreshes per day". In fact there is no intra-day
+write path - `store_harmonic_predictions` is only called from the
+daily cron in `scheduler.py`. The drift is between consecutive
+*daily* runs, because `harmonic_predict_events` samples on a grid
+anchored at "now" which advances 24h+seconds between runs and
+produces slightly different `_refine`-output timestamps for the
+same physical tide. After N days, each future tide had up to N
+rows in `harmonic_predictions`.
 
-**Why the design allowed this**: the `(timestamp, event_type,
-generated_at)` UNIQUE constraint was intended to preserve historical
-predictions across multiple days for later delta-vs-actual analysis.
-The assumption was "one refresh per day" so the timestamp would be
-identical between consecutive same-cycle predictions. That assumption
-breaks under multiple-refreshes-per-day, which is normal during
-operator activity.
+**Resolution**: added a `cycle_number INTEGER` column to
+`harmonic_predictions` (derived as `round(hours_since_2026-01-01
+/ 12.4167)`, matching the existing pattern in
+`access_calc.generate_event_uid` and
+`ical_manager._tide_event_uid`). Changed the `latest_only`
+correlated subquery to group by `(cycle_number, event_type)`
+instead of `(timestamp, event_type)`. Same physical tide with
+drifting timestamps now collapses to one row per cycle, with the
+freshest `generated_at` winning. Migration backfills
+`cycle_number` for existing rows and creates a `UNIQUE INDEX`
+on `(cycle_number, event_type, generated_at)` for storage-time
+enforcement. All changes contained in `app/database.py`. Multi-
+day historical-prediction capability preserved as the design
+intended - different daily runs have different `generated_at`
+values and remain distinct rows under `latest_only=False`.
 
-**Immediate workaround** (run when duplicates are observed):
+**Cleanup of pre-migration data**: not required. Old duplicate
+rows are migrated (cycle_number backfilled) and `latest_only`
+naturally returns one row per cycle. `cleanup_old_harmonic_
+predictions(days=365)` washes them out over time.
 
-```
-docker exec tidal-access sqlite3 /app/data/tides.db "
-DELETE FROM harmonic_predictions
-WHERE generated_at < (SELECT MAX(generated_at) FROM harmonic_predictions);
-"
-```
+**Out of scope, deferred**: the 90-min UKHO-vs-harmonic clash
+filter in `generate_langstone_harmonic_180d_feed` and
+`/api/tides?range=extended` is unrelated and unaffected. The
+"Best" extension (rounding `generated_at` to day) was not
+implemented because there is no intra-day write path to defend
+against.
 
-This keeps only the most recent batch.
+### 1. Flood-phase mid-cycle bias  **[RESOLVED v2.5.3]**
 
-**Permanent fix**: change the deduplication semantics so that
-"prediction for the same tidal cycle" collapses correctly while
-preserving day-by-day history.
+**Original state**: pure cosine flood interpolation with +0.134m
+mean bias and 0.290m RMS through the mid-flood region. Direction
+unsafe for boater (model overstated available water).
 
-Three levels of effort, ordered:
+**Correction to original framing**: the notes proposed `cos^p` with
+`p < 1` ("flattens extremes, steepens mid-cycle"). Working through
+the math, `p < 1` *increases* mid-flood height - the wrong direction
+for the observed +0.134m positive bias. The empirical sweep showed
+`p > 1` is what helps; `p = 1.20` zeroes the mean.
 
-  - **Quick**: in the harmonic refresh path, delete existing rows for
-    the prediction window before inserting the new batch. One-line
-    change in `app/scheduler.py::daily_ukho_fetch` or in
-    `store_harmonic_predictions`. Sacrifices intra-day history.
-  - **Better**: add a cycle-number-since-epoch column to the
-    `harmonic_predictions` schema (matching the pattern used by
-    `access_calc.generate_event_uid`). Make the natural deduplication
-    key `(cycle_number, event_type)` with `timestamp` as a data
-    column. `latest_only=True` then groups by cycle. Preserves
-    multi-day history of predictions for the same cycle.
-  - **Best**: same as "better", plus round `generated_at` to the day
-    in the dedup logic so within-day refreshes collapse but
-    once-per-day predictions persist as distinct rows. Best matches
-    the original design intent.
+**Resolution**: applied a "young flood stand" - linear rise during
+the first 60 minutes after LW lifting the water by 8% of the flood
+range, then a half-cosine from that level to HW. Symmetric in role
+to the existing ebb stand near HW but uses fraction of *range*
+rather than fraction of absolute height (because LW heights in
+Langstone are small, 0.5-1.5m typical, and a fraction of LW would
+be physically negligible).
 
-**Implementation note**: the dedup logic also exists implicitly in
-`generate_langstone_harmonic_180d_feed` (90-min clash filter against
-UKHO events). If the schema changes, the feed-generation deduplication
-should be reviewed for consistency.
+Selected by `scripts/sweep_flood_curve.py` over forms (1)
+`((1-cos(pi*f))/2)^p` swept on `p`, and (2) LW stand + cosine swept
+on (duration, rise_fraction). Form (2) at `(60min, 0.08)` gives
+flood mean +0.016m (statistically indistinguishable from zero with
+~380 samples), RMS 0.219m, max 0.66m. Form (1) was numerically
+close (`p=1.20` -> mean -0.001m, RMS 0.250m) but is curve-fitting;
+form (2) has physical justification in the documented Solent young-
+flood-stand effect (early-flood inflows around the Isle of Wight
+arrive out of phase with the main flood and briefly pause the rise
+just after LW).
 
-### 1. Flood-phase mid-cycle bias
+Implementation in `app/access_calc.py::_curve_interpolate` flood
+branch with two new keys in `model_config.json`:
+`flood_lw_stand_minutes=60` and `flood_lw_stand_rise_fraction=0.08`.
+Backward-compatible: if either key is zero or absent the flood
+reverts to pure cosine (legacy v2.5.2 behaviour).
 
-**Current state**: pure cosine interpolation on the flood, with a
-residual ~+0.13 m mean bias through the mid-flood region.
+**Boater safety**: previously the model overstated mid-flood water
+by ~13cm. The resolution essentially zeroes that bias. Net safety
+improvement.
 
-**What was tried**: adding a pre-HW stand symmetric to the existing
-ebb stand. This was rolled back because it more than doubled flood
-RMS error. The visible flatness near HW in the flood is largely
-accounted for by the cosine's own slowdown near its peak; an explicit
-linear stand on top double-counts that flatness AND compresses the
-mid-flood cosine to be unrealistically steep.
+**Validation completed 30 April 2026**: post-deploy
+`calibrate_from_ukho_week.py` rerun produced flood mean +0.016m,
+RMS 0.219m, max 0.66m - matching the sweep prediction to three
+decimal places. Combined-corpus rows in the accuracy table above
+now reflect the live deployed configuration.
 
-**What would actually help**: a different curve shape for the flood
-that has slower mid-rise than a cosine. Three candidate approaches:
+**Out of scope, deferred**: `compute_access_windows` still uses
+the curve interpolation path for harmonic-derived windows. Item 2
+below will replace that path for harmonic with direct
+`predict_height_at_time` calls, at which point the flood curve
+only affects UKHO/KHM windows.
 
-  - **Cosine variant**: e.g. `cos^p` with `p < 1`, which flattens both
-    extremes and steepens the mid-cycle. Could be evaluated by parameter
-    sweep over `p`.
-  - **Piecewise**: cosine to ~80% of HW, linear ramp through middle,
-    slow approach near HW. More parameters, more risk of overfitting.
-  - **Admiralty lookup table**: import the published Portsmouth tidal
-    curve diagram from Admiralty Tide Tables NP 159 as a height-vs-
-    hours-from-HW lookup. This is the industry standard approach and
-    would supersede the function-based curve. Requires sourcing the
-    table data.
+### 2. Harmonic mid-tide bias  **[partially addressed by v2.5.3]**
 
-**Direction of bias**: model predicts ~13cm higher than reality during
-mid-flood. This is the **less-safe direction** for access-window
-calculation - a boater on the flood seeing the model's prediction
-might assume more water is available than there actually is. A
-typical safety margin (30cm or more) absorbs this, but it is not
-zero risk.
+**v2.5.2 state**: production-path harmonic had +0.22m mean bias in
+the 2.5-3.5m height band, with RMS 0.32m - the single largest
+remaining residual in the harmonic prediction path.
 
-### 2. Harmonic mid-tide bias
+**v2.5.3 state**: the flood-stand fix (item 1) reduced the mid-band
+bias substantially. The `_curve_interpolate` overshoot through mid-
+flood was a major contributor. New numbers in the 2.5-3.5m band:
+mean +0.073m (was +0.22m; 67% reduction), RMS 0.202m (was 0.32m;
+37% reduction). Still material but priority of the proposed
+refactor below is now lower.
 
-**Current state**: production-path harmonic has a +0.22 m mean bias
-in the 2.5-3.5 m height band, with RMS 0.32 m. This is the single
-largest remaining residual in the harmonic prediction path.
+**Why it happens**: the residual ~+0.07m mean is the part of the
+bias that the flood-curve change does not reach - direct sampling
+of `predict_height_at_time(t)` (raw harmonic, no interpolation)
+shows that the harmonic synthesis itself has some residual bias in
+this band, which the curve interpolation cannot correct.
 
-**Why it happens**: the bias is dominated by the curve interpolation
-step that the production path inherits from the access-window code.
-Direct sampling of `predict_height_at_time(t)` (raw harmonic, no
-interpolation) shows much smaller bias in this band.
-
-**What would help**: Fix 1B from the option-1 analysis - use
-`predict_height_at_time` directly for harmonic-derived access window
-threshold-crossing detection, instead of going via
-`predict_events -> apply_offset -> interpolate`. The interpolation
-step throws away mid-cycle information the harmonic synthesis has
-calibrated for.
+**What would help**: use `predict_height_at_time` directly for
+harmonic-derived access window threshold-crossing detection,
+instead of going via `predict_events -> apply_offset -> interpolate`.
+The interpolation step throws away mid-cycle information the
+harmonic synthesis has calibrated for.
 
 **Implementation note**: would require modification to
 `app/access_calc.py::_find_crossing` so it can call
-`predict_height_at_time` directly when the source is harmonic, rather
-than always using event-bracketed curve interpolation. Significant
-refactor; not undertaken in the April 2026 calibration session.
+`predict_height_at_time` directly when the source is harmonic,
+rather than always using event-bracketed curve interpolation.
+Significant refactor; now sensible to weigh against item 3
+(constituent recalibration) before committing - they address
+overlapping but distinct symptoms.
 
-### 3. Harmonic per-day drift across the corpus
+### 3. Harmonic per-day drift across the corpus  **[monitored automatically v2.5.4]**
 
-**Current state**: production-path mean bias drifts from +0.049 m on
-14 April to -0.110 m on 5 May - a coherent ~16 cm change across 22
-days, with a step jump of ~+0.18 m at the boundary between the two
-CSVs (22 Apr → 29 Apr).
+**v2.5.3 state**: production-path mean bias drifts from +0.002m on
+14 April to -0.163m on 5 May - a coherent ~16cm change across 22
+days, with a step jump of ~+0.18m at the boundary between the two
+CSVs (22 April: -0.070m -> 29 April: +0.106m). Pattern essentially
+identical to v2.5.2 (which had +0.049m -> -0.110m and step ~+0.18m);
+the v2.5.3 flood fix shifted the absolute baseline by about -0.06m
+but did not affect the day-to-day drift shape, confirming the drift
+is harmonic-side and not curve-side.
 
 **Possible causes**: phase or amplitude drift in one or more harmonic
 constituents (likely M2), meteorological surge effects that the
@@ -181,12 +318,18 @@ amplitudes and phase lags simultaneously. Risk of overfitting to a
 **What does NOT help**: any single-week recalibration. The drift is
 too small to disambiguate from noise on a single week.
 
-### 4. Harmonic LW heights consistently low
+### 4. Harmonic HW heights consistently low  **[monitored automatically v2.5.4]**
 
-**Current state**: in the very-high band (>=4.5m), the production-path
-harmonic prediction is on average 0.11 m too low. Less critical than
-the mid-tide bias because RMS is only 0.15 m here, but worth knowing
-- the harmonic model's peaks aren't quite reaching real-world peaks.
+**v2.5.3 state**: in the very-high band (>=4.5m, n=121), the
+production-path harmonic prediction is on average 0.12m too low,
+with RMS 0.16m. Essentially unchanged from v2.5.2 (-0.11m / 0.15m).
+Less critical than the per-day drift in item 3, but worth knowing -
+the harmonic model's HW peaks aren't quite reaching real-world
+peaks.
+
+(Title corrected from "LW heights" - the band described is HW
+peaks, not LW. The original wording was a documentation defect
+predating v2.5.2.)
 
 **What would help**: same as item 3, harmonic constituent
 recalibration. The peak-amplitude shortfall is consistent with the

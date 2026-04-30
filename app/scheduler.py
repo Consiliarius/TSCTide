@@ -71,6 +71,7 @@ async def daily_ukho_fetch():
         get_mooring, calibrate_drying_height, cleanup_old_events,
         cleanup_old_tide_data,
         store_harmonic_predictions, cleanup_old_harmonic_predictions,
+        compute_harmonic_residuals,
         log_activity, prune_activity_log,
     )
     from app.harmonic import predict_events as harmonic_predict_events
@@ -218,6 +219,115 @@ async def daily_ukho_fetch():
         log_activity(
             event_type="langstone_feed_refresh",
             message=f"Langstone feed regeneration failed: {e}",
+            severity="error",
+        )
+
+    # --- Continuous harmonic-vs-UKHO residual monitoring ---
+    # Compute residuals over three rolling windows so trends and stable
+    # state are both visible. Logged once per daily run as a single
+    # activity_log row with structured details JSON. The 30-day window
+    # is the threshold-bearing one (see calibration_thresholds below);
+    # it is long enough to suppress single-storm noise, short enough to
+    # respond to a real model drift within ~a month.
+    #
+    # On a fresh deployment the harmonic_predictions table only contains
+    # rows from the day of first run, so historical comparison data
+    # accumulates over time. Until then, longer windows naturally return
+    # smaller `matched` counts and stats remain `None`. The threshold
+    # check is gated on having enough data; it does not warn on first
+    # run before history exists.
+    try:
+        residuals_7d = compute_harmonic_residuals(days=7)
+        residuals_30d = compute_harmonic_residuals(days=30)
+        residuals_90d = compute_harmonic_residuals(days=90)
+
+        # Threshold logic: warning if the 30-day stats breach any of
+        #   |HW height mean| > 0.10m, HW height RMS > 0.25m
+        #   |LW height mean| > 0.10m, LW height RMS > 0.25m
+        # The 30-day window must contain at least 20 matches (~half of
+        # the ~58 expected in 30 days) to count - below that, sampling
+        # noise dominates and a warning would be premature.
+        MIN_30D_MATCHES_FOR_WARNING = 20
+        HEIGHT_MEAN_THRESHOLD = 0.10
+        HEIGHT_RMS_THRESHOLD = 0.25
+
+        threshold_breaches = []
+        hw30 = residuals_30d["hw"]
+        lw30 = residuals_30d["lw"]
+        if hw30["count"] >= MIN_30D_MATCHES_FOR_WARNING:
+            if (hw30["height_mean"] is not None
+                    and abs(hw30["height_mean"]) > HEIGHT_MEAN_THRESHOLD):
+                threshold_breaches.append(
+                    f"HW mean {hw30['height_mean']:+.3f}m"
+                )
+            if (hw30["height_rms"] is not None
+                    and hw30["height_rms"] > HEIGHT_RMS_THRESHOLD):
+                threshold_breaches.append(
+                    f"HW RMS {hw30['height_rms']:.3f}m"
+                )
+        if lw30["count"] >= MIN_30D_MATCHES_FOR_WARNING:
+            if (lw30["height_mean"] is not None
+                    and abs(lw30["height_mean"]) > HEIGHT_MEAN_THRESHOLD):
+                threshold_breaches.append(
+                    f"LW mean {lw30['height_mean']:+.3f}m"
+                )
+            if (lw30["height_rms"] is not None
+                    and lw30["height_rms"] > HEIGHT_RMS_THRESHOLD):
+                threshold_breaches.append(
+                    f"LW RMS {lw30['height_rms']:.3f}m"
+                )
+
+        # Build the human-readable message. Always lead with 30-day
+        # numbers because they are the threshold-bearing window.
+        if hw30["count"] == 0 and lw30["count"] == 0:
+            msg = (
+                "Harmonic residuals: no matches in 30-day window "
+                "(insufficient history)"
+            )
+            severity = "info"
+        else:
+            hw_str = (
+                f"HW n={hw30['count']} "
+                f"mean={hw30['height_mean']:+.3f}m "
+                f"RMS={hw30['height_rms']:.3f}m"
+                if hw30["count"] > 0 else "HW n=0"
+            )
+            lw_str = (
+                f"LW n={lw30['count']} "
+                f"mean={lw30['height_mean']:+.3f}m "
+                f"RMS={lw30['height_rms']:.3f}m"
+                if lw30["count"] > 0 else "LW n=0"
+            )
+            base_msg = f"Harmonic vs UKHO 30d: {hw_str}; {lw_str}"
+            if threshold_breaches:
+                msg = f"{base_msg} - threshold breach: {'; '.join(threshold_breaches)}"
+                severity = "warning"
+            else:
+                msg = base_msg
+                severity = "info"
+
+        log_activity(
+            event_type="harmonic_residuals",
+            message=msg,
+            severity=severity,
+            details={
+                "thresholds": {
+                    "window_days": 30,
+                    "min_matches_for_warning": MIN_30D_MATCHES_FOR_WARNING,
+                    "height_mean_abs_max_m": HEIGHT_MEAN_THRESHOLD,
+                    "height_rms_max_m": HEIGHT_RMS_THRESHOLD,
+                },
+                "breaches": threshold_breaches,
+                "window_7d": residuals_7d,
+                "window_30d": residuals_30d,
+                "window_90d": residuals_90d,
+            },
+        )
+    except Exception as e:
+        logger.error(f"Harmonic residual monitoring failed: {e}")
+        log_activity(
+            event_type="harmonic_residuals",
+            message=f"Harmonic residual monitoring failed: {e}",
             severity="error",
         )
 

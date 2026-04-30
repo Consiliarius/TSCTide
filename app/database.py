@@ -121,6 +121,7 @@ CREATE TABLE IF NOT EXISTS pin_failed_attempts (
 CREATE TABLE IF NOT EXISTS harmonic_predictions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp TEXT NOT NULL,           -- target tide event time, ISO UTC, Langstone-corrected
+    cycle_number INTEGER,              -- tide cycle since 2026-01-01 epoch; primary dedup key (nullable for legacy rows pre-migration)
     height_m REAL NOT NULL,            -- predicted height in metres above CD
     event_type TEXT NOT NULL,          -- 'HighWater' or 'LowWater'
     generated_at TEXT NOT NULL,        -- ISO UTC time when this row was created
@@ -170,6 +171,46 @@ def init_db():
         conn.execute("ALTER TABLE moorings ADD COLUMN use_observations INTEGER DEFAULT 0")
     if "pin_hash" not in mooring_cols:
         conn.execute("ALTER TABLE moorings ADD COLUMN pin_hash TEXT DEFAULT ''")
+
+    # Migrate harmonic_predictions: add cycle_number column for cycle-based
+    # deduplication of latest_only queries. Existing rows are backfilled in
+    # the same pass; the unique index is then created (idempotent via
+    # IF NOT EXISTS) and lives outside the column-presence check so an
+    # interrupted prior migration self-heals on next startup.
+    cursor3 = conn.execute("PRAGMA table_info(harmonic_predictions)")
+    harm_cols = {row[1] for row in cursor3.fetchall()}
+    if "cycle_number" not in harm_cols:
+        conn.execute(
+            "ALTER TABLE harmonic_predictions ADD COLUMN cycle_number INTEGER"
+        )
+        # Backfill: compute cycle_number from each row's stored timestamp.
+        # Formula duplicated here so the migration is self-contained and
+        # does not depend on _compute_cycle_number being already importable
+        # at this point in module init.
+        epoch = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        rows = conn.execute(
+            "SELECT id, timestamp FROM harmonic_predictions"
+        ).fetchall()
+        for r in rows:
+            ts = r["timestamp"]
+            if ts.endswith("Z"):
+                ts_iso = ts[:-1] + "+00:00"
+            else:
+                ts_iso = ts
+            dt = datetime.fromisoformat(ts_iso)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            hours = (dt - epoch).total_seconds() / 3600.0
+            cyc = round(hours / 12.4167)
+            conn.execute(
+                "UPDATE harmonic_predictions SET cycle_number = ? WHERE id = ?",
+                (cyc, r["id"])
+            )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_harm_cycle_dedup "
+        "ON harmonic_predictions(cycle_number, event_type, generated_at)"
+    )
+
     conn.commit()
     conn.close()
 
@@ -1066,6 +1107,17 @@ def cleanup_old_tide_data(days: int = 365):
 #      analysed to refine the harmonic constants. Hence the per-row
 #      generated_at column rather than overwriting on each daily run.
 #
+# Deduplication: the same physical tide computed by predict_events on
+# different days produces timestamps that drift by seconds (the sampling
+# grid is anchored at "now", which advances 24h+drift between daily
+# runs). To collapse those drifting timestamps to one row per tide cycle
+# in latest_only queries, each row is tagged with a cycle_number
+# (= round(hours_since_2026-01-01 / 12.4167)). cycle_number is stable
+# under drift of much less than half a cycle (several hours), so seconds
+# of drift always map to the same cycle. The matching UNIQUE INDEX on
+# (cycle_number, event_type, generated_at) enforces 'one row per
+# (cycle, type) per write batch' at storage time as well as query time.
+#
 # This table is intentionally separate from tide_data:
 #   - tide_data holds authoritative UKHO/KHM observations used by
 #     observation calibration; harmonic predictions must NOT contaminate
@@ -1073,16 +1125,43 @@ def cleanup_old_tide_data(days: int = 365):
 #   - get_ukho_tide_events / get_tide_events / load_classification_inputs
 #     all query tide_data only and never see harmonic_predictions.
 
+# Constants for cycle-based deduplication. Match the values used by
+# access_calc.generate_event_uid and ical_manager._tide_event_uid; kept
+# duplicated here so database.py has no upward dependency on either.
+_HARM_CYCLE_EPOCH = datetime(2026, 1, 1, tzinfo=timezone.utc)
+_HARM_CYCLE_HOURS = 12.4167
+
+
+def _compute_cycle_number(timestamp_iso: str) -> int:
+    """
+    Compute the tide-cycle number for an ISO UTC timestamp, used as the
+    deduplication key in harmonic_predictions. The same physical tide
+    re-computed from a slightly different sample grid produces timestamps
+    differing by seconds; the rounded cycle number is stable under such
+    drift, making it a robust dedup key.
+    """
+    ts = timestamp_iso
+    if ts.endswith("Z"):
+        ts = ts[:-1] + "+00:00"
+    dt = datetime.fromisoformat(ts)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    hours = (dt - _HARM_CYCLE_EPOCH).total_seconds() / 3600.0
+    return round(hours / _HARM_CYCLE_HOURS)
+
+
 def store_harmonic_predictions(events: list[dict]) -> int:
     """
     Insert a batch of harmonic predictions, all tagged with the current
-    UTC time as generated_at. Each input event is a dict with at least
-    timestamp (ISO UTC string), height_m (float), event_type (string).
+    UTC time as generated_at and with a derived cycle_number. Each input
+    event is a dict with at least timestamp (ISO UTC string), height_m
+    (float), event_type (string).
 
-    Returns the count of rows actually inserted. If a row with the same
-    (timestamp, event_type, generated_at) tuple already exists (e.g. the
-    scheduler runs twice within the same second), the duplicate is
-    silently ignored thanks to the UNIQUE constraint.
+    Returns the count of rows the call attempted to insert. Conflicts on
+    either UNIQUE constraint - the original (timestamp, event_type,
+    generated_at) or the cycle-based (cycle_number, event_type,
+    generated_at) index - are silently ignored. Under normal once-per-day
+    operation no conflicts occur because each batch has a fresh generated_at.
     """
     if not events:
         return 0
@@ -1091,14 +1170,15 @@ def store_harmonic_predictions(events: list[dict]) -> int:
     with db_connection() as conn:
         for ev in events:
             try:
+                cycle = _compute_cycle_number(ev["timestamp"])
                 conn.execute(
                     "INSERT OR IGNORE INTO harmonic_predictions "
-                    "(timestamp, height_m, event_type, generated_at) "
-                    "VALUES (?, ?, ?, ?)",
-                    (ev["timestamp"], ev["height_m"], ev["event_type"], now),
+                    "(timestamp, height_m, event_type, generated_at, cycle_number) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (ev["timestamp"], ev["height_m"], ev["event_type"], now, cycle),
                 )
                 inserted += 1
-            except (sqlite3.IntegrityError, KeyError) as e:
+            except (sqlite3.IntegrityError, KeyError, ValueError) as e:
                 logger.warning(f"Skipped malformed harmonic event: {e}")
     return inserted
 
@@ -1118,12 +1198,19 @@ def get_harmonic_predictions(start: str, end: str,
     """
     with db_connection() as conn:
         if latest_only:
+            # Group by (cycle_number, event_type) so that the same physical
+            # tide cycle, whose timestamps drift seconds-to-tens-of-seconds
+            # between daily runs, collapses to a single row per group with
+            # the freshest generated_at winning. SQLite's IS operator is
+            # used in place of = so any legacy NULL cycle_number rows
+            # (should not occur post-migration) self-group correctly.
             rows = conn.execute(
                 "SELECT * FROM harmonic_predictions h1 "
                 "WHERE timestamp >= ? AND timestamp <= ? "
                 "AND generated_at = ("
                 "  SELECT MAX(generated_at) FROM harmonic_predictions h2 "
-                "  WHERE h2.timestamp = h1.timestamp AND h2.event_type = h1.event_type"
+                "  WHERE h2.cycle_number IS h1.cycle_number "
+                "    AND h2.event_type = h1.event_type"
                 ") "
                 "ORDER BY timestamp",
                 (start, end),
@@ -1159,6 +1246,161 @@ def cleanup_old_harmonic_predictions(days: int = 365):
                 f"Cleaned up {result.rowcount} harmonic prediction rows "
                 f"older than {days} days"
             )
+
+
+def compute_harmonic_residuals(days: int = 30) -> dict:
+    """
+    Compare stored harmonic predictions against actual UKHO HW/LW events for
+    the trailing `days` days, ending at "now". Returns aggregated residual
+    statistics suitable for activity-log monitoring.
+
+    Matching:
+      - For each UKHO HW/LW event with timestamp in [now - days, now], find
+        the freshest harmonic prediction sharing the same (cycle_number,
+        event_type). cycle_number is the same epoch-anchored quantity used
+        elsewhere in this module (round((hours_since_2026_01_01) / 12.4167)),
+        so harmonic timestamps drifting by minutes from UKHO still match
+        the same physical tide.
+      - Both sides are Langstone-corrected at storage time:
+          * harmonic_predictions stores rows already passed through
+            secondary_port.apply_offset() in scheduler.daily_ukho_fetch.
+          * tide_data stations are "langstone" (native, returned as-is by
+            get_ukho_tide_events) or "portsmouth" (fallback, returned
+            after offset). This function uses get_ukho_tide_events() so
+            the Portsmouth fallback offset is applied transparently.
+        Direct predicted-minus-actual differencing is therefore valid for
+        both height and timing; no further correction is applied here.
+
+    Sign convention:
+      residual = predicted - actual
+      Positive = harmonic over-predicts; negative = harmonic under-predicts.
+      Matches the convention used by scripts/calibrate_from_ukho_week.py
+      so that numbers reported here are directly comparable.
+
+    Returns a dict shaped for the activity-log details JSON:
+        {
+            "window_days": int,
+            "window_start": ISO UTC string,
+            "window_end":   ISO UTC string,
+            "matched":      total UKHO events with a harmonic match,
+            "unmatched":    total UKHO events without a match,
+            "hw": {"count": int, "height_mean": float, "height_rms": float,
+                    "height_max_abs": float, "timing_mean_min": float,
+                    "timing_rms_min": float, "timing_max_abs_min": float},
+            "lw": { ... same shape ... },
+        }
+
+    Returns the dict with all-None numeric fields and zero counts if the
+    window contains no matched pairs (e.g. first run, fresh database).
+    Callers must handle the empty-window case rather than this function
+    raising.
+    """
+    now = datetime.now(timezone.utc)
+    window_start = now - timedelta(days=days)
+    start_str = to_utc_str(window_start)
+    end_str = to_utc_str(now)
+
+    # UKHO events in the window. get_ukho_tide_events() applies the
+    # Portsmouth->Langstone offset for fallback rows, so the events are
+    # always Langstone-equivalent regardless of which station provided them.
+    ukho_events = get_ukho_tide_events(start_str, end_str)
+
+    # Harmonic predictions covering the same window. Slightly widen the
+    # query at both ends so a UKHO event near the edge whose harmonic
+    # twin lies just outside [start, end] still matches. Half a tidal
+    # cycle (~6.2h) on either side is generous and cheap.
+    harm_query_start = to_utc_str(window_start - timedelta(hours=7))
+    harm_query_end = to_utc_str(now + timedelta(hours=7))
+    harm_events = get_harmonic_predictions(
+        harm_query_start, harm_query_end, latest_only=True
+    )
+
+    # Index harmonic events by (cycle_number, event_type) for O(1) lookup.
+    # cycle_number is populated for all post-migration rows; legacy NULL
+    # rows are excluded (they cannot be matched and would skew counts).
+    harm_index: dict[tuple[int, str], dict] = {}
+    for h in harm_events:
+        cyc = h.get("cycle_number")
+        if cyc is None:
+            continue
+        harm_index[(cyc, h["event_type"])] = h
+
+    hw_height_resid: list[float] = []
+    lw_height_resid: list[float] = []
+    hw_timing_resid_min: list[float] = []
+    lw_timing_resid_min: list[float] = []
+    matched = 0
+    unmatched = 0
+
+    for u in ukho_events:
+        et = u["event_type"]
+        if et not in ("HighWater", "LowWater"):
+            continue
+        u_cyc = _compute_cycle_number(u["timestamp"])
+        h = harm_index.get((u_cyc, et))
+        if h is None:
+            unmatched += 1
+            continue
+
+        height_resid = h["height_m"] - u["height_m"]
+        try:
+            u_dt = datetime.fromisoformat(
+                u["timestamp"].replace("Z", "+00:00")
+            )
+            h_dt = datetime.fromisoformat(
+                h["timestamp"].replace("Z", "+00:00")
+            )
+            timing_resid_min = (h_dt - u_dt).total_seconds() / 60.0
+        except (ValueError, KeyError):
+            # Defensive: a malformed timestamp on either side should not
+            # poison the whole window. Skip this pair, log nothing here
+            # (caller logs aggregate stats), continue.
+            unmatched += 1
+            continue
+
+        if et == "HighWater":
+            hw_height_resid.append(height_resid)
+            hw_timing_resid_min.append(timing_resid_min)
+        else:
+            lw_height_resid.append(height_resid)
+            lw_timing_resid_min.append(timing_resid_min)
+        matched += 1
+
+    def _stats(height_vals: list[float], timing_vals: list[float]) -> dict:
+        n = len(height_vals)
+        if n == 0:
+            return {
+                "count": 0,
+                "height_mean": None, "height_rms": None,
+                "height_max_abs": None,
+                "timing_mean_min": None, "timing_rms_min": None,
+                "timing_max_abs_min": None,
+            }
+        h_mean = sum(height_vals) / n
+        h_rms = (sum(x * x for x in height_vals) / n) ** 0.5
+        h_max = max(abs(x) for x in height_vals)
+        t_mean = sum(timing_vals) / n
+        t_rms = (sum(x * x for x in timing_vals) / n) ** 0.5
+        t_max = max(abs(x) for x in timing_vals)
+        return {
+            "count": n,
+            "height_mean": round(h_mean, 3),
+            "height_rms": round(h_rms, 3),
+            "height_max_abs": round(h_max, 2),
+            "timing_mean_min": round(t_mean, 1),
+            "timing_rms_min": round(t_rms, 1),
+            "timing_max_abs_min": round(t_max, 1),
+        }
+
+    return {
+        "window_days": days,
+        "window_start": start_str,
+        "window_end": end_str,
+        "matched": matched,
+        "unmatched": unmatched,
+        "hw": _stats(hw_height_resid, hw_timing_resid_min),
+        "lw": _stats(lw_height_resid, lw_timing_resid_min),
+    }
 
 
 def cleanup_superseded_events(mooring_id: int):

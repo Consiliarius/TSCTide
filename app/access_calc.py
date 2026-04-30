@@ -118,23 +118,63 @@ def _curve_interpolate(target: datetime, before: tuple, after: tuple) -> float:
 
     # Determine if this is a flooding or ebbing phase
     if et_before == "LowWater" and et_after == "HighWater":
-        # Flooding tide - pure cosine.
+        # Flooding tide. Two regimes, selected by configuration:
         #
-        # An earlier attempt added a symmetric pre-HW stand (matching the
-        # ebb branch) on the basis that published Langstone tidal curves
-        # show a flat top on both sides of HW. The 16-day calibration
-        # corpus revealed this was wrong: adding the stand made flood RMS
-        # error rise from 0.29m to 0.60m. The visible flatness near HW
-        # in published curves is partly an artefact of the cosine's own
-        # natural slowdown near its peak; adding an explicit linear stand
-        # on top double-counts that flatness AND compresses the cosine
-        # portion to be too steep through the mid-flood. Pure cosine is
-        # the better approximation, even though it has a residual +0.13m
-        # mid-flood bias that a different curve shape would address.
+        #   1. LW stand then cosine (v2.5.3+, current production):
+        #      Linear rise for the first flood_lw_stand_minutes after LW,
+        #      lifting the water by flood_lw_stand_rise_fraction of the
+        #      flood range, then a half-cosine from that level up to HW.
+        #      Models the documented Solent young-flood-stand effect:
+        #      early-flood inflows arriving around the Isle of Wight are
+        #      out of phase with the main flood and briefly pause the
+        #      rise just after LW.
         #
-        # The 'stand_duration_minutes' and 'stand_height_fraction'
-        # parameters in model_config.json apply only to the ebb branch
-        # below.
+        #   2. Pure half-cosine (pre-v2.5.3 fallback): if either
+        #      flood_lw_stand_minutes or flood_lw_stand_rise_fraction is
+        #      zero or absent, the rise from LW to HW follows a standard
+        #      half-cosine smoothstep. This was production behaviour up
+        #      to v2.5.2 and had a residual +0.13m mid-flood mean bias
+        #      against the 16-day UKHO corpus.
+        #
+        # Parameter semantics: rise_fraction is the fraction of the
+        # flood RANGE that the water lifts during the stand, NOT the
+        # fraction of LW absolute height. The ebb stand below uses a
+        # fraction of HW absolute height (historical accident); the two
+        # forms differ because LW heights in Langstone are small (0.5-
+        # 1.5m typical) and a fraction of LW would be physically
+        # negligible, whereas HW heights are large enough that fraction-
+        # of-HW is meaningful.
+        #
+        # An earlier attempt added a *pre-HW* stand symmetric to the
+        # ebb stand. It was rolled back: the corpus showed it more than
+        # doubled flood RMS by double-counting the cosine's own natural
+        # slowdown near its peak. The LW-stand form here acts at the
+        # opposite end of the flood, where the cosine's natural rise is
+        # fastest and the empirical data shows a real depression.
+        #
+        # Tuned 30 April 2026 against the 16-day UKHO corpus via
+        # scripts/sweep_flood_curve.py: 60min / rise_fraction=0.08 gives
+        # flood mean +0.016m (was +0.134m), RMS 0.219m (was 0.290m).
+        lw_stand_mins = curve.get("flood_lw_stand_minutes", 0)
+        lw_stand_frac = curve.get("flood_lw_stand_rise_fraction", 0)
+
+        if lw_stand_mins > 0 and lw_stand_frac > 0 and total_seconds > 0:
+            # Cap stand at 50% of flood span. Combinations beyond this
+            # are unphysical (no room for the post-stand cosine to reach
+            # HW); the cap is a defensive bound for misconfiguration.
+            stand_proportion = min((lw_stand_mins * 60) / total_seconds, 0.5)
+            range_m = h_after - h_before
+            stand_top = h_before + range_m * lw_stand_frac
+
+            if fraction < stand_proportion:
+                # Linear rise during the young-flood stand.
+                return h_before + (stand_top - h_before) * (fraction / stand_proportion)
+
+            # Cosine from the top of the stand up to HW.
+            adjusted = (fraction - stand_proportion) / (1 - stand_proportion)
+            return _cosine_interp(adjusted, stand_top, h_after)
+
+        # Pure cosine fallback (legacy, pre-v2.5.3 behaviour).
         return _cosine_interp(fraction, h_before, h_after)
     elif et_before == "HighWater" and et_after == "LowWater":
         # Ebbing tide - apply asymmetry via stand effect
