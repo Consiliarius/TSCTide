@@ -22,21 +22,11 @@ logger = logging.getLogger(__name__)
 # Module-level cache for model config tidal curve parameters.
 # load_model_config() parses a JSON file on every call; at 3-minute
 # interpolation intervals over a 7-hour window this is called thousands
-# of times per calculation. The config is effectively static between
-# API calls, so cache it on first access.
-# Call invalidate_model_config_cache() after save_model_config() to ensure
-# the next calculation picks up any user edits.
+# of times per calculation. The bundled config is read-only at runtime
+# and effectively static for the lifetime of the process, so cache it
+# on first access. The deliberate refresh trigger is a container
+# restart, which reinitialises the process and discards the cache.
 _cached_curve_params: Optional[dict] = None
-
-
-def invalidate_model_config_cache():
-    """
-    Clear the cached tidal curve parameters.
-    Must be called after save_model_config() so that subsequent
-    calculations use the updated values.
-    """
-    global _cached_curve_params
-    _cached_curve_params = None
 
 
 def _get_curve_params() -> dict:

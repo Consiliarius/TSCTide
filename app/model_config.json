@@ -1,6 +1,6 @@
 {
     "_comment": "Tidal Access Model Configuration. Tidal curve parameters used by access window calculator. Harmonic constants and secondary port offsets are documented here for reference but are currently implemented in harmonic.py and secondary_port.py respectively.",
-    "_version": "2.5.4",
+    "_version": "2.5.5",
     "_last_updated": "2026-04-30",
 
     "secondary_port_offset": {

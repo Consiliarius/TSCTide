@@ -17,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from dateutil import parser as dtparse
 
 from app.config import (
-    ensure_dirs, load_model_config, save_model_config,
+    ensure_dirs, load_model_config,
     FEEDS_DIR, DEFAULT_TIMEZONE, UKHO_STATION_ID, OWM_API_KEY,
     to_utc_str,
 )
@@ -43,7 +43,7 @@ from app.khm_parser import parse_khm_paste
 from app.harmonic import predict_events as harmonic_predict_events
 from app.secondary_port import apply_offset
 from app.wind import fetch_current_wind, should_apply_offset
-from app.access_calc import compute_access_windows, generate_event_uid, invalidate_model_config_cache
+from app.access_calc import compute_access_windows, generate_event_uid
 from app.ical_manager import (
     generate_export_ics, store_windows_as_events,
     generate_feed_for_mooring,
@@ -294,7 +294,7 @@ async def lifespan(app: FastAPI):
     """Application startup and shutdown."""
     ensure_dirs()
     init_db()
-    load_model_config()  # Ensures default config is copied to data dir
+    load_model_config()  # Loads bundled config and warms the cache via _get_curve_params on first calc
     start_scheduler()
     logger.info("Tidal Access application started")
     yield
@@ -1389,19 +1389,17 @@ async def serve_feed(mooring_id: int):
 
 @app.get("/api/model-config")
 async def get_model_config():
-    """Get the current model configuration."""
+    """
+    Get the current model configuration.
+
+    Returns the bundled model configuration shipped with the application.
+    Read-only as of v2.5.5; the previous POST endpoint was removed because
+    it wrote to a volume-persisted operative copy that the cached loader
+    never picked up - silently lossy. The configuration now lives only in
+    app/model_config.json in the repo and reaches running containers via
+    rebuild + restart.
+    """
     return load_model_config()
-
-
-@app.post("/api/model-config")
-async def update_model_config(request: Request):
-    """Update the model configuration."""
-    data = await request.json()
-    save_model_config(data)
-    # Invalidate the cached tidal curve parameters so the next calculation
-    # picks up any changes to stand_duration_minutes, stand_height_fraction, etc.
-    invalidate_model_config_cache()
-    return {"status": "saved"}
 
 
 # --- Tide Data ---

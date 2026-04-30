@@ -53,7 +53,18 @@ DEFAULT_TIMEZONE = os.environ.get("DEFAULT_TIMEZONE", "Europe/London")
 # were removed. All mooring and wind data is stored in SQLite.
 FEEDS_DIR = DATA_DIR / "feeds"
 DB_PATH = DATA_DIR / "tides.db"
-MODEL_CONFIG_PATH = DATA_DIR / "model_config.json"
+
+# Bundled model configuration shipped with the application. Read-only at
+# runtime as of v2.5.5; see CALIBRATION_NOTES.md and config history for
+# rationale.
+#
+# Previously the file was copied to /app/data/model_config.json on first
+# run and that operative copy was used thereafter. That arrangement was
+# designed to support a UI for live-editing model parameters; no such UI
+# was ever built, the cache-invalidation path was never wired up, and the
+# operative copy diverged from the bundled file silently across rebuilds.
+# See git history for the v2.5.5 change that removed the persistence.
+_BUNDLED_MODEL_CONFIG_PATH = APP_DIR / "model_config.json"
 
 
 def ensure_dirs():
@@ -63,22 +74,19 @@ def ensure_dirs():
 
 
 def load_model_config() -> dict:
-    """Load model config from data dir, falling back to bundled default."""
-    if MODEL_CONFIG_PATH.exists():
-        with open(MODEL_CONFIG_PATH) as f:
-            return json.load(f)
-    # Copy bundled default to data dir on first run
-    bundled = APP_DIR / "model_config.json"
-    if bundled.exists():
-        with open(bundled) as f:
-            cfg = json.load(f)
-        save_model_config(cfg)
-        return cfg
-    return {}
+    """
+    Load the bundled model configuration from app/model_config.json.
 
+    The file is read-only at runtime. Edits must be made in the source
+    repository and applied via container rebuild + restart. The
+    `access_calc._get_curve_params` cache holds the parsed values for
+    the lifetime of the process; restart is the deliberate refresh
+    trigger.
 
-def save_model_config(cfg: dict):
-    """Persist model config to data dir."""
-    ensure_dirs()
-    with open(MODEL_CONFIG_PATH, "w") as f:
-        json.dump(cfg, f, indent=4)
+    Returns an empty dict if the bundled file is absent (which would
+    indicate a packaging fault rather than normal operation).
+    """
+    if not _BUNDLED_MODEL_CONFIG_PATH.exists():
+        return {}
+    with open(_BUNDLED_MODEL_CONFIG_PATH) as f:
+        return json.load(f)

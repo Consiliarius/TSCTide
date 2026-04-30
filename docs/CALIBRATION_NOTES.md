@@ -1,7 +1,7 @@
 # Calibration notes
 
 State of the tidal model and harmonic prediction calibration as of
-30 April 2026, post-v2.5.4 (continuous monitoring deployment).
+30 April 2026, post-v2.5.5 (model_config.json persistence removed).
 Records what has been refined, what has not, and the tradeoffs that
 remain open.
 
@@ -351,90 +351,35 @@ The timing offset is independently supported by both the original
 April 2026 validation and the 16-day corpus. Only the height offset
 was removed in v2.5.2.
 
-## How to ensure model_config.json changes reach the running app
+## How to update the model configuration
 
-There is a known wrinkle in how `model_config.json` is loaded that has
-caused confusion this session and will catch out future operators if
-not documented.
+As of v2.5.5 the model configuration lives only in the bundled file
+`app/model_config.json` in the repository. The previous arrangement
+persisted an operative copy at `/app/data/model_config.json` in the
+Docker volume; this caused silent staleness on image rebuilds because
+the operative copy was preferred over the bundled default once it
+existed, and the staleness was not visible to the operator until a
+calibration test exposed it. The persistence has been removed.
 
-### Where the config lives
+To apply a change to the model configuration:
 
-There are two copies of `model_config.json` at runtime:
+  1. Edit `app/model_config.json` in the repo.
+  2. Rebuild and restart the container:
+     ```
+     docker compose up -d --build
+     docker restart tidal-access
+     ```
 
-  - **Bundled default**: `/app/app/model_config.json` (inside the
-    Docker image, copied during build from `app/model_config.json` in
-    the repo).
-  - **Operative copy**: `/app/data/model_config.json` (in the bind-
-    mounted Docker volume `./data:/app/data`).
+No `docker cp` step is needed. The bundled file is read at startup
+and cached in `access_calc._get_curve_params` for the lifetime of
+the process. Container restart is the deliberate refresh trigger.
 
-The bundled default is read **only** on first run when the operative
-copy does not yet exist - `load_model_config()` copies it into the
-volume. From that point onward, the operative copy is the source of
-truth. The bundled default is ignored.
+If an old deployment has a `data/model_config.json` file left over
+from pre-v2.5.5, it is now orphaned and ignored. Optionally delete
+it for cleanliness; leaving it in place has no effect on behaviour.
 
-### Consequence: rebuilds do not pick up new defaults
-
-When the repo's `app/model_config.json` is updated and the image is
-rebuilt with `docker compose up -d --build`, the new bundled default
-does not reach the running app. The operative copy in the volume still
-contains the previous version.
-
-### How to apply changes correctly
-
-Two reliable methods:
-
-**Option A: copy the new file directly into the volume.** This is
-the surgical fix - updates the runtime config, no restart needed,
-preserves any user customisations to other parts of the file (none
-exist today, but the pattern is future-proof).
-
-```
-docker cp app/model_config.json tidal-access:/app/data/model_config.json
-```
-
-**Option B: delete the volume copy and let it re-populate.** Simpler
-to remember; loses any user customisations to the file (currently
-none).
-
-```
-docker exec tidal-access rm /app/data/model_config.json
-docker restart tidal-access
-```
-
-Either works. The next call to `load_model_config()` will read the
-updated values.
-
-### Caching
-
-`access_calc._get_curve_params()` caches the loaded config in module-
-level state. Long-running processes (the FastAPI server, the
-APScheduler thread) will continue to use the old values until either:
-
-  - The cache is invalidated via `invalidate_model_config_cache()`,
-    which is called automatically by `save_model_config()`.
-  - The process is restarted.
-
-For an out-of-band update via Option A or B, the safe approach is to
-restart the container:
-
-```
-docker restart tidal-access
-```
-
-This is fast (< 5 seconds) and guarantees a fresh cache.
-
-The calibration script `calibrate_from_ukho_week.py` runs as a
-short-lived process so the cache is naturally fresh on each
-invocation - no restart needed when running analysis.
-
-### Long-term improvement
-
-The volume-persistence of `model_config.json` was implemented
-anticipating a UI for users to edit model parameters. That UI does
-not exist and there is no plan for one. The cost of the current
-arrangement is silent staleness on rebuild. A possible future
-refactor: stop persisting the file, read the bundled default every
-time. Single source of truth, no admin step needed for upgrades.
-
-Not undertaken in this session. Worth considering when next touching
-`app/config.py`.
+The calibration scripts (`calibrate_from_ukho_week.py`,
+`sweep_ebb_params.py`, `sweep_flood_curve.py`) run as short-lived
+processes so the cache is naturally fresh on each invocation. The
+sweep scripts mutate `_cached_curve_params` directly to inject test
+parameters; this remains the supported pattern for ad-hoc analysis.

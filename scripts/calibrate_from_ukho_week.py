@@ -78,7 +78,11 @@ import pytz
 
 from app.access_calc import interpolate_height_at_time
 from app.harmonic import predict_height_at_time, predict_events
-from app.secondary_port import apply_offset
+from app.secondary_port import (
+    apply_offset,
+    HW_TIME_OFFSET_MINUTES,
+    HW_HEIGHT_OFFSET_M,
+)
 
 # Where the input data lives. The script discovers all .csv files in this
 # directory regardless of filename. Path resolution handles three layouts:
@@ -100,10 +104,14 @@ _CANDIDATE_DIRS = [
 ]
 DATA_DIR = next((d for d in _CANDIDATE_DIRS if d.exists()), _CANDIDATE_DIRS[0])
 
-# Constants from app.secondary_port - duplicated here rather than imported
-# to avoid coupling the analysis script to the offset constants.
-SECONDARY_HW_MINUTES = 9
-SECONDARY_HW_HEIGHT_M = 0.05
+# Constants from app.secondary_port - imported rather than copied so the
+# uniform-offset variant (b) of the harmonic test always uses the live
+# values. Earlier the script duplicated 9min/0.05m as local constants;
+# this drifted out of sync when the height offset was reduced to 0.0m
+# in v2.5.x and the script's variant (b) silently kept simulating the
+# obsolete value. Importing eliminates that class of bug.
+SECONDARY_HW_MINUTES = HW_TIME_OFFSET_MINUTES
+SECONDARY_HW_HEIGHT_M = HW_HEIGHT_OFFSET_M
 
 LONDON = pytz.timezone("Europe/London")
 
@@ -471,7 +479,7 @@ def run_harmonic_test(samples: list[dict]) -> None:
     print(f"  (a) Raw (Portsmouth as Langstone, no offset):")
     print(f"      {fmt_stats(stats(raw_resid))}")
     print()
-    print(f"  (b) Uniform offset (sampled -9min, +0.05m height):")
+    print(f"  (b) Uniform offset (sampled -{SECONDARY_HW_MINUTES}min, +{SECONDARY_HW_HEIGHT_M:.2f}m height):")
     print(f"      {fmt_stats(stats(offset_resid))}")
     print()
 

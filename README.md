@@ -99,11 +99,10 @@ tidal-access/
 │   ├── access_calc.py        # Window calculation engine
 │   ├── ical_manager.py       # iCal feed + export generation
 │   ├── scheduler.py          # APScheduler jobs
-│   ├── model_config.json     # Model parameters reference
+│   ├── model_config.json     # Model parameters (read-only at runtime)
 │   └── static/index.html     # Web UI
 └── data/                     # Docker volume (persistent)
     ├── tides.db              # SQLite database
-    ├── model_config.json     # Editable model parameters
     └── feeds/                # Generated .ics files
 ```
 
