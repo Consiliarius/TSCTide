@@ -25,6 +25,9 @@ the 16-day calibration corpus. See app/secondary_port.py for the full rationale.
 import logging
 from datetime import datetime, timezone, timedelta
 
+from app.config import get_secondary_port_offset
+from app.secondary_port import HW_TIME_OFFSET_MINUTES
+
 logger = logging.getLogger(__name__)
 
 
@@ -125,8 +128,17 @@ def parse_khm_paste(text: str, year: int = None, is_bst: bool = True) -> list[di
             # through curve interpolation; see app/secondary_port.py for
             # the analysis. LW times/heights are effectively identical
             # between ports.
+            #
+            # The offset value comes from model_config.json via the
+            # config accessor (with the secondary_port module-level
+            # constant as fallback), keeping this file aligned with
+            # secondary_port.apply_offset() without duplicating the
+            # number locally.
             if p["type"] == "HighWater":
-                utc_dt = utc_dt + timedelta(minutes=9)
+                hw_offset_minutes = get_secondary_port_offset(
+                    "hw_time_offset_minutes", HW_TIME_OFFSET_MINUTES
+                )
+                utc_dt = utc_dt + timedelta(minutes=hw_offset_minutes)
 
             events.append({
                 "timestamp": utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),

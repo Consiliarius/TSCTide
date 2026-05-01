@@ -1,7 +1,8 @@
 # Calibration notes
 
 State of the tidal model and harmonic prediction calibration as of
-30 April 2026, post-v2.5.5 (model_config.json persistence removed).
+30 April 2026, post-v2.5.6 (hardcoded model constants migrated to
+model_config.json).
 Records what has been refined, what has not, and the tradeoffs that
 remain open.
 
@@ -350,6 +351,119 @@ optimal. Going wider does not help.
 The timing offset is independently supported by both the original
 April 2026 validation and the 16-day corpus. Only the height offset
 was removed in v2.5.2.
+
+## Hardcoded constants migration (v2.5.6)
+
+A targeted migration of the model's tunable physical constants from
+hardcoded Python values into `model_config.json`, completing the path
+started by v2.5.5. The audit done during v2.5.5 noted that several
+entries in `model_config.json` were nominally documented but not
+actually consulted at runtime, while the live values lived in .py
+modules. v2.5.6 closes that gap for the values that are genuinely
+tunable per-deployment.
+
+### Scope
+
+Migrated to JSON, now read at runtime via accessors in `app/config.py`:
+
+  - `harmonic_reference.mean_level_m` (Z0 in `harmonic.py`)
+  - `harmonic_reference.constituents` (HARMONICS in `harmonic.py`)
+  - `secondary_port_offset.*` (4 offsets in `secondary_port.py`,
+    plus the `+9 min` literal previously inline in `khm_parser.py`)
+  - `cycle_number.epoch_iso` and `cycle_number.avg_cycle_hours`
+    (the cycle constants previously triplicated across
+    `access_calc.py`, `ical_manager.py`, and `database.py`, plus a
+    fourth copy inside the `init_db` migration backfill)
+
+Left hardcoded by deliberate decision:
+
+  - `SPEEDS` and `DOODSON` in `harmonic.py` - constituent angular
+    speeds and Doodson multipliers are physical constants of the
+    harmonic-prediction algorithm itself, not tuning parameters.
+    Editability is risk, not feature.
+  - The nodal-correction coefficients in `harmonic._nodal` - same
+    character: physical constants of the algorithm.
+  - `HW_ADMIRALTY_OFFSET_MINUTES` and `LW_ADMIRALTY_OFFSET_MINUTES`
+    in `harmonic.py` - data-derived corrections from a 710-point
+    validation set; alteration without revalidation invalidates the
+    accuracy claims.
+
+### Failure mode (lenient)
+
+If any migrated key is missing or malformed in `model_config.json`,
+the corresponding .py module-level constant is used as a fallback
+and a single INFO log line is emitted per (process, json_path) on
+first use. Subsequent fallbacks for the same path during the same
+process are silent. This preserves backward compatibility - an
+empty or absent `model_config.json` still produces correct
+predictions - at the cost that drift between JSON and .py defaults
+can go unnoticed unless the operator inspects logs. This is
+deliberate; the alternative (fail-fast) was rejected because the
+bundled JSON is part of the image and a missing key during local
+development should not break the whole app.
+
+The `harmonic_reference.constituents` accessor is all-or-nothing:
+if any one of the 19 constituents has a malformed amplitude or
+phase_lag, the entire dict reverts to the .py default rather than
+mixing JSON values with .py values. Harmonic synthesis combines
+all 19 in a sum, so a partial mix would produce subtly wrong
+predictions that pass silent validation.
+
+### Treatment of .py defaults
+
+Module-level constants are kept as readable documentation and as
+the fallback target. Each file's top-of-section comment block was
+updated to make this explicit:
+
+> Reference defaults. The values actually used at runtime come from
+> model_config.json (loaded via app.config.get_X). These constants
+> are kept here as readable documentation and as a fallback if the
+> JSON is missing or malformed. To change the model behaviour, edit
+> the JSON; do not edit these.
+
+The one exception is the cycle-number constants. Their .py defaults
+live in `app/config.py` (not duplicated across the three consuming
+modules) so the deduplication is genuine. `harmonic.py` and
+`secondary_port.py` keep their own .py defaults because each is the
+natural home for its own values.
+
+### Caching and refresh
+
+Each accessor caches its resolved value (or the fallback) in
+`app.config._resolved_cache` for the lifetime of the process.
+Hot-path callers (`predict_height_at_time` is invoked tens of
+thousands of times per scheduled run) bind the accessor return to
+a local variable once per outer call to avoid repeated dict access
+in the inner loop. Container restart is the deliberate refresh
+trigger; there is no in-process invalidation path. Same model as
+`access_calc._get_curve_params`.
+
+### Cycle-number constants - critical safety note
+
+The `cycle_number.epoch_iso` and `cycle_number.avg_cycle_hours`
+values ARE the dedup key for stored rows in
+`harmonic_predictions.cycle_number` AND form part of every iCal
+event UID issued. The bundled values are bit-for-bit identical to
+the pre-migration hardcoded values (epoch 2026-01-01T00:00:00Z,
+12.4167 hours). They MUST NOT be changed without a database
+migration plan covering the full data lifecycle; doing so would
+invalidate every existing UID (calendar apps see delete-and-re-add)
+and break the dedup index in `harmonic_predictions`.
+
+A matching warning is included in the JSON file alongside those
+keys.
+
+### Validation
+
+Numeric behaviour must be unchanged. Post-deploy validation runs
+`scripts/calibrate_from_ukho_week.py` and confirms residual statistics
+match v2.5.5 to three decimal places. If any number drifts, the
+migration changed math behaviour and must be rolled back.
+
+The sweep scripts (`scripts/sweep_flood_curve.py`,
+`scripts/sweep_ebb_params.py`) continue to work unchanged because
+they mutate `access_calc._cached_curve_params` directly; the new
+accessors do not affect them.
 
 ## How to update the model configuration
 

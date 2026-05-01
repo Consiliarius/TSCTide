@@ -16,9 +16,17 @@ import math
 import logging
 from datetime import datetime, timedelta, timezone
 
+from app.config import get_z0, get_harmonics
+
 logger = logging.getLogger(__name__)
 
-# Mean level above Chart Datum (m)
+# Reference defaults. The values actually used at runtime come from
+# model_config.json (loaded via app.config.get_z0). These constants
+# are kept here as readable documentation and as a fallback if the
+# JSON is missing or malformed. To change the model behaviour, edit
+# the JSON; do not edit these.
+#
+# Mean level above Chart Datum (m).
 Z0 = 2.8846
 
 # Constituent speeds (degrees/hour)
@@ -45,6 +53,13 @@ DOODSON = {
 }
 
 # Harmonic constants for Portsmouth (amplitude in metres, phase lag in degrees).
+#
+# Reference defaults. The values actually used at runtime come from
+# model_config.json (loaded via app.config.get_harmonics). These
+# constants are kept here as readable documentation and as a fallback
+# if the JSON is missing or malformed. To change the model behaviour,
+# edit the JSON; do not edit these.
+#
 # Calibrated April 2026 against Admiralty reference data:
 #   - 91 HW/LW points spanning May-December 2026
 #   - 7 additional spring HW reference points
@@ -116,13 +131,21 @@ def _nodal(dt: datetime) -> tuple:
 
 
 def predict_height_at_time(dt: datetime) -> float:
-    """Predict tide height at a specific datetime (UTC). Returns metres above CD."""
+    """Predict tide height at a specific datetime (UTC). Returns metres above CD.
+
+    Hot path. Resolves Z0 and the constituent dict via the config
+    accessors once per call (the accessors cache after first use, so
+    the JSON is parsed at most once per process). The local variables
+    below avoid repeated dict access in the inner loop.
+    """
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
+    z0 = get_z0(Z0)
+    harmonics = get_harmonics(HARMONICS)
     tau, s, h, p, N, p1 = _astro(dt)
     f, u = _nodal(dt)
-    height = Z0
-    for name, (amp, g) in HARMONICS.items():
+    height = z0
+    for name, (amp, g) in harmonics.items():
         d = DOODSON.get(name)
         if not d:
             continue

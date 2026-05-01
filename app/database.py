@@ -8,7 +8,7 @@ from pathlib import Path
 from contextlib import contextmanager
 from typing import Optional
 
-from app.config import DB_PATH, ensure_dirs, to_utc_str
+from app.config import DB_PATH, ensure_dirs, to_utc_str, compute_cycle_number
 
 logger = logging.getLogger(__name__)
 
@@ -183,25 +183,20 @@ def init_db():
         conn.execute(
             "ALTER TABLE harmonic_predictions ADD COLUMN cycle_number INTEGER"
         )
-        # Backfill: compute cycle_number from each row's stored timestamp.
-        # Formula duplicated here so the migration is self-contained and
-        # does not depend on _compute_cycle_number being already importable
-        # at this point in module init.
-        epoch = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        # Backfill: compute cycle_number from each row's stored timestamp
+        # using the shared helper. As of v2.5.6 the cycle constants live
+        # in model_config.json (with .py defaults as fallback); routing
+        # the migration through the same helper ensures backfilled values
+        # match those produced by store_harmonic_predictions on subsequent
+        # writes. The previous self-contained copy of the constants was
+        # replaced because app.config is already imported at the top of
+        # this module, so there is no circular-import risk to defend
+        # against.
         rows = conn.execute(
             "SELECT id, timestamp FROM harmonic_predictions"
         ).fetchall()
         for r in rows:
-            ts = r["timestamp"]
-            if ts.endswith("Z"):
-                ts_iso = ts[:-1] + "+00:00"
-            else:
-                ts_iso = ts
-            dt = datetime.fromisoformat(ts_iso)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            hours = (dt - epoch).total_seconds() / 3600.0
-            cyc = round(hours / 12.4167)
+            cyc = compute_cycle_number(r["timestamp"])
             conn.execute(
                 "UPDATE harmonic_predictions SET cycle_number = ? WHERE id = ?",
                 (cyc, r["id"])
@@ -1125,9 +1120,18 @@ def cleanup_old_tide_data(days: int = 365):
 #   - get_ukho_tide_events / get_tide_events / load_classification_inputs
 #     all query tide_data only and never see harmonic_predictions.
 
+# Reference defaults. The values actually used at runtime come from
+# model_config.json (loaded via app.config.compute_cycle_number). These
+# constants are kept here as readable documentation and as a fallback
+# if the JSON is missing or malformed. To change the model behaviour,
+# edit the JSON; do not edit these.
+#
 # Constants for cycle-based deduplication. Match the values used by
-# access_calc.generate_event_uid and ical_manager._tide_event_uid; kept
-# duplicated here so database.py has no upward dependency on either.
+# access_calc.generate_event_uid and ical_manager._tide_event_uid.
+# Critically, these values are the dedup key for stored rows in
+# harmonic_predictions.cycle_number; changing them invalidates every
+# existing row's cycle assignment and must not be done without a
+# database migration.
 _HARM_CYCLE_EPOCH = datetime(2026, 1, 1, tzinfo=timezone.utc)
 _HARM_CYCLE_HOURS = 12.4167
 
@@ -1139,15 +1143,14 @@ def _compute_cycle_number(timestamp_iso: str) -> int:
     re-computed from a slightly different sample grid produces timestamps
     differing by seconds; the rounded cycle number is stable under such
     drift, making it a robust dedup key.
+
+    Thin wrapper around app.config.compute_cycle_number so the dedup
+    key matches what access_calc.generate_event_uid and
+    ical_manager._tide_event_uid produce. Local function kept rather
+    than calling the helper directly at every call site to preserve
+    the documented module-level API.
     """
-    ts = timestamp_iso
-    if ts.endswith("Z"):
-        ts = ts[:-1] + "+00:00"
-    dt = datetime.fromisoformat(ts)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    hours = (dt - _HARM_CYCLE_EPOCH).total_seconds() / 3600.0
-    return round(hours / _HARM_CYCLE_HOURS)
+    return compute_cycle_number(timestamp_iso)
 
 
 def store_harmonic_predictions(events: list[dict]) -> int:
