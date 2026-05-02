@@ -1,7 +1,7 @@
 {
     "_comment": "Tidal Access Model Configuration. Tidal curve parameters used by access window calculator, harmonic-model parameters (mean level, constituents), Portsmouth-Langstone secondary port offsets, and cycle-numbering constants are all read at runtime as of v2.5.6. SPEEDS, DOODSON, nodal-correction coefficients, and the Admiralty convention offsets in harmonic.py remain hardcoded by design (they are physical constants of the harmonic-prediction algorithm or data-derived corrections, not tuning parameters).",
-    "_version": "2.5.6",
-    "_last_updated": "2026-04-30",
+    "_version": "2.5.7",
+    "_last_updated": "2026-05-01",
 
     "secondary_port_offset": {
         "_comment": "Portsmouth to Langstone Harbour corrections. Read at runtime by app.config.get_secondary_port_offset and consumed by secondary_port.apply_offset and khm_parser.parse_khm_paste. Module-level constants in those .py files are kept as reference defaults and as a fallback if any of these JSON keys are missing or malformed. Original validation April 2026 against UKHO half-hourly data for both ports observed HW height delta 0.0-0.1m. The 16-day calibration corpus subsequently showed that propagating a 0.05m HW height bump through curve interpolation introduced a +0.05m production-path mean bias with no offsetting RMS improvement; the height offset has been removed (set to 0). LW heights remain effectively identical between ports.",
@@ -13,14 +13,14 @@
 
     "tidal_curve": {
         "_comment": "Parameters for Langstone Harbour asymmetric tidal curve used to interpolate heights between HW/LW events. Applied to BOTH phases as of v2.5.3: flood has a young-flood stand near LW, ebb has a stand near HW. Read at runtime by access_calc._get_curve_params().",
-        "stand_duration_minutes": 70,
-        "stand_height_fraction": 0.96,
+        "stand_duration_minutes": 75,
+        "stand_height_fraction": 0.94,
         "flood_lw_stand_minutes": 60,
         "flood_lw_stand_rise_fraction": 0.08,
         "_unused": "flood_duration_fraction and ebb_duration_fraction are retained below for documentation only. They are not applied in access_calc._curve_interpolate(); the actual HW/LW event timestamps already encode the asymmetric flood/ebb duration, so applying a further fraction correction would double-count it.",
         "flood_duration_fraction": 0.42,
         "ebb_duration_fraction": 0.58,
-        "_notes": "Two stands are configured. Ebb stand near HW (stand_duration_minutes, stand_height_fraction) recalibrated 29 April 2026 against a 16-day half-hourly UKHO corpus: 70min / 96% selected by sweep over 28 combinations; see scripts/sweep_ebb_params.py. Result: ebb mean residual +0.002m, ebb RMS 0.139m (was 0.278m, 50% improvement). Flood stand near LW (flood_lw_stand_minutes, flood_lw_stand_rise_fraction) added 30 April 2026 against the same 16-day corpus: 60min / 8% selected by sweep over 35 combinations across two parameterisations; see scripts/sweep_flood_curve.py. Models the documented Solent young-flood-stand effect (out-of-phase early-flood inflows around the Isle of Wight). Result: flood mean residual +0.016m (was +0.134m), flood RMS 0.219m (was 0.290m, 24% improvement). Note: flood_lw_stand_rise_fraction is fraction of FLOOD RANGE (HW - LW), unlike stand_height_fraction which is fraction of HW absolute height; this asymmetry is intentional because LW heights in Langstone are small and fraction-of-LW would be physically negligible. Setting either flood_lw_stand_minutes or flood_lw_stand_rise_fraction to 0 reverts the flood to pure cosine (pre-v2.5.3 behaviour)."
+        "_notes": "Two stands are configured. Ebb stand near HW (stand_duration_minutes, stand_height_fraction) re-tuned 1 May 2026 against the expanded 18-day corpus to 75min / 94%, replacing v2.5.3's selection of 70min / 96%. The original v2.5.3 sweep (scripts/sweep_ebb_params.py) had a defect: it overwrote the cached curve params dict with only the ebb keys, silently disabling the v2.5.3 flood stand during the sweep. Re-running with the corrected sweep (which preserves the flood-stand keys, matching production) shifted the optimum from 70/96 to 75/94. Improvement on 18-day corpus: ebb |mean| +0.013 -> -0.006m, ebb RMS 0.137 -> 0.129m, all-RMS 0.187 -> 0.184m. Marginal absolute magnitude (~3sigma at corpus size) but consistent across all three 'best' criteria; mean shift direction is safety-positive on the ebb (slight under-prediction is conservative). Flood stand near LW (flood_lw_stand_minutes, flood_lw_stand_rise_fraction) was re-evaluated against the 18-day corpus on 1 May 2026 and v2.5.3's selection of 60min / 8% was retained: alternatives offered specific tradeoffs but no dominant winner. See scripts/sweep_flood_curve.py. Original v2.5.3 selection rationale: 60/8 selected by sweep over 35 combinations across two parameterisations against 16-day corpus; models the documented Solent young-flood-stand effect (out-of-phase early-flood inflows around the Isle of Wight). v2.5.3 flood improvement: mean +0.134m -> +0.016m, RMS 0.290m -> 0.219m. Note: flood_lw_stand_rise_fraction is fraction of FLOOD RANGE (HW - LW), unlike stand_height_fraction which is fraction of HW absolute height; this asymmetry is intentional because LW heights in Langstone are small and fraction-of-LW would be physically negligible. Setting either flood_lw_stand_minutes or flood_lw_stand_rise_fraction to 0 reverts the flood to pure cosine (pre-v2.5.3 behaviour)."
     },
 
     "admiralty_convention_offset": {

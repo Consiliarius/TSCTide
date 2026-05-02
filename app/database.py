@@ -400,8 +400,36 @@ def get_calendar_enabled_moorings() -> list[dict]:
 # --- Observations ---
 
 def add_observation(data: dict) -> dict:
-    """Add an observation record."""
+    """
+    Add an observation record.
+
+    The supplied timestamp is normalised to a UTC ISO-Z second-precision
+    string before insert so that all stored observations share one format,
+    regardless of which caller (XLSX upload, JSON API) wrote them. Without
+    this, timestamps from the JSON `POST /observations` path could carry
+    "+00:00" suffixes, fractional seconds, or naive local times, breaking
+    string-based ORDER BY and equality comparisons elsewhere.
+
+    Naive timestamps are interpreted as DEFAULT_TIMEZONE (matching the
+    XLSX upload flow's documented "Times are local time" convention).
+    """
     now = to_utc_str(datetime.now(timezone.utc))
+    raw_ts = data["timestamp"]
+    try:
+        if isinstance(raw_ts, datetime):
+            dt = raw_ts
+        else:
+            from dateutil import parser as _dtparse
+            dt = _dtparse.parse(str(raw_ts))
+        if dt.tzinfo is None:
+            import pytz
+            from app.config import DEFAULT_TIMEZONE
+            dt = pytz.timezone(DEFAULT_TIMEZONE).localize(dt)
+        normalized_ts = to_utc_str(dt)
+    except (ValueError, TypeError) as e:
+        # Surface unparseable input rather than silently corrupting the row.
+        raise ValueError(f"Could not parse observation timestamp {raw_ts!r}: {e}")
+
     with db_connection() as conn:
         cursor = conn.execute("""
             INSERT INTO observations (mooring_id, timestamp, state, wind_direction,
@@ -409,14 +437,16 @@ def add_observation(data: dict) -> dict:
             VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (
             data["mooring_id"],
-            data["timestamp"],
+            normalized_ts,
             data["state"],
             data.get("wind_direction", ""),
             data.get("direction_of_lay", ""),
             data.get("notes", ""),
             now
         ))
-        return {"id": cursor.lastrowid, **data}
+        # Return the stored (normalised) timestamp so callers see what the
+        # DB actually holds, not what they sent.
+        return {"id": cursor.lastrowid, **data, "timestamp": normalized_ts}
 
 
 def get_observations(mooring_id: int) -> list[dict]:
@@ -600,6 +630,13 @@ def record_failed_pin_attempt(mooring_id: int,
         continue to be rejected by check_pin_lockout before reaching
         this function.
 
+    The increment is performed by a single UPSERT statement with CASE
+    expressions, so two concurrent failed attempts cannot interleave a
+    SELECT/UPDATE pair and lose an increment. The previous read-then-write
+    implementation had a small race window under WAL: both connections
+    could observe failed_count=N before either committed, then each
+    write N+1.
+
     Returns: {
         "failed_count":        current count,
         "attempts_remaining": max(0, max_attempts - failed_count),
@@ -608,45 +645,54 @@ def record_failed_pin_attempt(mooring_id: int,
     """
     now = datetime.now(timezone.utc)
     now_str = to_utc_str(now)
-    window = timedelta(minutes=window_minutes)
+    window_cutoff = to_utc_str(now - timedelta(minutes=window_minutes))
+    lockout_until = to_utc_str(now + timedelta(minutes=lockout_minutes))
 
     with db_connection() as conn:
-        row = conn.execute(
-            "SELECT failed_count, first_failed_at, locked_until "
-            "FROM pin_failed_attempts WHERE mooring_id = ?",
-            (mooring_id,)
-        ).fetchone()
-
-        if row is None:
-            failed_count = 1
-            first_failed_at = now_str
-        else:
-            first_seen = dtparse_iso(row["first_failed_at"])
-            if (now - first_seen) > window:
-                # Previous window expired; start a new one.
-                failed_count = 1
-                first_failed_at = now_str
-            else:
-                failed_count = row["failed_count"] + 1
-                first_failed_at = row["first_failed_at"]
-
-        locked_until_str = None
-        if failed_count >= max_attempts:
-            locked_until_str = to_utc_str(
-                now + timedelta(minutes=lockout_minutes)
-            )
-
+        # Single atomic UPSERT. Branches inside the CASE expressions
+        # implement: "if the existing first_failed_at is older than the
+        # window cutoff, start a fresh window with count=1; otherwise
+        # increment the existing count". locked_until is set iff the
+        # resulting count reaches max_attempts.
+        #
+        # All SET expressions in SQLite UPSERT reference the *old*
+        # column values, so the inner CASE that derives the new
+        # failed_count has to be repeated inside the locked_until SET
+        # rather than referencing a freshly-set sibling column.
         conn.execute(
             "INSERT INTO pin_failed_attempts "
             "(mooring_id, failed_count, first_failed_at, locked_until) "
-            "VALUES (?, ?, ?, ?) "
+            "VALUES (?, 1, ?, CASE WHEN 1 >= ? THEN ? ELSE NULL END) "
             "ON CONFLICT(mooring_id) DO UPDATE SET "
-            "  failed_count = excluded.failed_count, "
-            "  first_failed_at = excluded.first_failed_at, "
-            "  locked_until = excluded.locked_until",
-            (mooring_id, failed_count, first_failed_at, locked_until_str)
+            "  failed_count = CASE "
+            "    WHEN first_failed_at < ? THEN 1 "
+            "    ELSE failed_count + 1 "
+            "  END, "
+            "  first_failed_at = CASE "
+            "    WHEN first_failed_at < ? THEN ? "
+            "    ELSE first_failed_at "
+            "  END, "
+            "  locked_until = CASE "
+            "    WHEN (CASE WHEN first_failed_at < ? THEN 1 "
+            "                ELSE failed_count + 1 END) >= ? "
+            "    THEN ? "
+            "    ELSE NULL "
+            "  END",
+            (
+                mooring_id, now_str, max_attempts, lockout_until,
+                window_cutoff,
+                window_cutoff, now_str,
+                window_cutoff, max_attempts, lockout_until,
+            ),
         )
+        row = conn.execute(
+            "SELECT failed_count, locked_until "
+            "FROM pin_failed_attempts WHERE mooring_id = ?",
+            (mooring_id,),
+        ).fetchone()
 
+    failed_count = row["failed_count"]
+    locked_until_str = row["locked_until"]
     return {
         "failed_count": failed_count,
         "attempts_remaining": max(0, max_attempts - failed_count),
@@ -692,10 +738,17 @@ def load_classification_inputs(mooring_id: int):
     in the same order as observations.
 
     Returns (None, [], [], [], []) if the mooring does not exist.
+    Returns (mooring, [], [], [], []) if the mooring exists but has no
+    observations - the supporting-data queries are skipped entirely in
+    that case.
 
-    The full historical range is queried intentionally: older observations
-    are still valid calibration data, and tide events/wind observations
-    beyond the current 7-day window are needed to classify them.
+    Tide events and wind observations are fetched bounded to a one-day
+    buffer around the observation timestamps. The classifier needs each
+    observation's preceding HW (≤12h earlier) and a wind sample within
+    ±60 min of HW+4h, so one day is comfortably wider than required and
+    keeps the queries from scanning the whole table. With years of
+    retention this matters: the previous "2000-01-01" → "2099-12-31"
+    bounds returned every row in the table on every call.
 
     Callers that need both calibrate_drying_height and calibrate_wind_offset
     should call this once and pass the result to both via the _preloaded
@@ -708,10 +761,29 @@ def load_classification_inputs(mooring_id: int):
         return None, [], [], [], []
 
     observations = get_observations(mooring_id)
-    tide_events = get_tide_events("2000-01-01", "2099-12-31")
-    wind_observations = get_wind_observations_in_range(
-        "2000-01-01", "2099-12-31"
-    )
+    if not observations:
+        return mooring, [], [], [], []
+
+    # Compute a bounded query window around the observation timestamps.
+    # Observations stored via add_observation are normalised to ISO-Z, so
+    # dtparse_iso handles them; older rows with "+00:00" suffixes are also
+    # parsed correctly by dtparse_iso.
+    obs_min = min(o["timestamp"] for o in observations)
+    obs_max = max(o["timestamp"] for o in observations)
+    try:
+        window_start_dt = dtparse_iso(obs_min) - timedelta(days=1)
+        window_end_dt = dtparse_iso(obs_max) + timedelta(days=1)
+        window_start = to_utc_str(window_start_dt)
+        window_end = to_utc_str(window_end_dt)
+    except (ValueError, TypeError):
+        # Defensive: if a malformed observation timestamp slipped past
+        # add_observation's validation, fall back to the unbounded query
+        # rather than skipping calibration entirely.
+        window_start = "2000-01-01"
+        window_end = "2099-12-31"
+
+    tide_events = get_tide_events(window_start, window_end)
+    wind_observations = get_wind_observations_in_range(window_start, window_end)
     classifications = classify_observations(
         observations, mooring, tide_events, wind_observations
     )

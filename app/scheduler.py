@@ -1,10 +1,16 @@
 """
 Job scheduler for automated data fetching and recalculation.
 
-Three job types:
-1. Fixed: Daily UKHO fetch at 02:00 (configurable)
-2. Dynamic: OWM wind observation at HW+offset for each ebb tide
-3. Reactive: Recalculate access windows after wind data arrives
+Two APScheduler-registered job types:
+1. Fixed: Daily UKHO fetch at 02:00 (configurable). See daily_ukho_fetch.
+2. Dynamic: OWM wind observation jobs at HW+offset, scheduled by
+   _schedule_wind_jobs from inside daily_ukho_fetch (and on manual UKHO
+   refresh). See wind_observation_job.
+
+The "reactive" recalculation of access windows after a wind sample lands
+is the body of wind_observation_job - it is not a separately-registered
+job type, just the work that the dynamic job does once it has its
+wind reading.
 """
 
 import asyncio
@@ -346,8 +352,7 @@ async def _schedule_wind_jobs(events: list[dict]) -> list[dict]:
     in the fetched data. Only schedules for future times.
     Returns a list of scheduled job details for logging.
     """
-    from app.wind import fetch_current_wind
-    from app.database import store_wind_observation, log_activity
+    from app.database import log_activity
 
     now = datetime.now(timezone.utc)
     offset_hours = WIND_SAMPLE_HW_OFFSET_HOURS

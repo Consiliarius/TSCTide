@@ -25,10 +25,14 @@ the 16-day calibration corpus. See app/secondary_port.py for the full rationale.
 import logging
 from datetime import datetime, timezone, timedelta
 
+import pytz
+
 from app.config import get_secondary_port_offset
 from app.secondary_port import HW_TIME_OFFSET_MINUTES
 
 logger = logging.getLogger(__name__)
+
+_LONDON_TZ = pytz.timezone("Europe/London")
 
 
 def parse_khm_paste(text: str, year: int = None, is_bst: bool = True) -> list[dict]:
@@ -48,7 +52,11 @@ def parse_khm_paste(text: str, year: int = None, is_bst: bool = True) -> list[di
     if not year:
         year = datetime.now().year
 
-    local_tz = timezone(timedelta(seconds=3600)) if is_bst else timezone.utc
+    # When is_bst is True we treat the published times as UK local clock time
+    # and let pytz handle the BST/GMT transition properly. The previous
+    # implementation used a fixed +1h offset, which silently mis-stamped any
+    # data that crossed the last-Sunday-in-March or last-Sunday-in-October
+    # boundary. is_bst=False is for raw GMT data and remains a static UTC.
     lines = [l for l in text.strip().split("\n") if l.strip()]
     events = []
     parse_errors = 0
@@ -112,10 +120,20 @@ def parse_khm_paste(text: str, year: int = None, is_bst: bool = True) -> list[di
             if hr > 23 or mn > 59:
                 continue
 
-            # Build UTC datetime from local time
+            # Build UTC datetime from local time. Use pytz.localize for the
+            # BST case so DST transitions are handled correctly; ambiguous or
+            # non-existent local times (the spring-forward / fall-back hours)
+            # are skipped rather than silently mis-stamped.
             try:
-                local_dt = datetime(yr, month, day, hr, mn, 0, tzinfo=local_tz)
+                naive_dt = datetime(yr, month, day, hr, mn, 0)
             except ValueError:
+                continue
+            try:
+                if is_bst:
+                    local_dt = _LONDON_TZ.localize(naive_dt, is_dst=None)
+                else:
+                    local_dt = naive_dt.replace(tzinfo=timezone.utc)
+            except (pytz.AmbiguousTimeError, pytz.NonExistentTimeError):
                 continue
 
             utc_dt = local_dt.astimezone(timezone.utc)

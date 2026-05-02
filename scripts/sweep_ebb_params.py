@@ -72,11 +72,24 @@ def run_sweep_iteration(
     Overrides _cached_curve_params directly rather than rewriting
     model_config.json - faster, no I/O, no risk of leaving the file in
     a half-edited state if the script is interrupted.
+
+    Preserves the flood-stand keys from the bundled config so the flood
+    branch behaves the same as production while the ebb keys are
+    swept. Earlier versions of this script overwrote the entire dict
+    with only the ebb keys, which silently disabled the v2.5.3 flood
+    stand and meant the "best ebb" reported was the best ebb against a
+    pure-cosine flood that does not match production. The fix is to
+    read the bundled config once and overlay only the keys being
+    swept.
     """
-    access_calc._cached_curve_params = {
-        "stand_duration_minutes": stand_minutes,
-        "stand_height_fraction": stand_fraction,
-    }
+    # Read the bundled curve params once. _get_curve_params() caches on
+    # first call; we deliberately call it before overwriting the cache
+    # so the overwrite picks up the bundled flood-stand values rather
+    # than {} from a stale cache state.
+    base = dict(access_calc._get_curve_params())
+    base["stand_duration_minutes"] = stand_minutes
+    base["stand_height_fraction"] = stand_fraction
+    access_calc._cached_curve_params = base
 
     flood: list[float] = []
     ebb: list[float] = []

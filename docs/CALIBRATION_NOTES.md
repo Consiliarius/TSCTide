@@ -1,32 +1,41 @@
 # Calibration notes
 
 State of the tidal model and harmonic prediction calibration as of
-30 April 2026, post-v2.5.6 (hardcoded model constants migrated to
-model_config.json).
+1 May 2026, post-v2.5.7 (ebb stand re-tuned to 75/94 against the
+18-day corpus, replacing v2.5.3's 70/96; sweep-script defect that
+selected 70/96 was found and fixed).
 Records what has been refined, what has not, and the tradeoffs that
 remain open.
 
 ## Calibration corpus
 
-Located at `app/calibration_data/`. Currently contains 16 days of
+Located at `app/calibration_data/`. Currently contains 18 days of
 half-hourly UKHO data for Langstone Harbour (station 0066), spanning
-14 April – 22 April and 29 April – 5 May 2026. Total 768 samples
-covering a full neaps-springs-neaps progression.
+14 April – 22 April, 29 April – 5 May, and 6 May – 7 May 2026.
+Total 864 samples covering a full neaps-springs-neaps progression
+and the start of the next cycle.
 
-Re-running the analysis is straightforward:
+Re-running the headline analysis:
 
 ```
 docker exec tidal-access python -m scripts.calibrate_from_ukho_week
 ```
 
-Optional parameter sweep over the ebb-stand parameters:
+Phase-position diagnostic (added 1 May 2026, see item 2 below):
+
+```
+docker exec tidal-access python -m scripts.diagnose_residual_position
+```
+
+Optional parameter sweeps:
 
 ```
 docker exec tidal-access python -m scripts.sweep_ebb_params
+docker exec tidal-access python -m scripts.sweep_flood_curve
 ```
 
-Adding new weeks is a matter of dropping a new CSV into
-`app/calibration_data/` and re-running. The script auto-discovers
+Adding new days is a matter of dropping a new CSV into
+`app/calibration_data/` and re-running. The scripts auto-discover
 all CSVs in the directory.
 
 ## Continuous monitoring (v2.5.4)
@@ -58,9 +67,13 @@ calibration corpus came from the UKHO Easy Tide web portal, which is
 a one-off manual download not available to the running container.
 
 Consequence: continuous monitoring covers items 3 (per-day drift)
-and 4 (HW peak undershoot) but cannot observe item 2 (mid-tide
-bias), since item 2's symptom is between HW and LW points and the
-harmonic model would need half-hourly comparison data to evaluate.
+and 4 (HW peak undershoot) but cannot observe items 2a (mid-flood
+synthesis residual) or 2b (late-ebb synthesis residual) directly,
+since those symptoms are between HW and LW points and the harmonic
+model would need half-hourly comparison data to evaluate. The
+phase-position diagnostic in `scripts/diagnose_residual_position.py`
+is the offline tool for those; new half-hourly data must be supplied
+manually to evaluate them.
 
 ### Threshold logic
 
@@ -257,43 +270,101 @@ decimal places. Combined-corpus rows in the accuracy table above
 now reflect the live deployed configuration.
 
 **Out of scope, deferred**: `compute_access_windows` still uses
-the curve interpolation path for harmonic-derived windows. Item 2
-below will replace that path for harmonic with direct
-`predict_height_at_time` calls, at which point the flood curve
-only affects UKHO/KHM windows.
+the curve interpolation path for harmonic-derived windows. The
+original note here said this would be replaced via item 2 with
+direct `predict_height_at_time` calls; that plan was abandoned on
+1 May 2026 after the phase-position diagnostic showed the curve is
+NET POSITIVE for accuracy (it corrects synthesis-side error). See
+item 2 below.
 
-### 2. Harmonic mid-tide bias  **[partially addressed by v2.5.3]**
+### 2. Harmonic mid-tide bias  **[reframed 1 May 2026; see below]**
 
 **v2.5.2 state**: production-path harmonic had +0.22m mean bias in
-the 2.5-3.5m height band, with RMS 0.32m - the single largest
-remaining residual in the harmonic prediction path.
+the 2.5-3.5m height band, with RMS 0.32m - reported as the single
+largest remaining residual in the harmonic prediction path.
 
 **v2.5.3 state**: the flood-stand fix (item 1) reduced the mid-band
 bias substantially. The `_curve_interpolate` overshoot through mid-
 flood was a major contributor. New numbers in the 2.5-3.5m band:
 mean +0.073m (was +0.22m; 67% reduction), RMS 0.202m (was 0.32m;
-37% reduction). Still material but priority of the proposed
-refactor below is now lower.
+37% reduction).
 
-**Why it happens**: the residual ~+0.07m mean is the part of the
-bias that the flood-curve change does not reach - direct sampling
-of `predict_height_at_time(t)` (raw harmonic, no interpolation)
-shows that the harmonic synthesis itself has some residual bias in
-this band, which the curve interpolation cannot correct.
+**v2.5.6 reframing (1 May 2026)**: the 16-day height-bin breakdown
+was misleading because the Solent's marked tidal asymmetry maps the
+same absolute height to two physically distinct positions on the
+cycle (one fast leg, one slow leg). After the corpus expanded to
+18 days and the phase-position diagnostic
+(`scripts/diagnose_residual_position.py`) was run, three things
+became clear:
 
-**What would help**: use `predict_height_at_time` directly for
-harmonic-derived access window threshold-crossing detection,
-instead of going via `predict_events -> apply_offset -> interpolate`.
-The interpolation step throws away mid-cycle information the
-harmonic synthesis has calibrated for.
+  1. **The original symptom (mid-band production residual) is
+     small.** Re-binned by phase position rather than absolute
+     height, the largest production-path mid-flood residual is in
+     fraction 0.2-0.4 of the flood at mean -0.283m, NOT a positive
+     bias. The +0.073m height-bin number averaged opposing flood
+     and ebb residuals.
 
-**Implementation note**: would require modification to
-`app/access_calc.py::_find_crossing` so it can call
-`predict_height_at_time` directly when the source is harmonic,
-rather than always using event-bracketed curve interpolation.
-Significant refactor; now sensible to weigh against item 3
-(constituent recalibration) before committing - they address
-overlapping but distinct symptoms.
+  2. **The originally-proposed fix (`_find_crossing` refactor to
+     bypass curve interpolation) would make accuracy WORSE.** The
+     diagnostic's variant b (synthesis only, no curve) returns RMS
+     0.279m vs variant c (production path) RMS 0.205m - the curve
+     is providing a 27% improvement, not adding error. Refactoring
+     it out would introduce a -0.370m mid-flood bias that the curve
+     currently corrects.
+
+  3. **The largest remaining production residuals are at specific
+     phase positions, not specific heights.** From the 18-day
+     diagnostic:
+
+     | Phase           | Bin        | Production mean | Synthesis mean |
+     |-----------------|-----------:|----------------:|---------------:|
+     | flood           | 0.2-0.4    | -0.283m         | -0.370m        |
+     | ebb             | 0.0-0.2    | -0.156m         | -0.134m        |
+     | flood           | 0.8-1.0    | -0.110m         | -0.315m        |
+     | (others)        |            | <0.1m           |                |
+
+     The first row is the largest single residual in the corpus.
+     The curve corrects ~25% of the underlying synthesis error
+     here; the rest is synthesis-side and is item 3 territory.
+
+**Status**: item 2 in its original framing (mid-tide bias from
+curve interpolation) is essentially closed. The diagnostic shows
+the curve is the single largest contributor to overall accuracy
+(RMS reduction 0.279m -> 0.205m). What remains are two distinct
+residuals worth tracking separately:
+
+  - **2a. Mid-flood synthesis residual** (flood 0.2-0.4):
+    -0.283m production mean, -0.370m synthesis mean. The curve
+    corrects only ~25% of this; the underlying synthesis under-
+    predicts this position by 37cm. Likely overlaps with item 3
+    (constituent recalibration) and item 4 (HW peak undershoot).
+
+  - **2b. Just-after-HW residual** (ebb 0.0-0.2): -0.156m
+    production mean. The curve makes this slightly worse here
+    (synthesis -0.134m, curve contribution -0.022m), suggesting
+    the v2.5.3 ebb stand parameters may have a re-tunable point
+    closer to the trough side. Re-running `sweep_ebb_params.py`
+    against the 18-day corpus on 1 May 2026 (after fixing a
+    silent defect in the sweep) shifted the ebb stand from 70/96
+    to 75/94; see the v2.5.7 section below. The diagnostic was
+    not re-run at the new parameters, so the specific impact on
+    item 2b is not quantified - but the headline ebb numbers
+    improved (|mean| 0.013 -> 0.006m, RMS 0.137 -> 0.129m) and
+    the parameter shift extends the stand by 5 minutes which
+    should reduce the just-after-HW under-prediction in direction
+    if not fully in magnitude.
+
+**What does NOT help**: the original `_find_crossing` refactor,
+rejected on the basis of the diagnostic. Documented in "Items NOT
+to address" below.
+
+**Boater-safety direction of remaining residuals**: the production
+flood 0.2-0.4 residual of -0.283m means the model UNDER-predicts
+mid-flood heights. The access window calculator would say "not yet
+accessible" when actually it is - boater inconvenience, but the
+opposite direction is what would matter for safety. Same for the
+just-after-HW residual of -0.156m: model says "start of inaccessible"
+slightly earlier than reality. Conservative direction in both cases.
 
 ### 3. Harmonic per-day drift across the corpus  **[monitored automatically v2.5.4]**
 
@@ -332,25 +403,56 @@ peaks.
 peaks, not LW. The original wording was a documentation defect
 predating v2.5.2.)
 
+**v2.5.6 phase-position view (1 May 2026)**: the height-bin finding
+is confirmed and localised. The HW peak undershoot lives in the
+late-flood region, fraction 0.8-1.0: production mean -0.110m, but
+the underlying synthesis is -0.315m at this position. The curve
+corrects ~65% of the synthesis shortfall, but the synthesis itself
+is the source. This strongly supports M2 amplitude as a candidate
+for under-fit, since the late-flood approach to HW is dominated
+by the M2 cosine peak.
+
 **What would help**: same as item 3, harmonic constituent
 recalibration. The peak-amplitude shortfall is consistent with the
-M2 amplitude being slightly under-fit.
+M2 amplitude being slightly under-fit. Item 2a (mid-flood under-
+prediction) and item 4 may be the same defect viewed at different
+phase positions; a single M2 amplitude correction could plausibly
+address both.
 
 ## Items NOT to address
 
-These were considered and rejected during the session.
+These were considered and rejected.
 
 ### Adding a pre-HW stand to the flood
 Rolled back. See item 1 above.
 
-### Increasing `stand_duration_minutes` beyond 70
-The parameter sweep over 60-100 minutes found 70 (with fraction 0.96)
-optimal. Going wider does not help.
+### Increasing `stand_duration_minutes` beyond 75
+The parameter sweep over 60-100 minutes (run 1 May 2026 against the
+18-day corpus) found 75 (with fraction 0.94) optimal. Going wider
+does not help; the 90 and 100 minute cells materially worsen ebb
+residuals.
+
+Note: the original v2.5.3 selection (70/96) was made by a sweep
+that had a silent defect (it disabled the v2.5.3 flood stand during
+the sweep run). The corrected sweep on the 18-day corpus selected
+75/94. See the v2.5.7 section below for details.
 
 ### Removing the +9 minute HW timing offset
 The timing offset is independently supported by both the original
 April 2026 validation and the 16-day corpus. Only the height offset
 was removed in v2.5.2.
+
+### Refactoring `_find_crossing` to use `predict_height_at_time` directly
+Proposed by the original item 2 framing. Rejected 1 May 2026 after
+the phase-position diagnostic showed that the curve interpolation
+is a 27% RMS improvement over direct synthesis (production RMS
+0.205m vs synthesis-only RMS 0.279m across the 18-day corpus). The
+curve actively corrects synthesis-side bias rather than adding
+error on top. Bypassing it would introduce a -0.370m mid-flood
+bias and the late-flood HW undershoot would worsen by ~0.20m.
+Boater-safety direction would also flip negative in places where
+it is currently neutral. Documented here so future readers do not
+revive the proposal.
 
 ## Hardcoded constants migration (v2.5.6)
 
@@ -465,6 +567,133 @@ The sweep scripts (`scripts/sweep_flood_curve.py`,
 they mutate `access_calc._cached_curve_params` directly; the new
 accessors do not affect them.
 
+## Ebb stand re-tuning and sweep-script fix (v2.5.7)
+
+The v2.5.3 ebb stand parameters of 70min / 96% were re-tuned to
+75min / 94% against the expanded 18-day corpus on 1 May 2026.
+During re-tuning, a silent defect in `scripts/sweep_ebb_params.py`
+was discovered and fixed. The defect did not affect production
+behaviour but did affect the parameter selection process.
+
+### The defect
+
+`sweep_ebb_params.py::run_sweep_iteration` overwrote
+`access_calc._cached_curve_params` with a new dict containing only
+the two ebb keys being swept:
+
+```python
+access_calc._cached_curve_params = {
+    "stand_duration_minutes": stand_minutes,
+    "stand_height_fraction": stand_fraction,
+}
+```
+
+This silently dropped the `flood_lw_stand_minutes` and
+`flood_lw_stand_rise_fraction` keys that drive the v2.5.3 flood
+stand. The flood branch of `_curve_interpolate` looked up these
+keys via `.get(..., 0)`, found them missing, and reverted to pure
+cosine flood interpolation. Consequence: every cell of the v2.5.3
+ebb sweep was evaluated against a hypothetical pure-cosine-flood +
+proposed-ebb-parameters configuration, which is NOT the
+configuration actually deployed in v2.5.3 (which has the LW stand
+active on the flood).
+
+The v2.5.3 selection of 70/96 happened to be close to the corrected
+optimum (75/94), so the defect did not produce a catastrophically
+wrong selection. But it could have, and the reproducibility of the
+original selection was compromised.
+
+### The fix
+
+`run_sweep_iteration` now reads the bundled curve params first and
+overlays only the swept keys:
+
+```python
+base = dict(access_calc._get_curve_params())
+base["stand_duration_minutes"] = stand_minutes
+base["stand_height_fraction"] = stand_fraction
+access_calc._cached_curve_params = base
+```
+
+This preserves whatever flood-stand keys are present in the
+bundled JSON, so the sweep evaluates ebb parameters against the
+actual deployed flood configuration. `sweep_flood_curve.py` was
+inspected and found to be free of the symmetric defect: its ebb
+branch reads `stand_duration_minutes` and `stand_height_fraction`
+via `_get_curve_params()` directly, picking up the bundled values.
+
+### The new selection
+
+With the corrected sweep run on the 18-day corpus, the optimum
+shifted from 70/96 to 75/94:
+
+| Metric            | v2.5.3 (70/96) | v2.5.7 (75/94) | Delta    |
+|-------------------|---------------:|---------------:|---------:|
+| ebb mean bias     | +0.013 m       | -0.006 m       | -0.019 m |
+| ebb RMS           | 0.137 m        | 0.129 m        | -0.008 m |
+| all-corpus RMS    | 0.187 m        | 0.184 m        | -0.003 m |
+
+Three "best" criteria (smallest |mean bias|, smallest RMS, combined
+heuristic) all converged on 75/94. The improvement is modest (~6%
+ebb RMS reduction; ebb mean shift roughly 3sigma at corpus size)
+and multiple neighbouring cells (70/95, 75/95) are statistically
+indistinguishable from 75/94 within sampling noise. 75/94 was
+selected as the unambiguous "best" by all three criteria.
+
+Direction of mean shift (ebb mean +0.013 -> -0.006) is
+safety-positive: a small ebb under-prediction means the model
+reports "no longer accessible" slightly earlier than reality,
+which is the conservative direction for the ebb phase.
+
+### Flood stand re-evaluated, retained
+
+The corresponding flood-stand sweep (`sweep_flood_curve.py`,
+unaffected by the defect) was also re-run against the 18-day
+corpus on 1 May 2026. The v2.5.3 selection of 60min / 8% remained
+close to optimal:
+
+| Cell               | flood mean | flood RMS | flood max |
+|--------------------|-----------:|----------:|----------:|
+| 60/0.08 (deployed) | +0.026     | 0.215     | 0.66      |
+| 60/0.10 (best RMS) | +0.063     | 0.208     | 0.58      |
+| 50/0.05 (best |m|) | +0.013     | 0.234     | 0.71      |
+
+No dominant winner. 60/0.08 sits at a balance point; the
+alternatives offer specific tradeoffs (better mean OR better RMS,
+but not both) and the magnitudes are small. v2.5.3 selection
+retained.
+
+### Diagnostic was not re-run
+
+The phase-position diagnostic (`scripts/diagnose_residual_position.py`)
+was not re-run at 75/94. The expected shift in item 2b
+(just-after-HW residual, currently -0.156m at 70/96) is
+directionally favourable but not quantified. Re-running the
+diagnostic at 75/94 would close that gap and is a useful next
+analytical step, but does not block the parameter change.
+
+### Wider impact
+
+  - **Existing harmonic_predictions table**: unaffected. Stored
+    rows are harmonic synthesis output, not curve-interpolated.
+  - **Existing calendar_events**: events for past tides are
+    unaffected. Future events will use the new parameters on next
+    regeneration.
+  - **Continuous monitoring (v2.5.4)**: thresholds in
+    `app/scheduler.py` monitor harmonic-vs-UKHO HW/LW only. Not
+    affected by the curve-parameter change.
+  - **Calendar event UIDs**: depend only on the cycle constants,
+    not curve parameters. Unaffected.
+
+### Reproducibility note for future readers
+
+Anyone re-deriving the v2.5.3 ebb parameters from a fresh
+`sweep_ebb_params.py` run will get 75/94 as the answer, not the
+70/96 actually deployed at v2.5.3. This is because the v2.5.3
+selection was made with the broken sweep and is not reproducible
+without that defect. The current deployed parameters (75/94 from
+v2.5.7) ARE reproducible from the corrected sweep.
+
 ## How to update the model configuration
 
 As of v2.5.5 the model configuration lives only in the bundled file
@@ -497,3 +726,146 @@ The calibration scripts (`calibrate_from_ukho_week.py`,
 processes so the cache is naturally fresh on each invocation. The
 sweep scripts mutate `_cached_curve_params` directly to inject test
 parameters; this remains the supported pattern for ad-hoc analysis.
+
+## Future calibration: planning and data acquisition
+
+This section is intended as a reference when returning to calibration
+work after several months. The goal is to accumulate enough half-hourly
+data across different seasons and tidal conditions that any future
+parameter changes can be validated against the full corpus rather than
+tuned to a single week.
+
+### Data acquisition options
+
+The half-hourly depth-of-tide readings used for calibration come from
+UKHO Admiralty predictions. Two acquisition paths exist:
+
+**Manual (current approach)**: copy and paste from Admiralty EasyTide
+(https://easytide.admiralty.co.uk). EasyTide is free and provides the
+current day plus 6 days of half-hourly heights. To build a multi-month
+corpus, a new week must be captured every 7 days. If a week is missed,
+that window is lost -- EasyTide does not provide historical data. The
+data must be pasted into a Claude chat session and saved to a CSV in
+`app/calibration_data/` following the format documented in
+`app/calibration_data/README.md`.
+
+**Automated via UKHO API upgrade**: the current TSCTide deployment
+uses the UKHO Tidal API **Discovery** tier (free), which provides
+HW/LW events only. Half-hourly height data is NOT available on
+Discovery. Two paid tiers offer it:
+
+  - **Foundation** (GBP 120/year): current + 13 days of tidal heights
+    at configurable intervals (e.g. 30 minutes). Would allow the
+    daily scheduler to fetch and store 13 days of half-hourly data
+    automatically, building the calibration corpus without manual
+    intervention. Endpoint: `GET /Stations/{id}/TidalHeights` with
+    `intervalInMinutes=30`. Rate limit: 20 calls/sec, 20,000/month.
+  - **Premium** (pricing not public): up to 1 year of historical and
+    future data at 1-minute resolution. Would let the system
+    backfill and build the entire corpus in one shot.
+
+If upgrading to Foundation, the implementation would be:
+  1. Add a new function in `app/ukho.py` to call the TidalHeights
+     endpoint with `intervalInMinutes=30`.
+  2. Add a new database table `calibration_heights` (or extend
+     `tide_data` with a `resolution` column) to store the half-hourly
+     samples separately from HW/LW events.
+  3. Add a daily scheduler job to fetch and store the latest 13 days
+     of half-hourly data. Overlap with previously-stored data is
+     handled by UPSERT on `(timestamp, station, source)` key.
+  4. Update the calibration script to read from both
+     `app/calibration_data/` CSVs (manual data) and the database
+     table (automated data), merging them into a single corpus.
+  5. Note: UKHO terms require that stored data is not made available
+     after 72 hours. The calibration use case (internal model
+     refinement, not redistribution) likely falls within acceptable
+     use, but the terms should be reviewed before implementation.
+
+**Recommendation**: if calibration work is going to be ongoing (which
+it should be, given items 2a-4 above), the Foundation tier pays for
+itself quickly in saved manual effort. A single year at GBP 120 would
+produce a corpus of ~17,500 half-hourly samples (365 days x 48/day)
+covering all seasonal and tidal conditions. That corpus would be
+sufficient for robust harmonic-constituent recalibration (item 3) and
+would reveal whether the remaining residuals vary seasonally.
+
+### Calibration cadence
+
+Whether data is acquired manually or automatically, the recommended
+calibration review cadence is:
+
+  - **Monthly (first 3 months)**: run the calibration script against
+    the growing corpus. Watch for the per-day drift (item 3) to see
+    whether it is consistent or seasonal. Check the harmonic-residual
+    monitoring in the activity log (v2.5.4). Do NOT change parameters
+    based on a single month's data.
+  - **Quarterly (after 3 months)**: with ~90 days of data, the corpus
+    is large enough to support parameter sweeps. Compare new-corpus
+    residuals against the v2.5.7 baseline before applying any
+    changes.
+  - **Annually**: with a full year of data, the corpus covers all
+    seasonal variation. This is the appropriate point to attempt
+    harmonic-constituent recalibration (item 3) with confidence that
+    the result generalises.
+
+### What to do when returning to calibration
+
+1. **Add any new half-hourly data** to `app/calibration_data/` as a
+   new CSV following the naming convention
+   `langstone_ukho_YYYY-MM-DD_to_YYYY-MM-DD.csv`.
+2. **Run the analysis scripts** against the full corpus:
+   ```
+   docker exec tidal-access python -m scripts.calibrate_from_ukho_week
+   docker exec tidal-access python -m scripts.diagnose_residual_position
+   ```
+3. **Compare the new residuals** against the v2.5.3 accuracy table
+   and the v2.5.7 ebb-stand numbers in this document. If the numbers
+   are similar, the model is stable. If they have drifted, investigate
+   which phase/height-band is responsible.
+4. **Check the harmonic-residual monitoring** for drift trends:
+   ```
+   docker exec tidal-access sqlite3 /app/data/tides.db \
+     "SELECT timestamp, severity, message FROM activity_log \
+      WHERE event_type='harmonic_residuals' \
+      ORDER BY timestamp DESC LIMIT 30;"
+   ```
+5. **Do NOT change parameters** based on a single new week. The
+   April 2026 session demonstrated that single-week tuning can
+   optimise away from the broader truth.
+6. **If parameter changes are warranted**, use the sweep scripts:
+   ```
+   docker exec tidal-access python -m scripts.sweep_ebb_params
+   docker exec tidal-access python -m scripts.sweep_flood_curve
+   ```
+   Evaluate the sweep results against the FULL corpus (all CSVs),
+   not just the newest week.
+7. **After any parameter change**, rebuild and restart:
+   ```
+   docker compose up -d --build
+   ```
+   As of v2.5.5, `model_config.json` is read from the bundled image.
+   Rebuilds pick up changes automatically with no manual copy step.
+
+### Harmonic constituent recalibration (when the corpus justifies it)
+
+When item 3 is pursued (recommended: after 6+ months of data), the
+approach should be:
+
+  1. Use `scipy.optimize.least_squares` to fit M2, S2, and N2
+     amplitudes and phase lags against the half-hourly corpus.
+     These three constituents dominate Langstone's tidal signal;
+     fitting all 19 simultaneously risks overfitting on the smaller
+     constituents.
+  2. Split the corpus: fit on the first 60% of days, validate on
+     the remaining 40%. If the validation residuals are materially
+     worse than the fit residuals, the model is overfitting.
+  3. Compare the new constituent values against the current values
+     in `model_config.json::harmonic_reference.constituents`.
+     Changes > 5% in M2 amplitude or > 10 degrees in M2 phase
+     warrant investigation rather than blind application.
+  4. After applying new constituents, re-run both the calibration
+     script and the sweep scripts to confirm the curve parameters
+     are still optimal. Constituent changes shift the harmonic
+     baseline, which may change the optimal ebb/flood stand values.
+  5. Bump the version in `model_config.json` and document the
+     change in this file.

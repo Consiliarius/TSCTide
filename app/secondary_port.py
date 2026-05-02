@@ -1,8 +1,18 @@
 """
-Secondary port offset: converts Portsmouth predictions to Langstone Harbour.
+Secondary port offset: converts Portsmouth values to Langstone Harbour.
 
-Applied to harmonic model predictions only. KHM data has corrections applied
-within the KHM parser itself. UKHO Langstone data is native and needs no offset.
+Applied at three sites in the production data flow:
+  - Harmonic model output (scheduler.daily_ukho_fetch + main.calculate when
+    source='harmonic') before storage and consumption.
+  - UKHO Portsmouth fallback rows on read (database.get_ukho_tide_events),
+    so callers never see uncorrected fallback heights/times.
+  - The manual /api/fetch-ukho path schedules wind jobs against corrected
+    times when the API fell back to Portsmouth.
+
+KHM data has its HW timing correction applied inside parse_khm_paste at
+parse time; it is stored already-corrected with station="langstone" and is
+NOT passed through this module on read. UKHO native Langstone data needs
+no offset and bypasses this module entirely.
 
 Correction values (validated April 2026 against UKHO half-hourly data,
 refined April 2026 against the 16-day calibration corpus):
@@ -86,7 +96,6 @@ def apply_offset(events: list[dict]) -> list[dict]:
             new_ev["height_m"] = round(ev["height_m"] + lw_height, 2)
 
         new_ev["timestamp"] = to_utc_str(dt)
-        new_ev["offset_applied"] = True
         result.append(new_ev)
 
     return result

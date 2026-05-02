@@ -27,7 +27,6 @@ from app.database import (
     store_tide_events, get_tide_events, get_ukho_tide_events,
     calibrate_drying_height, calibrate_wind_offset,
     load_classification_inputs,
-    get_wind_observations_in_range,
     delete_future_events, get_calendar_events, log_activity, get_activity_log,
     get_mooring_pin_hash, set_mooring_pin_hash,
     check_pin_lockout, record_failed_pin_attempt, clear_failed_pin_attempts,
@@ -37,7 +36,6 @@ from app.pin import (
     hash_pin, verify_pin, is_valid_pin_format,
     MAX_PIN_ATTEMPTS, PIN_ATTEMPT_WINDOW_MINUTES, PIN_LOCKOUT_MINUTES,
 )
-from app.observation_classifier import classify_observations
 from app.ukho import fetch_tidal_events
 from app.khm_parser import parse_khm_paste
 from app.harmonic import predict_events as harmonic_predict_events
@@ -838,6 +836,16 @@ async def apply_drying_height_calibration(mooring_id: int):
     best = cal.get("best_estimate")
     if best is None:
         raise HTTPException(400, "No drying height suggestion available to apply")
+    if cal.get("confidence") == "inconsistent":
+        # Aground observation lies above an afloat one — the midpoint is
+        # arithmetic, not physical. Refuse to apply silently; user must
+        # revisit the observations first.
+        raise HTTPException(
+            400,
+            "Calibration bounds are inconsistent (aground height above an "
+            "afloat height). Resolve the conflicting observation(s) before "
+            "applying.",
+        )
 
     previous = m["drying_height_m"]
     if abs(best - previous) < 0.01:
@@ -985,7 +993,15 @@ async def trigger_ukho_fetch():
     )
 
     from app.scheduler import _schedule_wind_jobs
-    await _schedule_wind_jobs(events)
+    # Mirror daily_ukho_fetch: when the API fell back to Portsmouth, schedule
+    # the wind sample against Langstone-corrected HW times, not the raw
+    # Portsmouth ones. Otherwise the manual-refresh path samples ~9 minutes
+    # earlier than the daily 02:00 path, drifting the two flows apart.
+    if station_label == "portsmouth":
+        calc_events = apply_offset(events)
+    else:
+        calc_events = events
+    await _schedule_wind_jobs(calc_events)
 
     # Regenerate the standalone Langstone tide feeds so manual refresh has
     # the same effect on those feeds as the daily 02:00 job. The harmonic

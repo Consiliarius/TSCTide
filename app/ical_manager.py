@@ -15,6 +15,8 @@ Event title formats:
 
 import logging
 import math
+import os
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from icalendar import Calendar, Event
@@ -22,6 +24,33 @@ from dateutil import parser as dtparse
 import pytz
 
 from app.config import FEEDS_DIR, DEFAULT_TIMEZONE, ensure_dirs, compute_cycle_number
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """
+    Write bytes to path atomically via a sibling temp file plus os.replace.
+
+    Subscription feeds are regenerated on every GET, so concurrent calendar
+    clients can drive simultaneous writes against the same .ics path. A
+    plain open()+write() leaves a window during which a third reader sees
+    a truncated or partially-written file; os.replace is atomic on POSIX
+    and on Windows for same-filesystem replacements, eliminating that
+    window.
+    """
+    tmp_dir = path.parent
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp",
+                                    dir=str(tmp_dir))
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp_name, str(path))
+    except Exception:
+        # Best-effort cleanup; on success the temp name no longer exists.
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 from app.database import (
     get_calendar_events, upsert_calendar_event, cleanup_superseded_events,
     get_ukho_tide_events, get_harmonic_predictions,
@@ -277,8 +306,7 @@ def generate_feed_for_mooring(mooring_id: int, boat_name: str = "",
         cal.add_component(ical_event)
 
     feed_path = FEEDS_DIR / f"mooring_{mooring_id:03d}.ics"
-    with open(feed_path, "wb") as f:
-        f.write(cal.to_ical())
+    _atomic_write_bytes(feed_path, cal.to_ical())
 
     logger.info(f"Generated feed for mooring {mooring_id}: {len(events)} events")
     return feed_path
@@ -580,8 +608,7 @@ def generate_langstone_ukho_7d_feed() -> Path:
         cal.add_component(_build_tide_event(ev, source_label, tz, is_estimate=False))
 
     feed_path = FEEDS_DIR / "Langstone_UKHO_7d.ics"
-    with open(feed_path, "wb") as f:
-        f.write(cal.to_ical())
+    _atomic_write_bytes(feed_path, cal.to_ical())
     logger.info(
         f"Generated Langstone_UKHO_7d.ics: {len(events)} events ({source_label})"
     )
@@ -670,8 +697,7 @@ def generate_langstone_harmonic_180d_feed() -> Path:
         ))
 
     feed_path = FEEDS_DIR / "Langstone_Harmonic_180d.ics"
-    with open(feed_path, "wb") as f:
-        f.write(cal.to_ical())
+    _atomic_write_bytes(feed_path, cal.to_ical())
     logger.info(
         f"Generated Langstone_Harmonic_180d.ics: "
         f"{len(ukho_events)} UKHO + {len(filtered_harmonic)} harmonic events"
