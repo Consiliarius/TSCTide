@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast; [ast.parse\\(open\\(f\\).read\\(\\)\\) for f in ['app/main.py','app/database.py','app/ical_manager.py','app/khm_parser.py','app/secondary_port.py','app/scheduler.py']]; print\\('OK'\\)\")"
+    ]
+  }
+}

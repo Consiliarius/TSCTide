@@ -1,28 +1,30 @@
 {
-    "_comment": "Tidal Access Model Configuration. Tidal curve parameters used by access window calculator. Harmonic constants and secondary port offsets are documented here for reference but are currently implemented in harmonic.py and secondary_port.py respectively.",
-    "_version": "2.4.0",
-    "_last_updated": "2026-04-23",
+    "_comment": "Tidal Access Model Configuration. Tidal curve parameters used by access window calculator, harmonic-model parameters (mean level, constituents), Portsmouth-Langstone secondary port offsets, and cycle-numbering constants are all read at runtime as of v2.5.6. SPEEDS, DOODSON, nodal-correction coefficients, and the Admiralty convention offsets in harmonic.py remain hardcoded by design (they are physical constants of the harmonic-prediction algorithm or data-derived corrections, not tuning parameters).",
+    "_version": "2.5.7",
+    "_last_updated": "2026-05-01",
 
     "secondary_port_offset": {
-        "_comment": "Portsmouth to Langstone Harbour corrections. REFERENCE ONLY — these values are not read by any code at runtime. The operative constants are hardcoded in secondary_port.py (apply_offset) and khm_parser.py (parse_khm_paste). Any change to these values must also be made in those two files. Validated April 2026 against UKHO half-hourly data for both ports: observed HW height delta 0.0-0.1m (mean +0.05m), not +0.24m as previously assumed. LW heights effectively identical between ports.",
+        "_comment": "Portsmouth to Langstone Harbour corrections. Read at runtime by app.config.get_secondary_port_offset and consumed by secondary_port.apply_offset and khm_parser.parse_khm_paste. Module-level constants in those .py files are kept as reference defaults and as a fallback if any of these JSON keys are missing or malformed. Original validation April 2026 against UKHO half-hourly data for both ports observed HW height delta 0.0-0.1m. The 16-day calibration corpus subsequently showed that propagating a 0.05m HW height bump through curve interpolation introduced a +0.05m production-path mean bias with no offsetting RMS improvement; the height offset has been removed (set to 0). LW heights remain effectively identical between ports.",
         "hw_time_offset_minutes": 9,
-        "hw_height_offset_m": 0.05,
+        "hw_height_offset_m": 0.0,
         "lw_time_offset_minutes": 0,
         "lw_height_offset_m": 0.0
     },
 
     "tidal_curve": {
-        "_comment": "Parameters for Langstone Harbour asymmetric tidal curve used to interpolate heights between HW/LW events. The Solent exhibits an extended HW stand on the ebb. Read at runtime by access_calc._get_curve_params().",
-        "stand_duration_minutes": 40,
-        "stand_height_fraction": 0.98,
-        "_unused": "flood_duration_fraction and ebb_duration_fraction are retained below for documentation only. They are not applied in access_calc._curve_interpolate() — the actual HW/LW event timestamps already encode the asymmetric flood/ebb duration, so applying a further fraction correction would double-count it.",
+        "_comment": "Parameters for Langstone Harbour asymmetric tidal curve used to interpolate heights between HW/LW events. Applied to BOTH phases as of v2.5.3: flood has a young-flood stand near LW, ebb has a stand near HW. Read at runtime by access_calc._get_curve_params().",
+        "stand_duration_minutes": 75,
+        "stand_height_fraction": 0.94,
+        "flood_lw_stand_minutes": 60,
+        "flood_lw_stand_rise_fraction": 0.08,
+        "_unused": "flood_duration_fraction and ebb_duration_fraction are retained below for documentation only. They are not applied in access_calc._curve_interpolate(); the actual HW/LW event timestamps already encode the asymmetric flood/ebb duration, so applying a further fraction correction would double-count it.",
         "flood_duration_fraction": 0.42,
         "ebb_duration_fraction": 0.58,
-        "_notes": "stand_height_fraction is the proportion of HW height (above CD) maintained during the stand period. Calibrated against UKHO half-hourly Langstone data (21-22 April 2026): stand duration ~40min at 98% of HW height, consistent across springs and neaps. Impact: ebb threshold crossings ~10-15min later on springs, ~20-30min later on neaps where HW is close to threshold."
+        "_notes": "Two stands are configured. Ebb stand near HW (stand_duration_minutes, stand_height_fraction) re-tuned 1 May 2026 against the expanded 18-day corpus to 75min / 94%, replacing v2.5.3's selection of 70min / 96%. The original v2.5.3 sweep (scripts/sweep_ebb_params.py) had a defect: it overwrote the cached curve params dict with only the ebb keys, silently disabling the v2.5.3 flood stand during the sweep. Re-running with the corrected sweep (which preserves the flood-stand keys, matching production) shifted the optimum from 70/96 to 75/94. Improvement on 18-day corpus: ebb |mean| +0.013 -> -0.006m, ebb RMS 0.137 -> 0.129m, all-RMS 0.187 -> 0.184m. Marginal absolute magnitude (~3sigma at corpus size) but consistent across all three 'best' criteria; mean shift direction is safety-positive on the ebb (slight under-prediction is conservative). Flood stand near LW (flood_lw_stand_minutes, flood_lw_stand_rise_fraction) was re-evaluated against the 18-day corpus on 1 May 2026 and v2.5.3's selection of 60min / 8% was retained: alternatives offered specific tradeoffs but no dominant winner. See scripts/sweep_flood_curve.py. Original v2.5.3 selection rationale: 60/8 selected by sweep over 35 combinations across two parameterisations against 16-day corpus; models the documented Solent young-flood-stand effect (out-of-phase early-flood inflows around the Isle of Wight). v2.5.3 flood improvement: mean +0.134m -> +0.016m, RMS 0.290m -> 0.219m. Note: flood_lw_stand_rise_fraction is fraction of FLOOD RANGE (HW - LW), unlike stand_height_fraction which is fraction of HW absolute height; this asymmetry is intentional because LW heights in Langstone are small and fraction-of-LW would be physically negligible. Setting either flood_lw_stand_minutes or flood_lw_stand_rise_fraction to 0 reverts the flood to pure cosine (pre-v2.5.3 behaviour)."
     },
 
     "admiralty_convention_offset": {
-        "_comment": "Post-processing time shifts applied to harmonic predict_events output to align mathematical peaks with Admiralty published HW/LW convention. REFERENCE ONLY — these values are not read by any code at runtime. The operative constants are HW_ADMIRALTY_OFFSET_MINUTES and LW_ADMIRALTY_OFFSET_MINUTES in harmonic.py. Any change must also be made there. Derived April 2026 from 710 Admiralty Portsmouth reference points (355 HW + 355 LW) across 6 months between Jul 2026 and Dec 2027. The mathematical peak of the harmonic curve falls systematically later than the Admiralty published time. These offsets do not affect predict_height_at_time() - heights throughout the tidal curve remain correct.",
+        "_comment": "Post-processing time shifts applied to harmonic predict_events output to align mathematical peaks with Admiralty published HW/LW convention. REFERENCE ONLY — these values are not read by any code at runtime; per the v2.5.6 scope decision they remain hardcoded as HW_ADMIRALTY_OFFSET_MINUTES and LW_ADMIRALTY_OFFSET_MINUTES in harmonic.py because they are data-derived corrections (not model tuning) whose alteration would invalidate the validation set below. Any change must be made in harmonic.py and revalidated. Derived April 2026 from 710 Admiralty Portsmouth reference points (355 HW + 355 LW) across 6 months between Jul 2026 and Dec 2027. The mathematical peak of the harmonic curve falls systematically later than the Admiralty published time. These offsets do not affect predict_height_at_time() - heights throughout the tidal curve remain correct.",
         "hw_offset_minutes": 34,
         "lw_offset_minutes": 28,
         "validation_dataset_size": 710,
@@ -37,7 +39,7 @@
     },
 
     "harmonic_reference": {
-        "_comment": "Harmonic constants are implemented in app/harmonic.py. Documented here for reference only. 19 constituents calibrated April 2026 against 388 Admiralty reference points (91 HW/LW + 7 spring HW + 288 half-hourly) spanning May-December 2026 plus April 2026 half-hourly data. Validated April 2026 against a further 710 Admiralty points across 6 months between Jul 2026 and Dec 2027 (see admiralty_convention_offset).",
+        "_comment": "Harmonic synthesis parameters for Portsmouth. Read at runtime by app.config.get_z0 and app.config.get_harmonics; consumed by harmonic.predict_height_at_time. Module-level Z0 and HARMONICS constants in harmonic.py are kept as reference defaults and as a fallback if these JSON values are missing or malformed. Note that SPEEDS (constituent angular speeds), DOODSON (Doodson multipliers) and the nodal-correction coefficients in harmonic._nodal remain hardcoded by design (they are physical constants of the harmonic algorithm itself, not tuning parameters). 19 constituents calibrated April 2026 against 388 Admiralty reference points (91 HW/LW + 7 spring HW + 288 half-hourly) spanning May-December 2026 plus April 2026 half-hourly data. Validated April 2026 against a further 710 Admiralty points across 6 months between Jul 2026 and Dec 2027 (see admiralty_convention_offset).",
         "mean_level_m": 2.8846,
         "constituents": {
             "M2": {"amplitude": 1.464, "phase_lag": 152.5},
@@ -60,6 +62,14 @@
             "SA": {"amplitude": 0.074, "phase_lag": 186.7},
             "SSA": {"amplitude": 0.045, "phase_lag": 5.3}
         },
-        "accuracy": "Post Admiralty offset correction: HW/LW timing bias near zero (HW +0.2min, LW -0.1min) with stdev 15min HW / 19min LW. Height bias near zero (HW +0.02m, LW +0.05m) with stdev 0.13m HW / 0.19m LW. Based on 710-point validation across Jul 2026 - Dec 2027."
+        "accuracy": "Post Admiralty offset correction: HW/LW timing bias near zero (HW +0.2min, LW -0.1min) with stdev 15min HW / 19min LW. Height bias near zero (HW +0.02m, LW +0.05m) with stdev 0.13m HW / 0.19m LW. Based on 710-point validation across Jul 2026 - Dec 2027.",
+        "_partial_fallback_note": "If any constituent in this dict has a malformed amplitude or phase_lag (non-numeric or wrong shape), the entire constituent dict reverts to the hardcoded HARMONICS in harmonic.py, not just the offending entry. This is by design: harmonic synthesis combines all 19 constituents, so a partial mix of JSON-vs-default values would produce subtly wrong predictions that pass silent validation. Either the JSON section is fully valid or the full default is used; an INFO log line will record which."
+    },
+
+    "cycle_number": {
+        "_comment": "Tide cycle numbering. Read at runtime by app.config.compute_cycle_number; consumed by access_calc.generate_event_uid (calendar event UIDs), ical_manager._tide_event_uid (tide feed UIDs), and database._compute_cycle_number (harmonic_predictions deduplication key). The same cycle constants are used in all three places, so this section is the single source of truth. Module-level constants in those three .py files are kept as reference defaults and as a fallback if these JSON values are missing or malformed.",
+        "epoch_iso": "2026-01-01T00:00:00Z",
+        "avg_cycle_hours": 12.4167,
+        "_warning": "These values ARE the dedup key for stored rows in harmonic_predictions.cycle_number AND form part of every iCal event UID issued. Changing them invalidates every existing UID (calendar apps will see delete-and-re-add) and breaks the dedup index in harmonic_predictions. Do NOT edit without a database migration plan covering the full data lifecycle. Bit-for-bit identical to the hardcoded values used pre-v2.5.6."
     }
 }

@@ -17,14 +17,22 @@ Column layout:
 
 Times are local (GMT or BST as published by KHM).
 All data is for Portsmouth. Secondary port correction to Langstone is applied
-within this parser (HW: +9 min, +0.05m; LW: unchanged), validated April 2026
-against UKHO half-hourly data for both ports.
+within this parser (HW: +9 min timing only; no height offset; LW unchanged),
+validated April 2026 against UKHO half-hourly data, refined April 2026 against
+the 16-day calibration corpus. See app/secondary_port.py for the full rationale.
 """
 
 import logging
 from datetime import datetime, timezone, timedelta
 
+import pytz
+
+from app.config import get_secondary_port_offset
+from app.secondary_port import HW_TIME_OFFSET_MINUTES
+
 logger = logging.getLogger(__name__)
+
+_LONDON_TZ = pytz.timezone("Europe/London")
 
 
 def parse_khm_paste(text: str, year: int = None, is_bst: bool = True) -> list[dict]:
@@ -44,7 +52,11 @@ def parse_khm_paste(text: str, year: int = None, is_bst: bool = True) -> list[di
     if not year:
         year = datetime.now().year
 
-    local_tz = timezone(timedelta(seconds=3600)) if is_bst else timezone.utc
+    # When is_bst is True we treat the published times as UK local clock time
+    # and let pytz handle the BST/GMT transition properly. The previous
+    # implementation used a fixed +1h offset, which silently mis-stamped any
+    # data that crossed the last-Sunday-in-March or last-Sunday-in-October
+    # boundary. is_bst=False is for raw GMT data and remains a static UTC.
     lines = [l for l in text.strip().split("\n") if l.strip()]
     events = []
     parse_errors = 0
@@ -108,22 +120,43 @@ def parse_khm_paste(text: str, year: int = None, is_bst: bool = True) -> list[di
             if hr > 23 or mn > 59:
                 continue
 
-            # Build UTC datetime from local time
+            # Build UTC datetime from local time. Use pytz.localize for the
+            # BST case so DST transitions are handled correctly; ambiguous or
+            # non-existent local times (the spring-forward / fall-back hours)
+            # are skipped rather than silently mis-stamped.
             try:
-                local_dt = datetime(yr, month, day, hr, mn, 0, tzinfo=local_tz)
+                naive_dt = datetime(yr, month, day, hr, mn, 0)
             except ValueError:
+                continue
+            try:
+                if is_bst:
+                    local_dt = _LONDON_TZ.localize(naive_dt, is_dst=None)
+                else:
+                    local_dt = naive_dt.replace(tzinfo=timezone.utc)
+            except (pytz.AmbiguousTimeError, pytz.NonExistentTimeError):
                 continue
 
             utc_dt = local_dt.astimezone(timezone.utc)
             adjusted_ht = ht
 
             # Secondary port correction: KHM data is for Portsmouth.
-            # Langstone HW is ~9 min later and ~0.05m higher (validated against
-            # UKHO half-hourly data for both ports, April 2026). LW times/heights
-            # effectively identical between ports.
+            # Langstone HW is ~9 min later. The previous 0.05m height
+            # offset was removed after the 16-day calibration corpus
+            # showed it introduced a +0.05m mean bias when propagated
+            # through curve interpolation; see app/secondary_port.py for
+            # the analysis. LW times/heights are effectively identical
+            # between ports.
+            #
+            # The offset value comes from model_config.json via the
+            # config accessor (with the secondary_port module-level
+            # constant as fallback), keeping this file aligned with
+            # secondary_port.apply_offset() without duplicating the
+            # number locally.
             if p["type"] == "HighWater":
-                utc_dt = utc_dt + timedelta(minutes=9)
-                adjusted_ht = round(ht + 0.05, 1)
+                hw_offset_minutes = get_secondary_port_offset(
+                    "hw_time_offset_minutes", HW_TIME_OFFSET_MINUTES
+                )
+                utc_dt = utc_dt + timedelta(minutes=hw_offset_minutes)
 
             events.append({
                 "timestamp": utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),

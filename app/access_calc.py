@@ -15,28 +15,18 @@ from datetime import datetime, timedelta, timezone
 from dateutil import parser as dtparse
 from typing import Optional
 
-from app.config import load_model_config, to_utc_str
+from app.config import load_model_config, to_utc_str, compute_cycle_number
 
 logger = logging.getLogger(__name__)
 
 # Module-level cache for model config tidal curve parameters.
 # load_model_config() parses a JSON file on every call; at 3-minute
 # interpolation intervals over a 7-hour window this is called thousands
-# of times per calculation. The config is effectively static between
-# API calls, so cache it on first access.
-# Call invalidate_model_config_cache() after save_model_config() to ensure
-# the next calculation picks up any user edits.
+# of times per calculation. The bundled config is read-only at runtime
+# and effectively static for the lifetime of the process, so cache it
+# on first access. The deliberate refresh trigger is a container
+# restart, which reinitialises the process and discards the cache.
 _cached_curve_params: Optional[dict] = None
-
-
-def invalidate_model_config_cache():
-    """
-    Clear the cached tidal curve parameters.
-    Must be called after save_model_config() so that subsequent
-    calculations use the updated values.
-    """
-    global _cached_curve_params
-    _cached_curve_params = None
 
 
 def _get_curve_params() -> dict:
@@ -118,7 +108,63 @@ def _curve_interpolate(target: datetime, before: tuple, after: tuple) -> float:
 
     # Determine if this is a flooding or ebbing phase
     if et_before == "LowWater" and et_after == "HighWater":
-        # Flooding tide
+        # Flooding tide. Two regimes, selected by configuration:
+        #
+        #   1. LW stand then cosine (v2.5.3+, current production):
+        #      Linear rise for the first flood_lw_stand_minutes after LW,
+        #      lifting the water by flood_lw_stand_rise_fraction of the
+        #      flood range, then a half-cosine from that level up to HW.
+        #      Models the documented Solent young-flood-stand effect:
+        #      early-flood inflows arriving around the Isle of Wight are
+        #      out of phase with the main flood and briefly pause the
+        #      rise just after LW.
+        #
+        #   2. Pure half-cosine (pre-v2.5.3 fallback): if either
+        #      flood_lw_stand_minutes or flood_lw_stand_rise_fraction is
+        #      zero or absent, the rise from LW to HW follows a standard
+        #      half-cosine smoothstep. This was production behaviour up
+        #      to v2.5.2 and had a residual +0.13m mid-flood mean bias
+        #      against the 16-day UKHO corpus.
+        #
+        # Parameter semantics: rise_fraction is the fraction of the
+        # flood RANGE that the water lifts during the stand, NOT the
+        # fraction of LW absolute height. The ebb stand below uses a
+        # fraction of HW absolute height (historical accident); the two
+        # forms differ because LW heights in Langstone are small (0.5-
+        # 1.5m typical) and a fraction of LW would be physically
+        # negligible, whereas HW heights are large enough that fraction-
+        # of-HW is meaningful.
+        #
+        # An earlier attempt added a *pre-HW* stand symmetric to the
+        # ebb stand. It was rolled back: the corpus showed it more than
+        # doubled flood RMS by double-counting the cosine's own natural
+        # slowdown near its peak. The LW-stand form here acts at the
+        # opposite end of the flood, where the cosine's natural rise is
+        # fastest and the empirical data shows a real depression.
+        #
+        # Tuned 30 April 2026 against the 16-day UKHO corpus via
+        # scripts/sweep_flood_curve.py: 60min / rise_fraction=0.08 gives
+        # flood mean +0.016m (was +0.134m), RMS 0.219m (was 0.290m).
+        lw_stand_mins = curve.get("flood_lw_stand_minutes", 0)
+        lw_stand_frac = curve.get("flood_lw_stand_rise_fraction", 0)
+
+        if lw_stand_mins > 0 and lw_stand_frac > 0 and total_seconds > 0:
+            # Cap stand at 50% of flood span. Combinations beyond this
+            # are unphysical (no room for the post-stand cosine to reach
+            # HW); the cap is a defensive bound for misconfiguration.
+            stand_proportion = min((lw_stand_mins * 60) / total_seconds, 0.5)
+            range_m = h_after - h_before
+            stand_top = h_before + range_m * lw_stand_frac
+
+            if fraction < stand_proportion:
+                # Linear rise during the young-flood stand.
+                return h_before + (stand_top - h_before) * (fraction / stand_proportion)
+
+            # Cosine from the top of the stand up to HW.
+            adjusted = (fraction - stand_proportion) / (1 - stand_proportion)
+            return _cosine_interp(adjusted, stand_top, h_after)
+
+        # Pure cosine fallback (legacy, pre-v2.5.3 behaviour).
         return _cosine_interp(fraction, h_before, h_after)
     elif et_before == "HighWater" and et_after == "LowWater":
         # Ebbing tide - apply asymmetry via stand effect
@@ -391,11 +437,11 @@ def generate_event_uid(mooring_id: int, hw_timestamp: str) -> str:
     predicted it (harmonic +/- 30min vs UKHO). The average tidal cycle is
     12.42 hours; dividing hours-since-epoch by this and rounding gives
     a cycle ID that's stable for shifts of up to +/- 3 hours.
+
+    Cycle epoch and length come from the shared helper in app.config
+    (compute_cycle_number) so this UID matches the cycle_number column
+    in harmonic_predictions and the UID generated by
+    ical_manager._tide_event_uid for the same tide.
     """
-    dt = dtparse.parse(hw_timestamp)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    epoch = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    hours_since_epoch = (dt - epoch).total_seconds() / 3600.0
-    cycle_number = round(hours_since_epoch / 12.4167)
+    cycle_number = compute_cycle_number(hw_timestamp)
     return f"tidal-access-m{mooring_id:03d}-c{cycle_number:05d}@langstone"

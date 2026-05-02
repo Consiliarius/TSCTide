@@ -239,6 +239,102 @@
     font-style: italic;
   }
 
+  /* Tides tab */
+  .tide-event-table {
+    width: 100%; border-collapse: collapse; font-size: 13px;
+    margin-bottom: 4px;
+  }
+  .tide-event-table th {
+    background: var(--navy); color: #fff; padding: 6px 10px;
+    text-align: left; font-weight: 600;
+    position: sticky; top: 0;
+  }
+  .tide-event-table td {
+    padding: 6px 10px; border-bottom: 1px solid var(--sand-dark);
+  }
+  .tide-event-table tr:nth-child(even) { background: var(--sand); }
+  .tide-event-table tr.tide-hw td { font-weight: 600; }
+  .tide-event-table tr.tide-lw { color: var(--text-light); }
+  .station-badge {
+    display: inline-block; padding: 1px 6px; border-radius: 3px;
+    font-size: 10px; font-weight: 700; text-transform: uppercase;
+    color: #fff;
+  }
+  .station-langstone { background: var(--ok); }
+  .station-portsmouth { background: var(--est); }
+  /* Harmonic predictions are model-derived, not measured. The dashed
+     border and warm hue distinguish them from the solid UKHO badges so
+     the user is always aware which rows are estimates. */
+  .station-harmonic {
+    background: #fce8c8; color: #7a5020; border: 1px dashed #b07a30;
+    padding: 0 5px;
+  }
+
+  /* Tides Forecast: source-break separator row inserted between the last
+     UKHO event and the first harmonic event in the extended view. */
+  .tide-source-break td {
+    background: #fff8e8; color: #7a5020;
+    font-style: italic; text-align: center;
+    padding: 8px 10px; font-weight: 600; border: 1px solid #ffc107;
+  }
+
+  /* Subscribe links shown in the Tides tab toolbar. */
+  .subscribe-block {
+    background: var(--sand); border: 1px dashed var(--border);
+    border-radius: var(--radius); padding: 8px 10px; margin-bottom: 12px;
+    font-size: 12px; color: var(--text);
+  }
+  .subscribe-block .subscribe-row { margin: 3px 0; }
+  .subscribe-block .subscribe-row a {
+    color: var(--sea); font-family: monospace; word-break: break-all;
+  }
+  .subscribe-block .subscribe-note {
+    color: var(--text-light); font-style: italic; margin-top: 4px;
+  }
+
+  /* Tides view: history month grouping */
+  .tide-month-panel {
+    background: #fff; border: 1px solid var(--border);
+    border-radius: var(--radius); margin-bottom: 8px; overflow: hidden;
+  }
+  .tide-month-header {
+    background: var(--sand-dark); color: var(--navy);
+    padding: 6px 12px; font-weight: 600; font-size: 13px;
+    cursor: pointer; user-select: none;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .tide-month-header .toggle { font-size: 11px; opacity: 0.7; }
+  .tide-month-body.collapsed { display: none; }
+
+  /* PIN modal */
+  #pin-modal-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.55);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 1000;
+  }
+  /* ID selectors beat class selectors on specificity, so the generic
+     .hidden rule below cannot hide this overlay on its own. Add an
+     element-specific rule so the hidden class works as expected. */
+  #pin-modal-overlay.hidden { display: none; }
+  #pin-modal {
+    background: #fff; border-radius: var(--radius);
+    padding: 16px 18px; min-width: 280px; max-width: 360px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+  }
+  #pin-modal-title {
+    font-size: 15px; font-weight: 600; color: var(--navy); margin-bottom: 4px;
+  }
+  #pin-modal-subtitle {
+    font-size: 12px; color: var(--text-light); margin-bottom: 10px;
+  }
+  #pin-modal-error {
+    background: #f8d7da; color: #721c24; padding: 6px 10px;
+    border-radius: var(--radius); font-size: 12px; margin-bottom: 10px;
+  }
+  #pin-modal input {
+    letter-spacing: 4px; text-align: center; font-size: 16px;
+  }
+
   .hidden { display: none; }
   .mt-8 { margin-top: 8px; }
   .mb-8 { margin-bottom: 8px; }
@@ -263,6 +359,7 @@
   <!-- Tab navigation -->
   <div class="tabs">
     <button class="tab active" data-view="main" onclick="switchView('main')">Access Windows</button>
+    <button class="tab" data-view="tides" onclick="switchView('tides')">Tides</button>
     <button class="tab" data-view="system" onclick="switchView('system')">System Activity</button>
     <button class="tab" data-view="moorings" onclick="switchView('moorings')">Mooring Configs</button>
   </div>
@@ -287,6 +384,9 @@
       <p>If you are using a mooring ID, you can enable <b>Use Observational Data</b> to provide observational information as to whether your boat is afloat or aground at specific times. Over time, these observations narrow down the true drying height of your mooring and a confidence rating is shown. Observations can be entered manually or batch-imported from a spreadsheet that you can fill in over time.</p>
       <p style="font-weight:600;margin-top:10px;">Wind offset</p>
       <p>If your mooring is near the edge of the channel, the direction the boat lies as the tide drops affects the depth available. Provide the direction in which the shallower-water lies, and the additional extra height of the ground in that direction have access windows automatically adjusted for when the wind may have pushed the boat toward the shallow side. During each tide's ebb, the system checks which direction the wind is blowing and updates the access window if it's likely the boat is lying on dryer/shallower ground.</p>
+      <p style="font-weight:600;margin-top:10px;">PIN protection</p>
+      <p>Each mooring configuration is protected by a 6-digit PIN. The first time you save a mooring, you will be prompted to set a PIN — keep a note of it, as it is required for any future changes to that mooring's configuration, observations, or calendar feed. The PIN is cached for the duration of your browser session so you will not be asked repeatedly. If you forget your PIN, the person who manages the server can reset it for you.</p>
+
 	  <p style="font-weight:600;margin-top:10px;">Obligatory safety warning</p>
 	  <p>This tool is provided with absolutely no guarantee of accuracy and may have limited value over simply assuming you can use your boat around 2 hours either side of High Water. It should not be relied upon for navigation, safety or any other critical purpose.</p>
     </div>
@@ -376,6 +476,8 @@
       <div class="btn-group">
         <button class="btn-primary" onclick="saveConfig()">Save Configuration</button>
         <button class="btn-sea" onclick="loadConfig()">Load from Mooring ID</button>
+        <button class="btn-sm" style="background:var(--sea-light);color:#fff;" onclick="changePin()">Change PIN</button>
+        <button class="btn-sm" style="background:var(--warn);color:#fff;" onclick="deleteMooring()">Delete Mooring</button>
       </div>
       <div id="cfg-status"></div>
 
@@ -535,12 +637,60 @@
       </div>
       <div class="btn-group hidden" id="results-actions">
         <button class="btn-primary" onclick="exportIcs()">Download .ICS</button>
-        <button class="btn-ok hidden" id="btn-add-feed" onclick="addToFeed()">Add to Calendar Feed</button>
+        <button class="btn-ok hidden" id="btn-add-feed" onclick="updateFeed()">Update Feed</button>
       </div>
     </div>
   </div>
 
   </div><!-- end #view-main -->
+
+  <!-- Tides view -->
+  <div class="view" id="view-tides">
+    <div class="panel">
+      <div class="panel-header" style="cursor:default;">Tides at Langstone Harbour</div>
+      <div class="panel-body">
+        <div class="row" style="margin-bottom:10px;align-items:end;">
+          <div>
+            <label>View</label>
+            <select id="tides-range" onchange="onTidesRangeChange()">
+              <option value="forecast" selected>Forecast (next 7 days)</option>
+              <option value="extended">Forecast (next 180 days)</option>
+              <option value="history">History (last 12 months)</option>
+            </select>
+          </div>
+          <div>
+            <label>Time zone</label>
+            <select id="tides-tz" onchange="renderTides()">
+              <option value="local" selected>Local (Europe/London)</option>
+              <option value="utc">UTC</option>
+            </select>
+          </div>
+          <div style="flex:0;">
+            <button class="btn-sm btn-primary" id="tides-refresh-btn" onclick="refreshTidesFromUKHO()">Refresh from UKHO</button>
+          </div>
+        </div>
+        <div id="tides-status"></div>
+
+        <!-- Subscribable Langstone tide feeds. Both regenerate daily at 02:00. -->
+        <div class="subscribe-block">
+          <div style="font-weight:600;color:var(--navy);margin-bottom:4px;">Subscribable tide feeds</div>
+          <div class="subscribe-row">
+            7-day UKHO: <a id="langstone-ukho-7d-url" href="/feeds/Langstone_UKHO_7d.ics">Langstone_UKHO_7d.ics</a>
+          </div>
+          <div class="subscribe-row">
+            180-day extended: <a id="langstone-180d-url" href="/feeds/Langstone_Harmonic_180d.ics">Langstone_Harmonic_180d.ics</a>
+          </div>
+          <div class="subscribe-note">
+            The 7-day feed is UKHO Admiralty data only. The 180-day feed uses UKHO for the next 7 days and the built-in harmonic model for days 8–180; harmonic events are marked “est.” in their title and are accurate to roughly +/-15-20min on time and +/-0.15m on height. Both feeds refresh daily at 02:00.
+          </div>
+        </div>
+
+        <div id="tides-content">
+          <p style="color:var(--text-light);font-size:12px;">Loading...</p>
+        </div>
+      </div>
+    </div>
+  </div>
 
   <!-- System Activity view -->
   <div class="view" id="view-system">
@@ -597,10 +747,48 @@
 
 </div><!-- end container -->
 
+<!-- PIN modal (v2) -->
+<div id="pin-modal-overlay" class="hidden">
+  <div id="pin-modal">
+    <div id="pin-modal-title">Enter PIN</div>
+    <div id="pin-modal-subtitle"></div>
+    <div id="pin-modal-error" class="hidden"></div>
+
+    <div id="pin-field-current-wrap" class="hidden">
+      <label>Current PIN</label>
+      <input type="password" id="pin-field-current"
+             inputmode="numeric" pattern="[0-9]{6}" maxlength="6"
+             autocomplete="off">
+    </div>
+
+    <div id="pin-field-new-wrap">
+      <label id="pin-field-new-label">PIN</label>
+      <input type="password" id="pin-field-new"
+             inputmode="numeric" pattern="[0-9]{6}" maxlength="6"
+             autocomplete="off">
+    </div>
+
+    <div id="pin-field-confirm-wrap" class="hidden">
+      <label>Confirm PIN</label>
+      <input type="password" id="pin-field-confirm"
+             inputmode="numeric" pattern="[0-9]{6}" maxlength="6"
+             autocomplete="off">
+    </div>
+
+    <div class="btn-group">
+      <button class="btn-primary" onclick="pinModalSubmit()">Submit</button>
+      <button class="btn-sm" style="background:var(--border);color:var(--text);" onclick="pinModalCancel()">Cancel</button>
+    </div>
+  </div>
+</div>
+
 <script>
 // State
 let lastWindows = [];
 let lastSource = '';
+// v2: wind_info preserved from last /calculate response so the Update Feed
+// button can pass wind metadata through to the feed-update endpoint.
+let lastWindInfo = null;
 // Calibration and observation list cached so renderObservations can
 // merge classifications into the observation rows without an extra fetch.
 let lastCalibration = null;
@@ -610,6 +798,12 @@ let lastObservations = null;
 // to lazy-load activity on the first expand only, rather than on every
 // expand or up-front for every mooring.
 const mooringActivityLoaded = new Set();
+
+// v2 PIN protection. currentPin is the PIN the user most recently entered
+// that successfully authenticated against currentPinMooringId. Cleared on
+// mooring-ID change and on page reload. Never persisted to storage.
+let currentPin = null;
+let currentPinMooringId = null;
 
 // --- Panel toggle ---
 function togglePanel(id) {
@@ -625,8 +819,14 @@ function toggleWindConfig() {
 }
 
 function updateMooringOptions() {
-  const mid = document.getElementById('mooring_id').value;
-  document.getElementById('mooring-options').classList.toggle('hidden', !mid);
+  const midStr = document.getElementById('mooring_id').value;
+  const mid = parseInt(midStr) || null;
+  document.getElementById('mooring-options').classList.toggle('hidden', !midStr);
+  // v2: invalidate the cached PIN if the mooring ID has changed. A PIN
+  // is only valid for the mooring against which it was verified.
+  if (currentPinMooringId !== null && currentPinMooringId !== mid) {
+    setCurrentPin(null, null);
+  }
 }
 
 function hideAllSourceSections() {
@@ -659,17 +859,271 @@ function num(id, def) {
   return isNaN(n) ? def : n;
 }
 
+// --- PIN protection (v2) ---
+
+function setCurrentPin(pin, mooringId) {
+  currentPin = pin || null;
+  currentPinMooringId = (pin && mooringId) ? mooringId : null;
+}
+
+// Modal state. The resolver/rejector of the currently-open prompt Promise
+// and the mode string are kept in module scope because the modal is a
+// singleton in the DOM - only one prompt can be active at a time.
+let pinModalResolver = null;
+let pinModalRejector = null;
+let pinModalMode = null;
+
+function promptForPin(opts) {
+  pinModalMode = opts.mode || 'verify';
+  const mooringId = opts.mooringId;
+
+  document.getElementById('pin-field-current').value = '';
+  document.getElementById('pin-field-new').value = '';
+  document.getElementById('pin-field-confirm').value = '';
+
+  // Field visibility per mode:
+  //   verify: new only (label becomes "PIN")
+  //   claim:  new + confirm
+  //   change: current + new + confirm
+  document.getElementById('pin-field-current-wrap')
+    .classList.toggle('hidden', pinModalMode !== 'change');
+  document.getElementById('pin-field-confirm-wrap')
+    .classList.toggle('hidden', pinModalMode === 'verify');
+
+  const titles = {
+    claim: 'Set PIN for mooring #' + mooringId,
+    verify: 'Enter PIN for mooring #' + mooringId,
+    change: 'Change PIN for mooring #' + mooringId,
+  };
+  const subtitles = {
+    claim: 'Choose a 6-digit PIN. You will need it for future changes to this mooring.',
+    verify: 'Enter the 6-digit PIN for this mooring.',
+    change: 'Enter your current PIN, then choose a new 6-digit PIN.',
+  };
+  document.getElementById('pin-modal-title').textContent = titles[pinModalMode];
+  document.getElementById('pin-modal-subtitle').textContent = subtitles[pinModalMode];
+  document.getElementById('pin-field-new-label').textContent =
+    pinModalMode === 'verify' ? 'PIN' : 'New PIN';
+
+  const errEl = document.getElementById('pin-modal-error');
+  if (opts.errorMsg) {
+    errEl.textContent = opts.errorMsg;
+    errEl.classList.remove('hidden');
+  } else {
+    errEl.classList.add('hidden');
+  }
+
+  document.getElementById('pin-modal-overlay').classList.remove('hidden');
+
+  // Focus first relevant input once the overlay is visible.
+  setTimeout(() => {
+    const first = pinModalMode === 'change'
+      ? document.getElementById('pin-field-current')
+      : document.getElementById('pin-field-new');
+    if (first) first.focus();
+  }, 50);
+
+  return new Promise((resolve, reject) => {
+    pinModalResolver = resolve;
+    pinModalRejector = reject;
+  });
+}
+
+function setPinModalError(msg) {
+  const errEl = document.getElementById('pin-modal-error');
+  errEl.textContent = msg;
+  errEl.classList.remove('hidden');
+}
+
+function pinModalSubmit() {
+  const current = document.getElementById('pin-field-current').value;
+  const newVal = document.getElementById('pin-field-new').value;
+  const confirmVal = document.getElementById('pin-field-confirm').value;
+  const digits6 = /^\d{6}$/;
+
+  if (pinModalMode === 'verify') {
+    if (!digits6.test(newVal)) {
+      setPinModalError('PIN must be exactly 6 digits.');
+      return;
+    }
+    const resolver = pinModalResolver;
+    closePinModal();
+    resolver({ pin: newVal });
+  } else if (pinModalMode === 'claim') {
+    if (!digits6.test(newVal)) {
+      setPinModalError('PIN must be exactly 6 digits.');
+      return;
+    }
+    if (newVal !== confirmVal) {
+      setPinModalError('PINs do not match.');
+      return;
+    }
+    const resolver = pinModalResolver;
+    closePinModal();
+    resolver({ pin: newVal });
+  } else if (pinModalMode === 'change') {
+    if (!digits6.test(current)) {
+      setPinModalError('Current PIN must be 6 digits.');
+      return;
+    }
+    if (!digits6.test(newVal)) {
+      setPinModalError('New PIN must be 6 digits.');
+      return;
+    }
+    if (newVal !== confirmVal) {
+      setPinModalError('New PINs do not match.');
+      return;
+    }
+    const resolver = pinModalResolver;
+    closePinModal();
+    resolver({ currentPin: current, newPin: newVal });
+  }
+}
+
+function pinModalCancel() {
+  const rejector = pinModalRejector;
+  closePinModal();
+  if (rejector) rejector(new Error('PIN prompt cancelled'));
+}
+
+function closePinModal() {
+  document.getElementById('pin-modal-overlay').classList.add('hidden');
+  pinModalResolver = null;
+  pinModalRejector = null;
+}
+
+// Keyboard: Enter submits, Escape cancels when modal is open.
+document.addEventListener('keydown', (e) => {
+  const overlay = document.getElementById('pin-modal-overlay');
+  if (!overlay || overlay.classList.contains('hidden')) return;
+  if (e.key === 'Enter') { pinModalSubmit(); e.preventDefault(); }
+  else if (e.key === 'Escape') { pinModalCancel(); e.preventDefault(); }
+});
+
+// pinnedFetch wraps a write request with automatic PIN-prompt handling.
+// On 401 with pin_required=verify, prompts the user to enter a PIN and
+// retries. On 403 with pin_required=claim, prompts the user to set a PIN
+// via the /pin endpoint, then retries. On 429 (lockout) gives up and
+// surfaces the lockout to the user. Other error statuses are returned
+// as-is for the caller to handle with its existing error logic.
+//
+// The caller's trialPin (the PIN the user most recently typed into a
+// verify prompt) is kept local to this function and only promoted to
+// currentPin on successful 200. This prevents a cancelled or
+// MAX_PROMPTS-exhausted sequence from leaving a wrong PIN cached, which
+// would silently burn a server-side retry slot on the next write.
+async function pinnedFetch(url, options, mooringId) {
+  // Aligned with server-side MAX_PIN_ATTEMPTS so the UI does not give up
+  // before the server does. With lower values the user had to re-click
+  // their write button partway through their retry allowance, which was
+  // confusing for no benefit.
+  const MAX_PROMPTS = 5;
+  let promptCount = 0;
+  let errMsgForNextPrompt = null;
+  let trialPin = null;
+
+  while (true) {
+    const reqOpts = { ...(options || {}) };
+    reqOpts.headers = { ...((options && options.headers) || {}) };
+    // Prefer the trial PIN (just typed by the user) over the cached one.
+    // If neither is available, send no header and let the server respond
+    // with pin_required=verify for the UI to handle.
+    const headerPin = trialPin ||
+      (currentPin && currentPinMooringId === mooringId ? currentPin : null);
+    if (headerPin) {
+      reqOpts.headers['X-Mooring-PIN'] = headerPin;
+    }
+
+    const res = await fetch(url, reqOpts);
+    if (res.ok) {
+      // Only promote the trial PIN to the cache once the server has
+      // actually accepted it.
+      if (trialPin) setCurrentPin(trialPin, mooringId);
+      return res;
+    }
+
+    let errBody = null;
+    try { errBody = await res.clone().json(); } catch (e) { /* not JSON */ }
+    const detail = errBody && errBody.detail;
+    const detailIsDict = detail && typeof detail === 'object';
+    const pinRequired = detailIsDict ? detail.pin_required : null;
+
+    if (res.status === 429) {
+      const sec = detailIsDict ? (detail.seconds_remaining || 0) : 0;
+      const min = Math.ceil(sec / 60);
+      setCurrentPin(null, null);
+      throw new Error(
+        `Too many failed PIN attempts. Locked out for ${min || 1} more minute(s).`
+      );
+    }
+
+    if (res.status === 403 && pinRequired === 'claim') {
+      if (promptCount >= MAX_PROMPTS) return res;
+      promptCount++;
+      const result = await promptForPin({
+        mode: 'claim', mooringId, errorMsg: errMsgForNextPrompt,
+      });
+      // Claim is a separate endpoint; direct fetch avoids recursion.
+      const claimRes = await fetch(`/api/moorings/${mooringId}/pin`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ new_pin: result.pin }),
+      });
+      if (!claimRes.ok) {
+        let errData = {};
+        try { errData = await claimRes.json(); } catch (e) {}
+        errMsgForNextPrompt =
+          (errData.detail && (errData.detail.message || errData.detail)) ||
+          'Failed to set PIN';
+        continue;
+      }
+      // The server has confirmed the claim so caching is safe. Clear
+      // any trialPin from a preceding verify attempt - it is no longer
+      // meaningful now the mooring has been (re-)claimed with a new PIN.
+      setCurrentPin(result.pin, mooringId);
+      trialPin = null;
+      errMsgForNextPrompt = null;
+      continue;
+    }
+
+    if (res.status === 401 && pinRequired === 'verify') {
+      if (promptCount >= MAX_PROMPTS) return res;
+      promptCount++;
+      const attemptsMsg = detailIsDict && detail.attempts_remaining !== undefined
+        ? `Incorrect PIN. ${detail.attempts_remaining} attempt(s) remaining.`
+        : null;
+      const result = await promptForPin({
+        mode: 'verify', mooringId,
+        errorMsg: attemptsMsg || errMsgForNextPrompt,
+      });
+      // Hold the user's input in trialPin only; do NOT touch currentPin.
+      // The cache is updated only if the server accepts this PIN on the
+      // next iteration.
+      trialPin = result.pin;
+      errMsgForNextPrompt = null;
+      continue;
+    }
+
+    return res;
+  }
+}
+
 // --- Config ---
 function getConfig() {
+  const mooringOptionsHidden = document.getElementById('mooring-options').classList.contains('hidden');
   return {
     mooring_id: parseInt(document.getElementById('mooring_id').value) || null,
     boat_name: document.getElementById('boat_name').value,
     draught_m: num('draught_m', 1.0),
     drying_height_m: num('drying_height_m', 2.0),
     safety_margin_m: num('safety_margin_m', 0.3),
-    wind_offset_enabled: document.getElementById('wind_offset_enabled').checked ? 1 : 0,
-    shallow_direction: document.getElementById('shallow_direction').value,
-    shallow_extra_depth_m: num('shallow_extra_depth_m', 0),
+    // Wind offset fields are only meaningful when a mooring ID is set.
+    // When mooring-options is hidden the user has cleared the mooring ID,
+    // so zero these out so stale values from a previously-loaded mooring
+    // cannot leak into an anonymous calculation request.
+    wind_offset_enabled: mooringOptionsHidden ? 0 : (document.getElementById('wind_offset_enabled').checked ? 1 : 0),
+    shallow_direction: mooringOptionsHidden ? '' : document.getElementById('shallow_direction').value,
+    shallow_extra_depth_m: mooringOptionsHidden ? 0 : num('shallow_extra_depth_m', 0),
     calendar_enabled: document.getElementById('calendar_enabled').checked ? 1 : 0,
     use_observations: document.getElementById('use_observations').checked ? 1 : 0,
   };
@@ -711,17 +1165,96 @@ async function saveConfig() {
     showStatus('cfg-status', 'Mooring ID is required to save configuration.', 'err');
     return;
   }
+  // v2: track whether we had a PIN cached for this mooring before the save.
+  // If not AND the save succeeds without pinnedFetch triggering a verify
+  // prompt (i.e. the mooring was new or unclaimed), prompt the user to
+  // claim a PIN immediately.
+  const hadPinBefore = !!(currentPin && currentPinMooringId === cfg.mooring_id);
   try {
-    const res = await fetch('/api/moorings', {
+    const res = await pinnedFetch('/api/moorings', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(cfg)
-    });
+    }, cfg.mooring_id);
     const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || 'Save failed');
+    if (!res.ok) {
+      const msg = (data.detail && (data.detail.message || data.detail)) || 'Save failed';
+      throw new Error(msg);
+    }
     showStatus('cfg-status', `Configuration saved for Mooring ${cfg.mooring_id}.`, 'ok');
     updateFeedUrl(cfg);
     toggleObsPanel();
+
+    // Prompt to claim a PIN if the mooring is unclaimed (we didn't have a
+    // PIN before, and pinnedFetch didn't set one during the save).
+    const hasPinNow = !!(currentPin && currentPinMooringId === cfg.mooring_id);
+    if (!hadPinBefore && !hasPinNow) {
+      await _promptToClaim(cfg.mooring_id);
+    }
   } catch(e) {
+    showStatus('cfg-status', e.message, 'err');
+  }
+}
+
+async function _promptToClaim(mooringId) {
+  try {
+    const result = await promptForPin({ mode: 'claim', mooringId });
+    const res = await fetch(`/api/moorings/${mooringId}/pin`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ new_pin: result.pin }),
+    });
+    let data = {};
+    try { data = await res.json(); } catch (e) {}
+    if (res.ok) {
+      setCurrentPin(result.pin, mooringId);
+      showStatus('cfg-status',
+        'PIN claimed. Keep it safe - you will need it for future changes.', 'ok');
+    } else {
+      const msg = (data.detail && (data.detail.message || data.detail)) ||
+        'PIN claim failed';
+      showStatus('cfg-status', 'Configuration saved, but PIN claim failed: ' + msg, 'err');
+    }
+  } catch(e) {
+    if (e.message === 'PIN prompt cancelled') {
+      // Save succeeded but the mooring is still unclaimed. The ONLY path
+      // back to claiming is another Save - the Change PIN flow requires
+      // a current PIN, which does not exist yet. Do NOT suggest Change
+      // PIN here, it would be misleading.
+      showStatus('cfg-status',
+        'Configuration saved without a PIN. Save again to set a PIN.',
+        'info');
+    } else {
+      showStatus('cfg-status', e.message, 'err');
+    }
+  }
+}
+
+async function changePin() {
+  const cfg = getConfig();
+  if (!cfg.mooring_id) {
+    showStatus('cfg-status', 'Enter a Mooring ID first.', 'err');
+    return;
+  }
+  try {
+    const result = await promptForPin({ mode: 'change', mooringId: cfg.mooring_id });
+    const res = await fetch(`/api/moorings/${cfg.mooring_id}/pin`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        current_pin: result.currentPin,
+        new_pin: result.newPin,
+      }),
+    });
+    let data = {};
+    try { data = await res.json(); } catch (e) {}
+    if (!res.ok) {
+      const msg = (data.detail && (data.detail.message || data.detail)) || 'Change failed';
+      throw new Error(msg);
+    }
+    setCurrentPin(result.newPin, cfg.mooring_id);
+    showStatus('cfg-status', 'PIN changed successfully.', 'ok');
+  } catch(e) {
+    if (e.message === 'PIN prompt cancelled') return;
     showStatus('cfg-status', e.message, 'err');
   }
 }
@@ -736,9 +1269,65 @@ async function loadConfig() {
     const res = await fetch('/api/moorings/' + mid);
     if (res.status === 404) throw new Error('Mooring not found');
     const data = await res.json();
+    // setConfig invokes toggleObsPanel() internally; no need to call it
+    // again here - doing so would double-fire the observations and
+    // calibration fetches.
     setConfig(data);
     showStatus('cfg-status', `Loaded configuration for Mooring ${mid}.`, 'ok');
+  } catch(e) {
+    showStatus('cfg-status', e.message, 'err');
+  }
+}
+
+async function deleteMooring() {
+  const cfg = getConfig();
+  if (!cfg.mooring_id) {
+    showStatus('cfg-status', 'Enter a Mooring ID first.', 'err');
+    return;
+  }
+  // Friction beyond the PIN: require the user to type the mooring ID
+  // back to confirm. Prevents an accidentally-cached PIN session from
+  // wiping out a mooring with one click.
+  const typed = prompt(
+    `This will permanently delete mooring #${cfg.mooring_id}, all its ` +
+    `observations, and its calendar feed file. This cannot be undone.\n\n` +
+    `Type the mooring ID (${cfg.mooring_id}) to confirm:`
+  );
+  if (typed === null) return; // user cancelled
+  if (parseInt(typed) !== cfg.mooring_id) {
+    showStatus('cfg-status', 'Mooring ID did not match. Deletion cancelled.', 'err');
+    return;
+  }
+  try {
+    const res = await pinnedFetch(`/api/moorings/${cfg.mooring_id}`, {
+      method: 'DELETE'
+    }, cfg.mooring_id);
+    const data = await res.json();
+    if (!res.ok) {
+      const msg = (data.detail && (data.detail.message || data.detail)) || 'Delete failed';
+      throw new Error(msg);
+    }
+    // Wipe the form and PIN cache - the mooring no longer exists.
+    setCurrentPin(null, null);
+    document.getElementById('mooring_id').value = '';
+    document.getElementById('boat_name').value = '';
+    document.getElementById('drying_height_m').value = '2.0';
+    document.getElementById('shallow_extra_depth_m').value = '0.0';
+    document.getElementById('shallow_direction').value = '';
+    document.getElementById('wind_offset_enabled').checked = false;
+    document.getElementById('calendar_enabled').checked = false;
+    document.getElementById('use_observations').checked = false;
+    updateMooringOptions();
+    toggleWindConfig();
     toggleObsPanel();
+    document.getElementById('feed-url-section').classList.add('hidden');
+    showStatus('cfg-status',
+      `Mooring ${data.mooring_id} deleted. ` +
+      `Removed ${data.db_counts.observations} observation(s), ` +
+      `${data.db_counts.calendar_events} stored event(s)` +
+      (data.feed_file_removed ? ', and the feed file' : '') +
+      `.`,
+      'ok');
   } catch(e) {
     showStatus('cfg-status', e.message, 'err');
   }
@@ -774,9 +1363,12 @@ async function calculate(source) {
 
     lastWindows = data.windows;
     lastSource = source;
+    lastWindInfo = data.wind_info || null;
     renderResults(data);
     let msg = `${data.event_count} access window(s) from ${source.toUpperCase()} data.`;
-    if (data.feed_updated) msg += ' Calendar feed updated.';
+    // v2: feed is no longer auto-updated by calculation. When the mooring
+    // has calendar subscription enabled, the Update Feed button in the
+    // results panel lets the user push the results to the feed.
     showStatus('calc-status', msg, 'ok');
   } catch(e) {
     showStatus('calc-status', e.message, 'err');
@@ -896,9 +1488,13 @@ function renderResults(data) {
   // Show action buttons
   actionsDiv.classList.remove('hidden');
   const cfg = getConfig();
-  // "Add to Calendar Feed" only needed when mooring is set but calendar subscription
-  // is not enabled — when enabled, the feed auto-updates on every calculation.
-  if (cfg.mooring_id && !cfg.calendar_enabled) {
+  // v2: "Update Feed" is shown when the mooring has calendar subscription
+  // enabled. Previously "Add to Calendar Feed" was shown only when it was
+  // NOT enabled, because calculation auto-updated the feed. Calculation is
+  // now read-only and the user must press Update Feed explicitly. When
+  // calendar is disabled, per user preference, no feed is generated at
+  // all, so the button is hidden.
+  if (cfg.mooring_id && cfg.calendar_enabled) {
     addBtn.classList.remove('hidden');
   } else {
     addBtn.classList.add('hidden');
@@ -930,25 +1526,45 @@ async function exportIcs() {
   }
 }
 
-async function addToFeed() {
+async function updateFeed() {
   const cfg = getConfig();
   if (!cfg.mooring_id) return;
+  if (!lastWindows || !lastWindows.length) {
+    showStatus('calc-status', 'Calculate access windows first before updating the feed.', 'err');
+    return;
+  }
   try {
-    const res = await fetch('/api/calculate', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({
-        source: lastSource,
+    // Push the last calculated windows into the mooring's stored events
+    // and regenerate the .ics feed (PIN-gated). The body shape matches
+    // what /api/calculate returned so the backend can reconstruct event
+    // descriptions with the same parameters and wind info.
+    const body = {
+      source: lastSource,
+      windows: lastWindows,
+      parameters: {
         draught_m: cfg.draught_m,
         drying_height_m: cfg.drying_height_m,
         safety_margin_m: cfg.safety_margin_m,
-        mooring_id: cfg.mooring_id,
-        add_to_feed: true,
-        days: lastSource === 'harmonic' ? (parseInt(document.getElementById('harmonic_days').value) || 30) : undefined,
-      })
-    });
+      },
+      wind_info: lastWindInfo,
+    };
+    const res = await pinnedFetch(`/api/moorings/${cfg.mooring_id}/feed/update`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    }, cfg.mooring_id);
     const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || 'Failed');
-    showStatus('calc-status', 'Events added to calendar feed.', 'ok');
+    if (!res.ok) {
+      const msg = (data.detail && (data.detail.message || data.detail)) || 'Update failed';
+      throw new Error(msg);
+    }
+    if (data.feed_generated) {
+      showStatus('calc-status',
+        `Calendar feed updated (${data.window_count} windows).`, 'ok');
+    } else {
+      showStatus('calc-status',
+        'Events stored but feed not regenerated (calendar subscription is disabled).',
+        'info');
+    }
   } catch(e) {
     showStatus('calc-status', e.message, 'err');
   }
@@ -989,10 +1605,10 @@ async function submitObservation() {
     direction_of_lay: document.getElementById('obs_lay').value,
   };
   try {
-    const res = await fetch(`/api/moorings/${cfg.mooring_id}/observations`, {
+    const res = await pinnedFetch(`/api/moorings/${cfg.mooring_id}/observations`, {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(body)
-    });
+    }, cfg.mooring_id);
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || 'Failed');
     // Auto-apply of drying height was removed deliberately - calibration
@@ -1020,11 +1636,11 @@ async function uploadObsXlsx() {
   showStatus('obs-status', 'Uploading...', 'info');
   try {
     const buf = await file.arrayBuffer();
-    const res = await fetch(`/api/moorings/${cfg.mooring_id}/observations/upload`, {
+    const res = await pinnedFetch(`/api/moorings/${cfg.mooring_id}/observations/upload`, {
       method: 'POST',
       headers: {'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'},
       body: buf
-    });
+    }, cfg.mooring_id);
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || 'Upload failed');
     // Auto-apply of drying height was removed - see submitObservation().
@@ -1193,9 +1809,10 @@ async function applyDryingHeight() {
   const cfg = getConfig();
   if (!cfg.mooring_id) return;
   try {
-    const res = await fetch(
+    const res = await pinnedFetch(
       `/api/moorings/${cfg.mooring_id}/calibration/apply-drying-height`,
-      {method: 'POST'}
+      {method: 'POST'},
+      cfg.mooring_id
     );
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || 'Apply failed');
@@ -1221,9 +1838,10 @@ async function applyWindOffset() {
   const cfg = getConfig();
   if (!cfg.mooring_id) return;
   try {
-    const res = await fetch(
+    const res = await pinnedFetch(
       `/api/moorings/${cfg.mooring_id}/calibration/apply-wind-offset`,
-      {method: 'POST'}
+      {method: 'POST'},
+      cfg.mooring_id
     );
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || 'Apply failed');
@@ -1294,9 +1912,9 @@ async function deleteObservation(obsId) {
   const cfg = getConfig();
   if (!cfg.mooring_id) return;
   try {
-    const res = await fetch(`/api/moorings/${cfg.mooring_id}/observations/${obsId}`, {
+    const res = await pinnedFetch(`/api/moorings/${cfg.mooring_id}/observations/${obsId}`, {
       method: 'DELETE'
-    });
+    }, cfg.mooring_id);
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || 'Failed');
     showStatus('obs-status', 'Observation deleted.', 'ok');
@@ -1312,9 +1930,9 @@ async function clearAllObservations() {
   if (!cfg.mooring_id) return;
   if (!confirm('Delete all observations for this mooring? This cannot be undone.')) return;
   try {
-    const res = await fetch(`/api/moorings/${cfg.mooring_id}/observations`, {
+    const res = await pinnedFetch(`/api/moorings/${cfg.mooring_id}/observations`, {
       method: 'DELETE'
-    });
+    }, cfg.mooring_id);
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || 'Failed');
     showStatus('obs-status', `Cleared ${data.deleted_count} observations.`, 'ok');
@@ -1348,6 +1966,15 @@ document.getElementById('obs_timestamp').value =
   } catch(e) { /* wind section stays hidden */ }
 })();
 
+// Tides tab state. Cached so range/timezone toggles re-render without
+// hitting the backend every time.
+let tidesData = null;
+let tidesRange = 'forecast';
+// Tracks which history month panels the user has expanded. Default is
+// only the current month expanded; user-expanded panels persist for
+// the lifetime of the page.
+const expandedMonths = new Set();
+
 // --- Tab switching ---
 function switchView(viewName) {
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -1356,6 +1983,337 @@ function switchView(viewName) {
   document.getElementById(`view-${viewName}`).classList.add('active');
   if (viewName === 'system') loadSystemLog();
   if (viewName === 'moorings') loadMooringConfigs();
+  if (viewName === 'tides') loadTides();
+}
+
+// --- Tides tab ---
+
+async function loadTides() {
+  tidesRange = document.getElementById('tides-range').value;
+  // Show or hide the Refresh button - it only makes sense for the
+  // forecast (and extended forecast) views since the UKHO API does not
+  // deliver historical data. For the extended view, refresh updates the
+  // UKHO portion (next 7 days). The harmonic portion only refreshes via
+  // the daily 02:00 scheduler job.
+  const refreshBtn = document.getElementById('tides-refresh-btn');
+  refreshBtn.classList.toggle('hidden', tidesRange === 'history');
+
+  document.getElementById('tides-content').innerHTML =
+    '<p style="color:var(--text-light);font-size:12px;">Loading...</p>';
+  try {
+    const res = await fetch(`/api/tides?range=${tidesRange}`);
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.detail || 'Failed to load tides');
+    }
+    tidesData = data;
+    renderTides();
+  } catch(e) {
+    document.getElementById('tides-content').innerHTML =
+      `<p style="color:var(--warn);font-size:12px;">Failed to load tides: ${escapeHtml(e.message)}</p>`;
+  }
+}
+
+function onTidesRangeChange() {
+  // Clear the cache and reload from the appropriate range.
+  tidesData = null;
+  expandedMonths.clear();
+  loadTides();
+}
+
+async function refreshTidesFromUKHO() {
+  showStatus('tides-status', 'Fetching latest UKHO data...', 'info');
+  try {
+    const res = await fetch('/api/fetch-ukho', {method:'POST'});
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Refresh failed');
+    showStatus('tides-status',
+      `Fetched ${data.fetched} events from UKHO (${data.station}).`, 'ok');
+    await loadTides();
+  } catch(e) {
+    showStatus('tides-status', e.message, 'err');
+  }
+}
+
+function formatTideTime(iso) {
+  if (!iso) return '—';
+  const useUtc = document.getElementById('tides-tz').value === 'utc';
+  const d = new Date(iso);
+  // "Local" means Europe/London for this app, NOT the browser's timezone.
+  // Tide data is for Langstone Harbour; users overseas should still see
+  // BST/GMT, not their local clock. Forcing the timezone explicitly also
+  // means the column-header label "Time (Europe/London)" is always honest.
+  const opts = useUtc
+    ? {hour:'2-digit', minute:'2-digit', timeZone:'UTC'}
+    : {hour:'2-digit', minute:'2-digit', timeZone:'Europe/London'};
+  return d.toLocaleTimeString('en-GB', opts);
+}
+
+function formatTideDate(iso) {
+  if (!iso) return '—';
+  const useUtc = document.getElementById('tides-tz').value === 'utc';
+  const d = new Date(iso);
+  // See formatTideTime: Europe/London, not browser TZ.
+  const opts = useUtc
+    ? {weekday:'short', day:'numeric', month:'short', timeZone:'UTC'}
+    : {weekday:'short', day:'numeric', month:'short', timeZone:'Europe/London'};
+  return d.toLocaleDateString('en-GB', opts);
+}
+
+// Header label for the time column. "Local" in this app always means
+// Europe/London (BST in summer, GMT in winter). Across a 12-month or
+// 180-day window the column will straddle DST transitions and contain
+// mixed-offset rows, so the header cannot legitimately say BST or GMT;
+// the explicit zone name removes ambiguity.
+function tideTimeHeader() {
+  const useUtc = document.getElementById('tides-tz').value === 'utc';
+  return useUtc ? 'Time (UTC)' : 'Time (Europe/London)';
+}
+
+// Determine which station a given row came from. The /api/tides endpoint
+// returns events with the raw `station` field intact - either 'langstone'
+// or 'portsmouth'.
+function stationBadge(stationName) {
+  if (stationName === 'portsmouth') {
+    return `<span class="station-badge station-portsmouth" title="UKHO Portsmouth, secondary port offset applies">P</span>`;
+  }
+  return `<span class="station-badge station-langstone" title="UKHO Langstone, native data">L</span>`;
+}
+
+// Source badge for the extended Forecast view: distinguishes UKHO
+// (measured/Admiralty data, days 0-7) from harmonic (model-derived
+// estimate, days 8-180). Stations from UKHO still show L/P; harmonic
+// rows show H. The data_source field is added by /api/tides for the
+// extended range and uniquely identifies the row's origin.
+function tideRowBadge(ev) {
+  if (ev.data_source === 'harmonic') {
+    return `<span class="station-badge station-harmonic" title="Harmonic model estimate, less accurate than UKHO">H</span>`;
+  }
+  return stationBadge(ev.station);
+}
+
+function renderTidesForecast(events) {
+  if (!events.length) {
+    return '<p style="color:var(--text-light);font-size:13px;">No forecast data available. Click Refresh to fetch from UKHO.</p>';
+  }
+  // Header note about the source: forecast events are normally all from
+  // a single source (whichever the most recent fetch returned), so a
+  // single line above the table is sufficient.
+  const stations = new Set(events.map(e => e.station));
+  let sourceNote = '';
+  if (stations.size === 1) {
+    const s = events[0].station;
+    if (s === 'portsmouth') {
+      sourceNote = `<p style="font-size:12px;color:var(--est);margin-bottom:6px;">` +
+        `Source: UKHO Portsmouth (Langstone-native data unavailable; secondary port offset is applied when computing access windows).</p>`;
+    } else {
+      sourceNote = `<p style="font-size:12px;color:var(--text-light);margin-bottom:6px;">` +
+        `Source: UKHO Langstone.</p>`;
+    }
+  }
+  return sourceNote + renderTideTable(events);
+}
+
+function renderTideTable(events) {
+  let html = '<table class="tide-event-table"><thead><tr>' +
+    '<th>Date</th>' +
+    `<th>${tideTimeHeader()}</th>` +
+    '<th>Type</th><th>Height</th><th title="Station">Src</th>' +
+    '</tr></thead><tbody>';
+  let lastSourceTag = null;
+  for (const e of events) {
+    // Insert a visual break row between the UKHO portion and the harmonic
+    // portion of an extended forecast. This only triggers when both kinds
+    // are present (extended view) and we're transitioning from one to the
+    // other; the regular forecast and history views never see this branch.
+    const sourceTag = e.data_source || 'ukho';
+    if (lastSourceTag === 'ukho' && sourceTag === 'harmonic') {
+      html += `<tr class="tide-source-break"><td colspan="5">` +
+        `─── Beyond this point: harmonic model estimates ` +
+        `(less accurate; refined to UKHO data within 7 days) ───` +
+        `</td></tr>`;
+    }
+    lastSourceTag = sourceTag;
+
+    const isHw = e.event_type === 'HighWater';
+    const cls = isHw ? 'tide-hw' : 'tide-lw';
+    const typeLabel = isHw ? 'HW' : 'LW';
+    // Harmonic events get a tilde prefix on the height to remind that the
+    // value is estimated. Time and date are not tilde-prefixed (would be
+    // visually noisy and the H badge is already present).
+    const heightStr = sourceTag === 'harmonic'
+      ? `~${e.height_m.toFixed(1)}m`
+      : `${e.height_m.toFixed(1)}m`;
+    html += `<tr class="${cls}">` +
+      `<td>${formatTideDate(e.timestamp)}</td>` +
+      `<td>${formatTideTime(e.timestamp)}</td>` +
+      `<td>${typeLabel}</td>` +
+      `<td>${heightStr}</td>` +
+      `<td>${tideRowBadge(e)}</td>` +
+      `</tr>`;
+  }
+  html += '</tbody></table>';
+  return html;
+}
+
+// Helper: extract the year and month integers for an event timestamp,
+// using either UTC or Europe/London as the reference timezone. Used by
+// the history and extended-forecast views to bucket events by month.
+// Crucially this is NOT browser-TZ-dependent: "Local" always means
+// Europe/London, so a user in another timezone sees the same buckets
+// as a UK user.
+function tideEventYearMonth(iso, useUtc) {
+  const d = new Date(iso);
+  if (useUtc) {
+    return {year: d.getUTCFullYear(), month: d.getUTCMonth()};
+  }
+  // Use Intl.DateTimeFormat to extract Europe/London year and month
+  // independent of the browser's locale. The 'en-GB' locale gives
+  // numeric outputs which we parse back to integers.
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Europe/London',
+    year: 'numeric',
+    month: 'numeric',
+  }).formatToParts(d);
+  let y = 0, m = 0;
+  for (const p of parts) {
+    if (p.type === 'year') y = parseInt(p.value, 10);
+    else if (p.type === 'month') m = parseInt(p.value, 10) - 1;  // 0-indexed
+  }
+  return {year: y, month: m};
+}
+
+function renderTidesHistory(events) {
+  if (!events.length) {
+    return '<p style="color:var(--text-light);font-size:13px;">No historical UKHO data available yet. Once daily fetches have run for a few days, this view will populate.</p>';
+  }
+  // Group by year-month. Use UTC for grouping so a single tide event near
+  // midnight does not jump months under user TZ choice. Display labels
+  // honour the TZ choice though - i.e. "April 2026" is unambiguous either
+  // way; the choice only affects per-row time display.
+  const groups = new Map();
+  const useUtc = document.getElementById('tides-tz').value === 'utc';
+  for (const e of events) {
+    const ym = tideEventYearMonth(e.timestamp, useUtc);
+    const key = `${ym.year}-${String(ym.month + 1).padStart(2, '0')}`;
+    if (!groups.has(key)) groups.set(key, {year: ym.year, month: ym.month, events: []});
+    groups.get(key).events.push(e);
+  }
+
+  // Sort newest first.
+  const sortedKeys = [...groups.keys()].sort().reverse();
+
+  // The most recent month is expanded by default; older months default
+  // to collapsed. User-expanded months are tracked in expandedMonths so
+  // expansion state survives a re-render (e.g. after toggling time zone).
+  if (expandedMonths.size === 0 && sortedKeys.length > 0) {
+    expandedMonths.add(sortedKeys[0]);
+  }
+
+  const monthNames = ['January','February','March','April','May','June',
+    'July','August','September','October','November','December'];
+
+  let html = '';
+  for (const key of sortedKeys) {
+    const g = groups.get(key);
+    const expanded = expandedMonths.has(key);
+    const label = `${monthNames[g.month]} ${g.year}`;
+    const eventCount = g.events.length;
+    html += `<div class="tide-month-panel">` +
+      `<div class="tide-month-header" onclick="toggleTideMonth('${key}')">` +
+        `<span>${label} <span style="font-weight:normal;color:var(--text-light);font-size:12px;">(${eventCount} events)</span></span>` +
+        `<span class="toggle" id="tide-month-toggle-${key}">${expanded ? '▼' : '▶'}</span>` +
+      `</div>` +
+      `<div class="tide-month-body${expanded ? '' : ' collapsed'}" id="tide-month-body-${key}">` +
+        renderTideTable(g.events) +
+      `</div>` +
+    `</div>`;
+  }
+  return html;
+}
+
+function toggleTideMonth(key) {
+  const body = document.getElementById(`tide-month-body-${key}`);
+  const toggle = document.getElementById(`tide-month-toggle-${key}`);
+  if (!body || !toggle) return;
+  const wasCollapsed = body.classList.contains('collapsed');
+  body.classList.toggle('collapsed');
+  toggle.textContent = wasCollapsed ? '▼' : '▶';
+  if (wasCollapsed) expandedMonths.add(key);
+  else expandedMonths.delete(key);
+}
+
+function renderTidesExtended(data) {
+  const events = data.events || [];
+  if (!events.length) {
+    return '<p style="color:var(--text-light);font-size:13px;">' +
+      'No data yet. The 180-day forecast populates after the first daily ' +
+      'scheduler run at 02:00 (or after a manual UKHO refresh).</p>';
+  }
+  // Group by year-month for collapsibility, same UI as the History view.
+  // The current month is expanded by default; older user-expansion state
+  // persists across re-renders (e.g. timezone toggle).
+  const groups = new Map();
+  const useUtc = document.getElementById('tides-tz').value === 'utc';
+  for (const e of events) {
+    const ym = tideEventYearMonth(e.timestamp, useUtc);
+    const key = `${ym.year}-${String(ym.month + 1).padStart(2, '0')}`;
+    if (!groups.has(key)) groups.set(key, {year: ym.year, month: ym.month, events: []});
+    groups.get(key).events.push(e);
+  }
+  // Sort oldest first - extended FORECAST is forward-looking, so the
+  // current month should appear at the top, then chronological months
+  // following. (History view sorts newest-first; this is the inverse.)
+  const sortedKeys = [...groups.keys()].sort();
+  if (expandedMonths.size === 0 && sortedKeys.length > 0) {
+    expandedMonths.add(sortedKeys[0]);
+  }
+  const monthNames = ['January','February','March','April','May','June',
+    'July','August','September','October','November','December'];
+
+  let html = '';
+  // Optional summary line at the top so the user knows the size and
+  // composition of what they're scrolling through.
+  const ukhoCount = data.ukho_count || 0;
+  const harmCount = data.harmonic_count || 0;
+  if (ukhoCount + harmCount > 0) {
+    html += `<p style="font-size:12px;color:var(--text-light);margin-bottom:8px;">` +
+      `Showing ${ukhoCount} UKHO event(s) for the next 7 days, ` +
+      `then ${harmCount} harmonic estimate(s) out to 180 days.</p>`;
+  }
+  for (const key of sortedKeys) {
+    const g = groups.get(key);
+    const expanded = expandedMonths.has(key);
+    const label = `${monthNames[g.month]} ${g.year}`;
+    const eventCount = g.events.length;
+    html += `<div class="tide-month-panel">` +
+      `<div class="tide-month-header" onclick="toggleTideMonth('${key}')">` +
+        `<span>${label} <span style="font-weight:normal;color:var(--text-light);font-size:12px;">(${eventCount} events)</span></span>` +
+        `<span class="toggle" id="tide-month-toggle-${key}">${expanded ? '▼' : '▶'}</span>` +
+      `</div>` +
+      `<div class="tide-month-body${expanded ? '' : ' collapsed'}" id="tide-month-body-${key}">` +
+        renderTideTable(g.events) +
+      `</div>` +
+    `</div>`;
+  }
+  return html;
+}
+
+function renderTides() {
+  if (!tidesData) {
+    document.getElementById('tides-content').innerHTML =
+      '<p style="color:var(--text-light);font-size:12px;">No data loaded.</p>';
+    return;
+  }
+  let html;
+  if (tidesData.range === 'forecast') {
+    html = renderTidesForecast(tidesData.events);
+  } else if (tidesData.range === 'extended') {
+    html = renderTidesExtended(tidesData);
+  } else {
+    html = renderTidesHistory(tidesData.events);
+  }
+  document.getElementById('tides-content').innerHTML = html;
 }
 
 // --- Time formatting for logs ---

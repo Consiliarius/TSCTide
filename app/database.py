@@ -8,7 +8,7 @@ from pathlib import Path
 from contextlib import contextmanager
 from typing import Optional
 
-from app.config import DB_PATH, ensure_dirs, to_utc_str
+from app.config import DB_PATH, ensure_dirs, to_utc_str, compute_cycle_number
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS moorings (
     shallow_extra_depth_m REAL DEFAULT 0.0,
     calendar_enabled INTEGER DEFAULT 0,
     use_observations INTEGER DEFAULT 0,
+    pin_hash TEXT DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -108,6 +109,26 @@ CREATE TABLE IF NOT EXISTS activity_log (
 CREATE INDEX IF NOT EXISTS idx_activity_ts ON activity_log(timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_activity_scope ON activity_log(scope, timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_activity_mooring ON activity_log(mooring_id, timestamp DESC);
+
+CREATE TABLE IF NOT EXISTS pin_failed_attempts (
+    mooring_id INTEGER PRIMARY KEY,
+    failed_count INTEGER NOT NULL DEFAULT 0,
+    first_failed_at TEXT NOT NULL,
+    locked_until TEXT,
+    FOREIGN KEY (mooring_id) REFERENCES moorings(mooring_id)
+);
+
+CREATE TABLE IF NOT EXISTS harmonic_predictions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,           -- target tide event time, ISO UTC, Langstone-corrected
+    cycle_number INTEGER,              -- tide cycle since 2026-01-01 epoch; primary dedup key (nullable for legacy rows pre-migration)
+    height_m REAL NOT NULL,            -- predicted height in metres above CD
+    event_type TEXT NOT NULL,          -- 'HighWater' or 'LowWater'
+    generated_at TEXT NOT NULL,        -- ISO UTC time when this row was created
+    UNIQUE (timestamp, event_type, generated_at)
+);
+CREATE INDEX IF NOT EXISTS idx_harm_timestamp ON harmonic_predictions(timestamp);
+CREATE INDEX IF NOT EXISTS idx_harm_generated ON harmonic_predictions(generated_at);
 """
 
 
@@ -148,6 +169,43 @@ def init_db():
     mooring_cols = {row[1] for row in cursor2.fetchall()}
     if "use_observations" not in mooring_cols:
         conn.execute("ALTER TABLE moorings ADD COLUMN use_observations INTEGER DEFAULT 0")
+    if "pin_hash" not in mooring_cols:
+        conn.execute("ALTER TABLE moorings ADD COLUMN pin_hash TEXT DEFAULT ''")
+
+    # Migrate harmonic_predictions: add cycle_number column for cycle-based
+    # deduplication of latest_only queries. Existing rows are backfilled in
+    # the same pass; the unique index is then created (idempotent via
+    # IF NOT EXISTS) and lives outside the column-presence check so an
+    # interrupted prior migration self-heals on next startup.
+    cursor3 = conn.execute("PRAGMA table_info(harmonic_predictions)")
+    harm_cols = {row[1] for row in cursor3.fetchall()}
+    if "cycle_number" not in harm_cols:
+        conn.execute(
+            "ALTER TABLE harmonic_predictions ADD COLUMN cycle_number INTEGER"
+        )
+        # Backfill: compute cycle_number from each row's stored timestamp
+        # using the shared helper. As of v2.5.6 the cycle constants live
+        # in model_config.json (with .py defaults as fallback); routing
+        # the migration through the same helper ensures backfilled values
+        # match those produced by store_harmonic_predictions on subsequent
+        # writes. The previous self-contained copy of the constants was
+        # replaced because app.config is already imported at the top of
+        # this module, so there is no circular-import risk to defend
+        # against.
+        rows = conn.execute(
+            "SELECT id, timestamp FROM harmonic_predictions"
+        ).fetchall()
+        for r in rows:
+            cyc = compute_cycle_number(r["timestamp"])
+            conn.execute(
+                "UPDATE harmonic_predictions SET cycle_number = ? WHERE id = ?",
+                (cyc, r["id"])
+            )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_harm_cycle_dedup "
+        "ON harmonic_predictions(cycle_number, event_type, generated_at)"
+    )
+
     conn.commit()
     conn.close()
 
@@ -342,8 +400,36 @@ def get_calendar_enabled_moorings() -> list[dict]:
 # --- Observations ---
 
 def add_observation(data: dict) -> dict:
-    """Add an observation record."""
+    """
+    Add an observation record.
+
+    The supplied timestamp is normalised to a UTC ISO-Z second-precision
+    string before insert so that all stored observations share one format,
+    regardless of which caller (XLSX upload, JSON API) wrote them. Without
+    this, timestamps from the JSON `POST /observations` path could carry
+    "+00:00" suffixes, fractional seconds, or naive local times, breaking
+    string-based ORDER BY and equality comparisons elsewhere.
+
+    Naive timestamps are interpreted as DEFAULT_TIMEZONE (matching the
+    XLSX upload flow's documented "Times are local time" convention).
+    """
     now = to_utc_str(datetime.now(timezone.utc))
+    raw_ts = data["timestamp"]
+    try:
+        if isinstance(raw_ts, datetime):
+            dt = raw_ts
+        else:
+            from dateutil import parser as _dtparse
+            dt = _dtparse.parse(str(raw_ts))
+        if dt.tzinfo is None:
+            import pytz
+            from app.config import DEFAULT_TIMEZONE
+            dt = pytz.timezone(DEFAULT_TIMEZONE).localize(dt)
+        normalized_ts = to_utc_str(dt)
+    except (ValueError, TypeError) as e:
+        # Surface unparseable input rather than silently corrupting the row.
+        raise ValueError(f"Could not parse observation timestamp {raw_ts!r}: {e}")
+
     with db_connection() as conn:
         cursor = conn.execute("""
             INSERT INTO observations (mooring_id, timestamp, state, wind_direction,
@@ -351,14 +437,16 @@ def add_observation(data: dict) -> dict:
             VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (
             data["mooring_id"],
-            data["timestamp"],
+            normalized_ts,
             data["state"],
             data.get("wind_direction", ""),
             data.get("direction_of_lay", ""),
             data.get("notes", ""),
             now
         ))
-        return {"id": cursor.lastrowid, **data}
+        # Return the stored (normalised) timestamp so callers see what the
+        # DB actually holds, not what they sent.
+        return {"id": cursor.lastrowid, **data, "timestamp": normalized_ts}
 
 
 def get_observations(mooring_id: int) -> list[dict]:
@@ -391,6 +479,256 @@ def clear_observations(mooring_id: int) -> int:
         return result.rowcount
 
 
+def delete_mooring(mooring_id: int) -> dict:
+    """
+    Permanently remove a mooring and its associated per-mooring data.
+
+    Cascades into:
+      - observations (per-mooring)
+      - calendar_events (per-mooring)
+      - pin_failed_attempts (per-mooring)
+
+    Intentionally NOT touched:
+      - activity_log: kept as audit trail per design decision. Old entries
+        age out via prune_activity_log within 7 days for mooring scope.
+      - wind_observations: not per-mooring, shared across all moorings.
+      - tide_data: not per-mooring.
+
+    The on-disk feed file (.ics under FEEDS_DIR) is the responsibility of
+    the caller (see app.main.delete_mooring_config) - this function only
+    handles database state.
+
+    Returns a dict of deletion counts:
+        {"mooring": 0|1, "observations": int, "calendar_events": int,
+         "pin_failed_attempts": 0|1}
+    """
+    counts = {
+        "mooring": 0,
+        "observations": 0,
+        "calendar_events": 0,
+        "pin_failed_attempts": 0,
+    }
+    with db_connection() as conn:
+        r = conn.execute(
+            "DELETE FROM observations WHERE mooring_id = ?", (mooring_id,)
+        )
+        counts["observations"] = r.rowcount
+
+        r = conn.execute(
+            "DELETE FROM calendar_events WHERE mooring_id = ?", (mooring_id,)
+        )
+        counts["calendar_events"] = r.rowcount
+
+        r = conn.execute(
+            "DELETE FROM pin_failed_attempts WHERE mooring_id = ?", (mooring_id,)
+        )
+        counts["pin_failed_attempts"] = r.rowcount
+
+        # Delete the mooring row last so that if any of the above fails,
+        # the orphan rows can still be cleaned up by re-running.
+        r = conn.execute(
+            "DELETE FROM moorings WHERE mooring_id = ?", (mooring_id,)
+        )
+        counts["mooring"] = r.rowcount
+
+    return counts
+
+
+# --- PIN Protection (v2) ---
+#
+# PIN hashes are stored on the moorings table in column pin_hash. An
+# empty string means "unclaimed" - the next write to a PIN-gated endpoint
+# triggers the claim flow (user sets a new PIN).
+#
+# Rate limiting is tracked in pin_failed_attempts, keyed by mooring_id.
+# Policy: up to MAX_PIN_ATTEMPTS failures within PIN_ATTEMPT_WINDOW_MINUTES
+# before the mooring is locked for PIN_LOCKOUT_MINUTES. These constants
+# live in app.pin so they can be imported by other modules without
+# creating a database dependency.
+
+def get_mooring_pin_hash(mooring_id: int) -> Optional[str]:
+    """
+    Return the stored PIN hash for a mooring, or None if the mooring
+    does not exist, or an empty string if the mooring exists but is
+    unclaimed. Callers must distinguish those two cases.
+    """
+    with db_connection() as conn:
+        row = conn.execute(
+            "SELECT pin_hash FROM moorings WHERE mooring_id = ?",
+            (mooring_id,)
+        ).fetchone()
+    if row is None:
+        return None
+    return row["pin_hash"] or ""
+
+
+def set_mooring_pin_hash(mooring_id: int, pin_hash: str) -> bool:
+    """
+    Store a PIN hash on an existing mooring row. Returns True on success,
+    False if no such mooring exists. Does NOT create a mooring row;
+    callers should ensure the row exists first (save_mooring).
+    """
+    now = to_utc_str(datetime.now(timezone.utc))
+    with db_connection() as conn:
+        result = conn.execute(
+            "UPDATE moorings SET pin_hash = ?, updated_at = ? WHERE mooring_id = ?",
+            (pin_hash, now, mooring_id)
+        )
+        return result.rowcount > 0
+
+
+def clear_mooring_pin_hash(mooring_id: int) -> bool:
+    """
+    Remove the stored PIN hash from a mooring (returning it to the
+    unclaimed state). Used by the admin-reset procedure if invoked
+    through Python; the documented reset flow is to overwrite with a
+    known hash via direct SQL.
+    """
+    return set_mooring_pin_hash(mooring_id, "")
+
+
+def check_pin_lockout(mooring_id: int) -> Optional[dict]:
+    """
+    Return None if the mooring is not currently locked. If locked,
+    returns {"locked_until": iso_str, "seconds_remaining": int}. The
+    caller is responsible for returning a 429 with this information.
+
+    A lockout expires naturally once locked_until is in the past; this
+    function does not delete the row (cleared on next successful PIN
+    verify or next failed attempt that starts a new window).
+    """
+    with db_connection() as conn:
+        row = conn.execute(
+            "SELECT locked_until FROM pin_failed_attempts WHERE mooring_id = ?",
+            (mooring_id,)
+        ).fetchone()
+    if row is None or not row["locked_until"]:
+        return None
+    locked_until = dtparse_iso(row["locked_until"])
+    now = datetime.now(timezone.utc)
+    if locked_until <= now:
+        return None
+    return {
+        "locked_until": row["locked_until"],
+        "seconds_remaining": int((locked_until - now).total_seconds()),
+    }
+
+
+def record_failed_pin_attempt(mooring_id: int,
+                              max_attempts: int,
+                              window_minutes: int,
+                              lockout_minutes: int) -> dict:
+    """
+    Record a failed PIN attempt and return the post-attempt state.
+
+    Policy:
+      - First failure (no row, or first_failed_at older than
+        window_minutes ago): failed_count := 1, first_failed_at := now.
+      - Subsequent failure within the window: failed_count increments.
+      - When failed_count reaches max_attempts: locked_until := now +
+        lockout_minutes. Any further attempts in the lockout window
+        continue to be rejected by check_pin_lockout before reaching
+        this function.
+
+    The increment is performed by a single UPSERT statement with CASE
+    expressions, so two concurrent failed attempts cannot interleave a
+    SELECT/UPDATE pair and lose an increment. The previous read-then-write
+    implementation had a small race window under WAL: both connections
+    could observe failed_count=N before either committed, then each
+    write N+1.
+
+    Returns: {
+        "failed_count":        current count,
+        "attempts_remaining": max(0, max_attempts - failed_count),
+        "locked_until":       iso_str or None,
+    }
+    """
+    now = datetime.now(timezone.utc)
+    now_str = to_utc_str(now)
+    window_cutoff = to_utc_str(now - timedelta(minutes=window_minutes))
+    lockout_until = to_utc_str(now + timedelta(minutes=lockout_minutes))
+
+    with db_connection() as conn:
+        # Single atomic UPSERT. Branches inside the CASE expressions
+        # implement: "if the existing first_failed_at is older than the
+        # window cutoff, start a fresh window with count=1; otherwise
+        # increment the existing count". locked_until is set iff the
+        # resulting count reaches max_attempts.
+        #
+        # All SET expressions in SQLite UPSERT reference the *old*
+        # column values, so the inner CASE that derives the new
+        # failed_count has to be repeated inside the locked_until SET
+        # rather than referencing a freshly-set sibling column.
+        conn.execute(
+            "INSERT INTO pin_failed_attempts "
+            "(mooring_id, failed_count, first_failed_at, locked_until) "
+            "VALUES (?, 1, ?, CASE WHEN 1 >= ? THEN ? ELSE NULL END) "
+            "ON CONFLICT(mooring_id) DO UPDATE SET "
+            "  failed_count = CASE "
+            "    WHEN first_failed_at < ? THEN 1 "
+            "    ELSE failed_count + 1 "
+            "  END, "
+            "  first_failed_at = CASE "
+            "    WHEN first_failed_at < ? THEN ? "
+            "    ELSE first_failed_at "
+            "  END, "
+            "  locked_until = CASE "
+            "    WHEN (CASE WHEN first_failed_at < ? THEN 1 "
+            "                ELSE failed_count + 1 END) >= ? "
+            "    THEN ? "
+            "    ELSE NULL "
+            "  END",
+            (
+                mooring_id, now_str, max_attempts, lockout_until,
+                window_cutoff,
+                window_cutoff, now_str,
+                window_cutoff, max_attempts, lockout_until,
+            ),
+        )
+        row = conn.execute(
+            "SELECT failed_count, locked_until "
+            "FROM pin_failed_attempts WHERE mooring_id = ?",
+            (mooring_id,),
+        ).fetchone()
+
+    failed_count = row["failed_count"]
+    locked_until_str = row["locked_until"]
+    return {
+        "failed_count": failed_count,
+        "attempts_remaining": max(0, max_attempts - failed_count),
+        "locked_until": locked_until_str,
+    }
+
+
+def clear_failed_pin_attempts(mooring_id: int) -> None:
+    """
+    Delete the failed-attempts row for a mooring. Called after a
+    successful PIN verification.
+    """
+    with db_connection() as conn:
+        conn.execute(
+            "DELETE FROM pin_failed_attempts WHERE mooring_id = ?",
+            (mooring_id,)
+        )
+
+
+def dtparse_iso(ts: str) -> datetime:
+    """
+    Parse an ISO timestamp stored by to_utc_str (format
+    'YYYY-MM-DDTHH:MM:SSZ') back to a timezone-aware UTC datetime.
+    Local helper to avoid a top-of-file dateutil import when the rest of
+    the module uses raw datetime.
+    """
+    # The 'Z' suffix is equivalent to +00:00 in ISO 8601; fromisoformat
+    # before Python 3.11 does not accept 'Z', so normalise first.
+    if ts.endswith("Z"):
+        ts = ts[:-1] + "+00:00"
+    dt = datetime.fromisoformat(ts)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 def load_classification_inputs(mooring_id: int):
     """
     Load all data needed for calibration in a single pass. Returns a tuple:
@@ -400,10 +738,17 @@ def load_classification_inputs(mooring_id: int):
     in the same order as observations.
 
     Returns (None, [], [], [], []) if the mooring does not exist.
+    Returns (mooring, [], [], [], []) if the mooring exists but has no
+    observations - the supporting-data queries are skipped entirely in
+    that case.
 
-    The full historical range is queried intentionally: older observations
-    are still valid calibration data, and tide events/wind observations
-    beyond the current 7-day window are needed to classify them.
+    Tide events and wind observations are fetched bounded to a one-day
+    buffer around the observation timestamps. The classifier needs each
+    observation's preceding HW (≤12h earlier) and a wind sample within
+    ±60 min of HW+4h, so one day is comfortably wider than required and
+    keeps the queries from scanning the whole table. With years of
+    retention this matters: the previous "2000-01-01" → "2099-12-31"
+    bounds returned every row in the table on every call.
 
     Callers that need both calibrate_drying_height and calibrate_wind_offset
     should call this once and pass the result to both via the _preloaded
@@ -416,10 +761,29 @@ def load_classification_inputs(mooring_id: int):
         return None, [], [], [], []
 
     observations = get_observations(mooring_id)
-    tide_events = get_tide_events("2000-01-01", "2099-12-31")
-    wind_observations = get_wind_observations_in_range(
-        "2000-01-01", "2099-12-31"
-    )
+    if not observations:
+        return mooring, [], [], [], []
+
+    # Compute a bounded query window around the observation timestamps.
+    # Observations stored via add_observation are normalised to ISO-Z, so
+    # dtparse_iso handles them; older rows with "+00:00" suffixes are also
+    # parsed correctly by dtparse_iso.
+    obs_min = min(o["timestamp"] for o in observations)
+    obs_max = max(o["timestamp"] for o in observations)
+    try:
+        window_start_dt = dtparse_iso(obs_min) - timedelta(days=1)
+        window_end_dt = dtparse_iso(obs_max) + timedelta(days=1)
+        window_start = to_utc_str(window_start_dt)
+        window_end = to_utc_str(window_end_dt)
+    except (ValueError, TypeError):
+        # Defensive: if a malformed observation timestamp slipped past
+        # add_observation's validation, fall back to the unbounded query
+        # rather than skipping calibration entirely.
+        window_start = "2000-01-01"
+        window_end = "2099-12-31"
+
+    tide_events = get_tide_events(window_start, window_end)
+    wind_observations = get_wind_observations_in_range(window_start, window_end)
     classifications = classify_observations(
         observations, mooring, tide_events, wind_observations
     )
@@ -551,10 +915,22 @@ def calibrate_drying_height(mooring_id: int, _preloaded=None) -> dict:
             result["best_estimate"] = round((lower + upper) / 2.0, 2)
             result["confidence"] = "inconsistent"
     elif lower is not None:
-        result["best_estimate"] = round(lower + 0.15, 2)
+        # Aground-only observations give a lower bound but no upper bound:
+        # the drying height could be anywhere from `lower` upwards. There is
+        # no principled point estimate from a one-sided constraint, so we
+        # do NOT suggest a value. The UI shows the lower bound as a fact
+        # and presents no Apply button. Adding a fudge factor (e.g.
+        # `lower + 0.15`) was wrong here: it made the system suggest
+        # reductions in the stored drying height that the data did not
+        # actually support, sometimes lowering it below known-grounded
+        # observations.
+        result["best_estimate"] = None
         result["confidence"] = "partial-low"
     elif upper is not None:
-        result["best_estimate"] = round(upper - 0.15, 2)
+        # Symmetric reasoning to the partial-low branch: afloat-only
+        # observations give an upper bound but no lower bound. No point
+        # estimate is offered.
+        result["best_estimate"] = None
         result["confidence"] = "partial-high"
 
     return result
@@ -750,7 +1126,7 @@ def delete_future_events(mooring_id: int, after: str):
 def cleanup_old_events(days: int = 14):
     """Remove calendar events with HW times older than the given number of days.
     Only cleans calendar_events (computed windows); tide_data is preserved
-    for observation calibration."""
+    for observation calibration and the historical Tides tab view."""
     cutoff = to_utc_str(datetime.now(timezone.utc) - timedelta(days=days))
     with db_connection() as conn:
         result = conn.execute(
@@ -758,6 +1134,348 @@ def cleanup_old_events(days: int = 14):
         )
         if result.rowcount:
             logger.info(f"Cleaned up {result.rowcount} calendar events older than {days} days")
+
+
+def cleanup_old_tide_data(days: int = 365):
+    """
+    Remove tide_data rows older than the given number of days.
+
+    Default 365 days matches the rolling 12-month retention policy for the
+    historical Tides tab view. tide_data is otherwise written-once-and-kept,
+    so without this cleanup the table would grow unbounded.
+
+    Note: observation calibration relies on having tide events that bracket
+    each observation. If observations older than `days` exist, they will
+    become un-matchable to tide data and will count as `unmatched` in
+    calibration responses. With the default 12-month window this is a
+    non-issue in practice - the calibrate functions only consider
+    observations the user has recorded, and observations more than a year
+    old are unlikely to be representative of current mooring conditions.
+    """
+    cutoff = to_utc_str(datetime.now(timezone.utc) - timedelta(days=days))
+    with db_connection() as conn:
+        result = conn.execute(
+            "DELETE FROM tide_data WHERE timestamp < ?", (cutoff,)
+        )
+        if result.rowcount:
+            logger.info(
+                f"Cleaned up {result.rowcount} tide_data rows older than {days} days"
+            )
+
+
+# --- Harmonic Predictions ---
+#
+# Stores the harmonic model's predicted tide events for the next N days,
+# regenerated daily by the scheduler. Two purposes:
+#   1. Powers the 180-day Forecast view and the Langstone_Harmonic_180d.ics
+#      feed without recomputing the harmonic model on every page load.
+#   2. Preserves a record of past predictions so that, periodically, the
+#      delta between predicted-on-day-X and actual-UKHO-on-day-X can be
+#      analysed to refine the harmonic constants. Hence the per-row
+#      generated_at column rather than overwriting on each daily run.
+#
+# Deduplication: the same physical tide computed by predict_events on
+# different days produces timestamps that drift by seconds (the sampling
+# grid is anchored at "now", which advances 24h+drift between daily
+# runs). To collapse those drifting timestamps to one row per tide cycle
+# in latest_only queries, each row is tagged with a cycle_number
+# (= round(hours_since_2026-01-01 / 12.4167)). cycle_number is stable
+# under drift of much less than half a cycle (several hours), so seconds
+# of drift always map to the same cycle. The matching UNIQUE INDEX on
+# (cycle_number, event_type, generated_at) enforces 'one row per
+# (cycle, type) per write batch' at storage time as well as query time.
+#
+# This table is intentionally separate from tide_data:
+#   - tide_data holds authoritative UKHO/KHM observations used by
+#     observation calibration; harmonic predictions must NOT contaminate
+#     the calibration inputs.
+#   - get_ukho_tide_events / get_tide_events / load_classification_inputs
+#     all query tide_data only and never see harmonic_predictions.
+
+# Reference defaults. The values actually used at runtime come from
+# model_config.json (loaded via app.config.compute_cycle_number). These
+# constants are kept here as readable documentation and as a fallback
+# if the JSON is missing or malformed. To change the model behaviour,
+# edit the JSON; do not edit these.
+#
+# Constants for cycle-based deduplication. Match the values used by
+# access_calc.generate_event_uid and ical_manager._tide_event_uid.
+# Critically, these values are the dedup key for stored rows in
+# harmonic_predictions.cycle_number; changing them invalidates every
+# existing row's cycle assignment and must not be done without a
+# database migration.
+_HARM_CYCLE_EPOCH = datetime(2026, 1, 1, tzinfo=timezone.utc)
+_HARM_CYCLE_HOURS = 12.4167
+
+
+def _compute_cycle_number(timestamp_iso: str) -> int:
+    """
+    Compute the tide-cycle number for an ISO UTC timestamp, used as the
+    deduplication key in harmonic_predictions. The same physical tide
+    re-computed from a slightly different sample grid produces timestamps
+    differing by seconds; the rounded cycle number is stable under such
+    drift, making it a robust dedup key.
+
+    Thin wrapper around app.config.compute_cycle_number so the dedup
+    key matches what access_calc.generate_event_uid and
+    ical_manager._tide_event_uid produce. Local function kept rather
+    than calling the helper directly at every call site to preserve
+    the documented module-level API.
+    """
+    return compute_cycle_number(timestamp_iso)
+
+
+def store_harmonic_predictions(events: list[dict]) -> int:
+    """
+    Insert a batch of harmonic predictions, all tagged with the current
+    UTC time as generated_at and with a derived cycle_number. Each input
+    event is a dict with at least timestamp (ISO UTC string), height_m
+    (float), event_type (string).
+
+    Returns the count of rows the call attempted to insert. Conflicts on
+    either UNIQUE constraint - the original (timestamp, event_type,
+    generated_at) or the cycle-based (cycle_number, event_type,
+    generated_at) index - are silently ignored. Under normal once-per-day
+    operation no conflicts occur because each batch has a fresh generated_at.
+    """
+    if not events:
+        return 0
+    now = to_utc_str(datetime.now(timezone.utc))
+    inserted = 0
+    with db_connection() as conn:
+        for ev in events:
+            try:
+                cycle = _compute_cycle_number(ev["timestamp"])
+                conn.execute(
+                    "INSERT OR IGNORE INTO harmonic_predictions "
+                    "(timestamp, height_m, event_type, generated_at, cycle_number) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (ev["timestamp"], ev["height_m"], ev["event_type"], now, cycle),
+                )
+                inserted += 1
+            except (sqlite3.IntegrityError, KeyError, ValueError) as e:
+                logger.warning(f"Skipped malformed harmonic event: {e}")
+    return inserted
+
+
+def get_harmonic_predictions(start: str, end: str,
+                              latest_only: bool = True) -> list[dict]:
+    """
+    Return harmonic predictions whose target timestamp falls in [start, end].
+
+    With latest_only=True (default), returns only the most recently generated
+    row for each (timestamp, event_type) pair. This is what the Forecast view
+    and the 180d feed need - the freshest prediction available.
+
+    With latest_only=False, returns every stored prediction including older
+    versions for the same target time. Used for historical delta analysis
+    (compare predictions made at various lead times against actual UKHO).
+    """
+    with db_connection() as conn:
+        if latest_only:
+            # Group by (cycle_number, event_type) so that the same physical
+            # tide cycle, whose timestamps drift seconds-to-tens-of-seconds
+            # between daily runs, collapses to a single row per group with
+            # the freshest generated_at winning. SQLite's IS operator is
+            # used in place of = so any legacy NULL cycle_number rows
+            # (should not occur post-migration) self-group correctly.
+            rows = conn.execute(
+                "SELECT * FROM harmonic_predictions h1 "
+                "WHERE timestamp >= ? AND timestamp <= ? "
+                "AND generated_at = ("
+                "  SELECT MAX(generated_at) FROM harmonic_predictions h2 "
+                "  WHERE h2.cycle_number IS h1.cycle_number "
+                "    AND h2.event_type = h1.event_type"
+                ") "
+                "ORDER BY timestamp",
+                (start, end),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM harmonic_predictions "
+                "WHERE timestamp >= ? AND timestamp <= ? "
+                "ORDER BY timestamp, generated_at",
+                (start, end),
+            ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def cleanup_old_harmonic_predictions(days: int = 365):
+    """
+    Remove harmonic_predictions rows whose target timestamp is older than
+    the given number of days. Matches the tide_data retention policy.
+
+    A prediction made today for a tide 200 days in the future will not be
+    pruned until that target tide is itself >365 days in the past. This is
+    intentional: while the prediction sits in the future, it remains useful
+    as a forecast; once the tide has happened and a year has passed, the
+    delta-vs-actual analysis is no longer relevant.
+    """
+    cutoff = to_utc_str(datetime.now(timezone.utc) - timedelta(days=days))
+    with db_connection() as conn:
+        result = conn.execute(
+            "DELETE FROM harmonic_predictions WHERE timestamp < ?", (cutoff,)
+        )
+        if result.rowcount:
+            logger.info(
+                f"Cleaned up {result.rowcount} harmonic prediction rows "
+                f"older than {days} days"
+            )
+
+
+def compute_harmonic_residuals(days: int = 30) -> dict:
+    """
+    Compare stored harmonic predictions against actual UKHO HW/LW events for
+    the trailing `days` days, ending at "now". Returns aggregated residual
+    statistics suitable for activity-log monitoring.
+
+    Matching:
+      - For each UKHO HW/LW event with timestamp in [now - days, now], find
+        the freshest harmonic prediction sharing the same (cycle_number,
+        event_type). cycle_number is the same epoch-anchored quantity used
+        elsewhere in this module (round((hours_since_2026_01_01) / 12.4167)),
+        so harmonic timestamps drifting by minutes from UKHO still match
+        the same physical tide.
+      - Both sides are Langstone-corrected at storage time:
+          * harmonic_predictions stores rows already passed through
+            secondary_port.apply_offset() in scheduler.daily_ukho_fetch.
+          * tide_data stations are "langstone" (native, returned as-is by
+            get_ukho_tide_events) or "portsmouth" (fallback, returned
+            after offset). This function uses get_ukho_tide_events() so
+            the Portsmouth fallback offset is applied transparently.
+        Direct predicted-minus-actual differencing is therefore valid for
+        both height and timing; no further correction is applied here.
+
+    Sign convention:
+      residual = predicted - actual
+      Positive = harmonic over-predicts; negative = harmonic under-predicts.
+      Matches the convention used by scripts/calibrate_from_ukho_week.py
+      so that numbers reported here are directly comparable.
+
+    Returns a dict shaped for the activity-log details JSON:
+        {
+            "window_days": int,
+            "window_start": ISO UTC string,
+            "window_end":   ISO UTC string,
+            "matched":      total UKHO events with a harmonic match,
+            "unmatched":    total UKHO events without a match,
+            "hw": {"count": int, "height_mean": float, "height_rms": float,
+                    "height_max_abs": float, "timing_mean_min": float,
+                    "timing_rms_min": float, "timing_max_abs_min": float},
+            "lw": { ... same shape ... },
+        }
+
+    Returns the dict with all-None numeric fields and zero counts if the
+    window contains no matched pairs (e.g. first run, fresh database).
+    Callers must handle the empty-window case rather than this function
+    raising.
+    """
+    now = datetime.now(timezone.utc)
+    window_start = now - timedelta(days=days)
+    start_str = to_utc_str(window_start)
+    end_str = to_utc_str(now)
+
+    # UKHO events in the window. get_ukho_tide_events() applies the
+    # Portsmouth->Langstone offset for fallback rows, so the events are
+    # always Langstone-equivalent regardless of which station provided them.
+    ukho_events = get_ukho_tide_events(start_str, end_str)
+
+    # Harmonic predictions covering the same window. Slightly widen the
+    # query at both ends so a UKHO event near the edge whose harmonic
+    # twin lies just outside [start, end] still matches. Half a tidal
+    # cycle (~6.2h) on either side is generous and cheap.
+    harm_query_start = to_utc_str(window_start - timedelta(hours=7))
+    harm_query_end = to_utc_str(now + timedelta(hours=7))
+    harm_events = get_harmonic_predictions(
+        harm_query_start, harm_query_end, latest_only=True
+    )
+
+    # Index harmonic events by (cycle_number, event_type) for O(1) lookup.
+    # cycle_number is populated for all post-migration rows; legacy NULL
+    # rows are excluded (they cannot be matched and would skew counts).
+    harm_index: dict[tuple[int, str], dict] = {}
+    for h in harm_events:
+        cyc = h.get("cycle_number")
+        if cyc is None:
+            continue
+        harm_index[(cyc, h["event_type"])] = h
+
+    hw_height_resid: list[float] = []
+    lw_height_resid: list[float] = []
+    hw_timing_resid_min: list[float] = []
+    lw_timing_resid_min: list[float] = []
+    matched = 0
+    unmatched = 0
+
+    for u in ukho_events:
+        et = u["event_type"]
+        if et not in ("HighWater", "LowWater"):
+            continue
+        u_cyc = _compute_cycle_number(u["timestamp"])
+        h = harm_index.get((u_cyc, et))
+        if h is None:
+            unmatched += 1
+            continue
+
+        height_resid = h["height_m"] - u["height_m"]
+        try:
+            u_dt = datetime.fromisoformat(
+                u["timestamp"].replace("Z", "+00:00")
+            )
+            h_dt = datetime.fromisoformat(
+                h["timestamp"].replace("Z", "+00:00")
+            )
+            timing_resid_min = (h_dt - u_dt).total_seconds() / 60.0
+        except (ValueError, KeyError):
+            # Defensive: a malformed timestamp on either side should not
+            # poison the whole window. Skip this pair, log nothing here
+            # (caller logs aggregate stats), continue.
+            unmatched += 1
+            continue
+
+        if et == "HighWater":
+            hw_height_resid.append(height_resid)
+            hw_timing_resid_min.append(timing_resid_min)
+        else:
+            lw_height_resid.append(height_resid)
+            lw_timing_resid_min.append(timing_resid_min)
+        matched += 1
+
+    def _stats(height_vals: list[float], timing_vals: list[float]) -> dict:
+        n = len(height_vals)
+        if n == 0:
+            return {
+                "count": 0,
+                "height_mean": None, "height_rms": None,
+                "height_max_abs": None,
+                "timing_mean_min": None, "timing_rms_min": None,
+                "timing_max_abs_min": None,
+            }
+        h_mean = sum(height_vals) / n
+        h_rms = (sum(x * x for x in height_vals) / n) ** 0.5
+        h_max = max(abs(x) for x in height_vals)
+        t_mean = sum(timing_vals) / n
+        t_rms = (sum(x * x for x in timing_vals) / n) ** 0.5
+        t_max = max(abs(x) for x in timing_vals)
+        return {
+            "count": n,
+            "height_mean": round(h_mean, 3),
+            "height_rms": round(h_rms, 3),
+            "height_max_abs": round(h_max, 2),
+            "timing_mean_min": round(t_mean, 1),
+            "timing_rms_min": round(t_rms, 1),
+            "timing_max_abs_min": round(t_max, 1),
+        }
+
+    return {
+        "window_days": days,
+        "window_start": start_str,
+        "window_end": end_str,
+        "matched": matched,
+        "unmatched": unmatched,
+        "hw": _stats(hw_height_resid, hw_timing_resid_min),
+        "lw": _stats(lw_height_resid, lw_timing_resid_min),
+    }
 
 
 def cleanup_superseded_events(mooring_id: int):
