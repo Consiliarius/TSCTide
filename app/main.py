@@ -10,6 +10,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from contextlib import asynccontextmanager
+from typing import Optional
 
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import HTMLResponse, Response, JSONResponse
@@ -236,6 +237,38 @@ def _build_calibration_response(mooring_id: int) -> dict:
     return response
 
 
+def _compute_tender_windows(
+    events: list[dict],
+    mooring: dict,
+    source: str,
+    wind_offset_m: float = 0.0,
+    wind_offset_hw_timestamp: Optional[str] = None,
+) -> tuple[Optional[list[dict]], Optional[float]]:
+    """
+    Run a second compute_access_windows() pass with draught_m=0 and
+    safety_margin_m=tender_min_depth_m so the threshold becomes
+    drying_height_m + tender_min_depth_m. Returns (windows, depth) when
+    tender access is enabled on the mooring, else (None, None).
+
+    Wind offset is applied identically to the main pass because the
+    ground topography is the same; the same HW receives the offset in
+    both passes so on-screen totals stay consistent.
+    """
+    if not mooring or not mooring.get("tender_access_enabled"):
+        return None, None
+    depth = float(mooring.get("tender_min_depth_m") or 0.3)
+    tw = compute_access_windows(
+        events=events,
+        draught_m=0.0,
+        drying_height_m=mooring["drying_height_m"],
+        safety_margin_m=depth,
+        wind_offset_m=wind_offset_m,
+        wind_offset_hw_timestamp=wind_offset_hw_timestamp,
+        source=source,
+    )
+    return tw, depth
+
+
 def _recompute_future_windows(mooring_id: int):
     """
     After a mooring configuration change, clear stored future events and
@@ -271,6 +304,8 @@ def _recompute_future_windows(mooring_id: int):
     # were included only for interpolation context, not as real future windows.
     windows = [w for w in windows if w["hw_timestamp"] >= now_str]
 
+    tender_windows, tender_depth = _compute_tender_windows(tide_data, m, "ukho")
+
     cal = calibrate_drying_height(mooring_id)
     calc_params = {
         "draught_m": m["draught_m"],
@@ -281,6 +316,8 @@ def _recompute_future_windows(mooring_id: int):
     store_windows_as_events(
         windows, mooring_id, "ukho", m.get("boat_name", ""),
         calc_params=calc_params,
+        tender_windows=tender_windows,
+        tender_min_depth_m=tender_depth,
     )
 
     if m.get("calendar_enabled"):
@@ -1201,23 +1238,51 @@ async def calculate_access_windows(request: Request):
         source=tide_source,
     )
 
+    # Tender access pass. Uses the mooring's stored tender config; an
+    # anonymous /calculate (no mooring_id) skips it. The wind offset is
+    # passed through unchanged because the mooring's ground topography
+    # is the same for the boat and for the tender.
+    tender_windows, tender_depth = _compute_tender_windows(
+        events, mooring, tide_source,
+        wind_offset_m=wind_offset, wind_offset_hw_timestamp=next_hw_ts,
+    )
+
     now_str = to_utc_str(now)
     windows = [w for w in windows if w["hw_timestamp"] >= now_str]
+
+    # Merge tender data onto each main window so the UI can render a sub-row
+    # without a second API call. Tender fields are also returned in
+    # parameters for the round-trip to /feed/update.
+    if tender_windows is not None:
+        tender_by_hw = {tw["hw_timestamp"]: tw for tw in tender_windows}
+        for w in windows:
+            tw = tender_by_hw.get(w["hw_timestamp"])
+            if tw is None:
+                continue
+            w["tender_start_time"] = tw.get("start_time")
+            w["tender_end_time"] = tw.get("end_time")
+            w["tender_always_accessible"] = bool(tw.get("always_accessible"))
+            w["tender_below_threshold"] = bool(tw.get("below_threshold"))
 
     # v2: This endpoint is read-only. Storing events and regenerating the
     # iCal feed now happens via POST /api/moorings/{id}/feed/update, which
     # is PIN-gated. The UI passes this response body back to that endpoint
     # verbatim when the user clicks "Update Feed".
 
+    parameters = {
+        "draught_m": float(draught),
+        "drying_height_m": float(drying),
+        "safety_margin_m": float(margin),
+        "wind_offset_m": wind_offset,
+    }
+    if tender_depth is not None:
+        parameters["tender_min_depth_m"] = tender_depth
+        parameters["tender_access_enabled"] = True
+
     return {
         "windows": windows,
         "source": source,
-        "parameters": {
-            "draught_m": float(draught),
-            "drying_height_m": float(drying),
-            "safety_margin_m": float(margin),
-            "wind_offset_m": wind_offset,
-        },
+        "parameters": parameters,
         "wind_info": wind_info,
         "event_count": len([w for w in windows if not w.get("below_threshold")]),
     }
@@ -1316,11 +1381,32 @@ async def update_mooring_feed(mooring_id: int, request: Request):
             "offset_m": wind_info.get("offset_m"),
         }
 
+    # Tender data round-trips on each window dict from /api/calculate.
+    # Reconstruct the tender_windows list for store_windows_as_events.
+    tender_windows = None
+    tender_depth = (params or {}).get("tender_min_depth_m")
+    if any(
+        ("tender_start_time" in w) or w.get("tender_always_accessible")
+        for w in windows
+    ):
+        tender_windows = [
+            {
+                "hw_timestamp": w["hw_timestamp"],
+                "start_time": w.get("tender_start_time"),
+                "end_time": w.get("tender_end_time"),
+                "always_accessible": w.get("tender_always_accessible"),
+                "below_threshold": w.get("tender_below_threshold", False),
+            }
+            for w in windows
+        ]
+
     # Always store events - they are internal state, used by serve_feed
     # on every request, and preserved across calendar_enabled toggles.
     store_windows_as_events(
         windows, mooring_id, source, m.get("boat_name", ""),
         calc_params=calc_params, wind_details=wind_details,
+        tender_windows=tender_windows,
+        tender_min_depth_m=tender_depth,
     )
 
     feed_generated = False

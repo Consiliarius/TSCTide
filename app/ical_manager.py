@@ -19,6 +19,7 @@ import os
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Optional
 from icalendar import Calendar, Event
 from dateutil import parser as dtparse
 import pytz
@@ -178,7 +179,51 @@ def _build_description(ev_data: dict, tz, calibration: dict = None) -> str:
         else:
             lines.append("Offset: not applied (wind favourable)")
 
+    # Tender access (only present when the mooring has tender enabled and
+    # a tender window was computed for this cycle).
+    tender_line = _format_tender_line(ev_data, tz)
+    if tender_line:
+        lines.append("")
+        lines.append(tender_line)
+
     return "\n".join(lines)
+
+
+def _format_tender_line(ev_data: dict, tz) -> Optional[str]:
+    """
+    Build the tender-access line for an event description.
+
+    Returns None when the event has no tender data (tender disabled, or
+    tender threshold not met for this cycle). The caller decides whether
+    to insert a blank separator line above.
+
+    Three states map to three wordings:
+      - tender_always_accessible: tender threshold never reached at LW
+      - normal:                   tender_start_time .. tender_end_time present
+      - main below_threshold + tender available: not currently produced
+        because below-threshold cycles are not stored as events
+    """
+    if ev_data.get("tender_always_accessible"):
+        return "Tender access available throughout this tidal cycle"
+
+    t_start = ev_data.get("tender_start_time")
+    t_end = ev_data.get("tender_end_time")
+    if not t_start or not t_end:
+        return None
+
+    s = dtparse.parse(t_start)
+    e = dtparse.parse(t_end)
+    if s.tzinfo is None:
+        s = s.replace(tzinfo=timezone.utc)
+    if e.tzinfo is None:
+        e = e.replace(tzinfo=timezone.utc)
+    s_local = s.astimezone(tz).strftime("%H:%M")
+    e_local = e.astimezone(tz).strftime("%H:%M")
+
+    # Below-threshold sailing-but-tender-available wording is reserved for
+    # future use when below-threshold events are persisted; on stored
+    # main-window events the sailing access exists by definition.
+    return f"Access via tender likely available from {s_local} to {e_local}"
 
 
 def _deduplicate_events(events: list[dict]) -> list[dict]:
@@ -394,11 +439,19 @@ def generate_export_ics(windows: list[dict], source: str,
 
 def store_windows_as_events(windows: list[dict], mooring_id: int,
                             source: str, boat_name: str = "",
-                            calc_params: dict = None, wind_details: dict = None):
+                            calc_params: dict = None, wind_details: dict = None,
+                            tender_windows: list[dict] = None,
+                            tender_min_depth_m: Optional[float] = None):
     """Store computed access windows as calendar events in the database.
 
     calc_params: {draught_m, drying_height_m, safety_margin_m, obs_calibrated}
     wind_details: {direction, speed_ms, offset_m}
+    tender_windows: optional list from a second compute_access_windows() call
+        with draught_m=0 and safety_margin_m=tender_min_depth_m. Matched to
+        main windows by hw_timestamp; tender fields are written onto the same
+        calendar_events row so the per-event description can render them.
+    tender_min_depth_m: the threshold value used for the tender_windows pass.
+        Stored on each event for provenance.
 
     Always-accessible windows are stored too, so that if the mooring is
     recalibrated later (e.g. a deeper-draught boat raises the threshold)
@@ -406,6 +459,13 @@ def store_windows_as_events(windows: list[dict], mooring_id: int,
     recalculation rather than being silently missing.
     """
     from app.access_calc import generate_event_uid
+
+    tender_by_hw = {}
+    if tender_windows:
+        for tw in tender_windows:
+            ts = tw.get("hw_timestamp")
+            if ts:
+                tender_by_hw[ts] = tw
 
     for w in windows:
         if not w.get("start_time") or not w.get("end_time"):
@@ -439,6 +499,16 @@ def store_windows_as_events(windows: list[dict], mooring_id: int,
             event["wind_direction"] = wind_details.get("direction")
             event["wind_speed_ms"] = wind_details.get("speed_ms")
             event["wind_offset_m"] = wind_details.get("offset_m", 0)
+
+        tw = tender_by_hw.get(w["hw_timestamp"])
+        if tw is not None and not tw.get("below_threshold"):
+            event["tender_start_time"] = tw.get("start_time")
+            event["tender_end_time"] = tw.get("end_time")
+            event["tender_always_accessible"] = (
+                1 if tw.get("always_accessible") else 0
+            )
+            if tender_min_depth_m is not None:
+                event["tender_min_depth_m"] = float(tender_min_depth_m)
 
         upsert_calendar_event(event)
 

@@ -39,6 +39,8 @@ CREATE TABLE IF NOT EXISTS moorings (
     calendar_enabled INTEGER DEFAULT 0,
     use_observations INTEGER DEFAULT 0,
     pin_hash TEXT DEFAULT '',
+    tender_access_enabled INTEGER DEFAULT 0,
+    tender_min_depth_m REAL DEFAULT 0.3,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -73,6 +75,10 @@ CREATE TABLE IF NOT EXISTS calendar_events (
     wind_speed_ms REAL,
     wind_offset_m REAL DEFAULT 0,
     always_accessible INTEGER DEFAULT 0,
+    tender_start_time TEXT,
+    tender_end_time TEXT,
+    tender_always_accessible INTEGER DEFAULT 0,
+    tender_min_depth_m REAL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY (mooring_id) REFERENCES moorings(mooring_id)
@@ -167,6 +173,10 @@ def init_db():
         "wind_speed_ms": "ALTER TABLE calendar_events ADD COLUMN wind_speed_ms REAL",
         "wind_offset_m": "ALTER TABLE calendar_events ADD COLUMN wind_offset_m REAL DEFAULT 0",
         "always_accessible": "ALTER TABLE calendar_events ADD COLUMN always_accessible INTEGER DEFAULT 0",
+        "tender_start_time": "ALTER TABLE calendar_events ADD COLUMN tender_start_time TEXT",
+        "tender_end_time": "ALTER TABLE calendar_events ADD COLUMN tender_end_time TEXT",
+        "tender_always_accessible": "ALTER TABLE calendar_events ADD COLUMN tender_always_accessible INTEGER DEFAULT 0",
+        "tender_min_depth_m": "ALTER TABLE calendar_events ADD COLUMN tender_min_depth_m REAL",
     }
     for col, sql in migrations.items():
         if col not in existing_cols:
@@ -179,6 +189,14 @@ def init_db():
         conn.execute("ALTER TABLE moorings ADD COLUMN use_observations INTEGER DEFAULT 0")
     if "pin_hash" not in mooring_cols:
         conn.execute("ALTER TABLE moorings ADD COLUMN pin_hash TEXT DEFAULT ''")
+    if "tender_access_enabled" not in mooring_cols:
+        conn.execute(
+            "ALTER TABLE moorings ADD COLUMN tender_access_enabled INTEGER DEFAULT 0"
+        )
+    if "tender_min_depth_m" not in mooring_cols:
+        conn.execute(
+            "ALTER TABLE moorings ADD COLUMN tender_min_depth_m REAL DEFAULT 0.3"
+        )
 
     # Migrate harmonic_predictions: add cycle_number column for cycle-based
     # deduplication of latest_only queries. Existing rows are backfilled in
@@ -340,7 +358,8 @@ def save_mooring(data: dict) -> dict:
                 UPDATE moorings SET boat_name=?, draught_m=?, drying_height_m=?,
                     safety_margin_m=?, timezone=?, wind_offset_enabled=?,
                     shallow_direction=?, shallow_extra_depth_m=?, calendar_enabled=?,
-                    use_observations=?, updated_at=?
+                    use_observations=?, tender_access_enabled=?, tender_min_depth_m=?,
+                    updated_at=?
                 WHERE mooring_id=?
             """, (
                 data.get("boat_name", ""),
@@ -353,6 +372,8 @@ def save_mooring(data: dict) -> dict:
                 data.get("shallow_extra_depth_m", 0.0),
                 data.get("calendar_enabled", 0),
                 data.get("use_observations", 0),
+                1 if data.get("tender_access_enabled") else 0,
+                float(data.get("tender_min_depth_m", 0.3)),
                 now,
                 data["mooring_id"]
             ))
@@ -361,8 +382,9 @@ def save_mooring(data: dict) -> dict:
                 INSERT INTO moorings (mooring_id, boat_name, draught_m, drying_height_m,
                     safety_margin_m, timezone, wind_offset_enabled, shallow_direction,
                     shallow_extra_depth_m, calendar_enabled, use_observations,
+                    tender_access_enabled, tender_min_depth_m,
                     created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 data["mooring_id"],
                 data.get("boat_name", ""),
@@ -375,6 +397,8 @@ def save_mooring(data: dict) -> dict:
                 data.get("shallow_extra_depth_m", 0.0),
                 data.get("calendar_enabled", 0),
                 data.get("use_observations", 0),
+                1 if data.get("tender_access_enabled") else 0,
+                float(data.get("tender_min_depth_m", 0.3)),
                 now, now
             ))
     return get_mooring(data["mooring_id"])
@@ -1069,6 +1093,8 @@ def upsert_calendar_event(event: dict):
                     draught_m=?, drying_height_m=?, safety_margin_m=?, obs_calibrated=?,
                     wind_direction=?, wind_speed_ms=?, wind_offset_m=?,
                     always_accessible=?,
+                    tender_start_time=?, tender_end_time=?,
+                    tender_always_accessible=?, tender_min_depth_m=?,
                     updated_at=?
                 WHERE event_uid=?
             """, (
@@ -1081,6 +1107,9 @@ def upsert_calendar_event(event: dict):
                 event.get("wind_direction"), event.get("wind_speed_ms"),
                 event.get("wind_offset_m", 0),
                 event.get("always_accessible", 0),
+                event.get("tender_start_time"), event.get("tender_end_time"),
+                event.get("tender_always_accessible", 0),
+                event.get("tender_min_depth_m"),
                 now, event["event_uid"]
             ))
         else:
@@ -1089,8 +1118,10 @@ def upsert_calendar_event(event: dict):
                     hw_height_m, start_time, end_time, source, title, wind_adjusted,
                     draught_m, drying_height_m, safety_margin_m, obs_calibrated,
                     wind_direction, wind_speed_ms, wind_offset_m, always_accessible,
+                    tender_start_time, tender_end_time, tender_always_accessible,
+                    tender_min_depth_m,
                     created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 event["event_uid"], event["mooring_id"],
                 event["hw_timestamp"], event.get("hw_height_m"),
@@ -1102,6 +1133,9 @@ def upsert_calendar_event(event: dict):
                 event.get("wind_direction"), event.get("wind_speed_ms"),
                 event.get("wind_offset_m", 0),
                 event.get("always_accessible", 0),
+                event.get("tender_start_time"), event.get("tender_end_time"),
+                event.get("tender_always_accessible", 0),
+                event.get("tender_min_depth_m"),
                 now, now
             ))
 
