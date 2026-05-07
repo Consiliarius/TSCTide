@@ -171,6 +171,14 @@
   .results-table tr:nth-child(even) { background: var(--sand); }
   .results-table tr.no-access { color: var(--text-light); font-style: italic; }
   .results-table tr.always-afloat td { font-weight: 600; color: var(--ok); }
+  /* Tender sub-row: muted, smaller, indented under its main access row */
+  .results-table tr.tender-row td {
+    font-size: 11px; color: var(--text-light);
+    padding-top: 2px; padding-bottom: 6px;
+    border-bottom: 1px solid var(--sand-dark);
+    background: transparent;
+  }
+  .results-table tr.tender-row td.tender-label { padding-left: 24px; font-style: italic; }
   .source-badge {
     display: inline-block; padding: 1px 6px; border-radius: 3px;
     font-size: 11px; font-weight: 600; color: #fff;
@@ -509,7 +517,7 @@
         </div>
         <div>
           <label>Drying Height (m)</label>
-          <input type="number" id="drying_height_m" step="0.01" value="2.0">
+          <input type="number" id="drying_height_m" step="0.01" value="2.0" oninput="updateTenderVisibility()">
         </div>
         <div>
           <label>Safety Margin (m)</label>
@@ -547,6 +555,27 @@
         </div>
       </div>
       </div><!-- end wind-section -->
+
+      <!-- Tender Access (only relevant for moorings that dry; visibility
+           is controlled by updateTenderVisibility based on drying_height_m) -->
+      <div id="tender-section" class="hidden">
+        <div class="switch-row">
+          <label class="switch">
+            <input type="checkbox" id="tender_access_enabled" onchange="toggleTenderConfig()">
+            <span class="slider"></span>
+          </label>
+          <span style="font-size:13px;font-weight:600;">Tender Access</span>
+          <span style="font-size:11px;color:var(--text-light);">(extra window for reaching the mooring by dinghy)</span>
+        </div>
+        <div id="tender-config" class="hidden">
+          <div class="row">
+            <div>
+              <label>Minimum Tender Depth (m)</label>
+              <input type="number" id="tender_min_depth_m" step="0.05" min="0" value="0.3">
+            </div>
+          </div>
+        </div>
+      </div>
 
       <!-- Calendar subscription toggle -->
       <div class="switch-row">
@@ -923,6 +952,29 @@ function toggleWindConfig() {
     !document.getElementById('wind_offset_enabled').checked);
 }
 
+function toggleTenderConfig() {
+  document.getElementById('tender-config').classList.toggle('hidden',
+    !document.getElementById('tender_access_enabled').checked);
+}
+
+// Tender access only makes sense for moorings that dry. Hide the whole
+// section when drying_height_m <= 0 so a deep-water mooring does not see
+// the toggle. If the section gets hidden while the toggle is on, also
+// uncheck so a stale value cannot be saved.
+function updateTenderVisibility() {
+  const drying = parseFloat(document.getElementById('drying_height_m').value);
+  const visible = !isNaN(drying) && drying > 0;
+  const section = document.getElementById('tender-section');
+  section.classList.toggle('hidden', !visible);
+  if (!visible) {
+    const cb = document.getElementById('tender_access_enabled');
+    if (cb.checked) {
+      cb.checked = false;
+      toggleTenderConfig();
+    }
+  }
+}
+
 function updateMooringOptions() {
   const midStr = document.getElementById('mooring_id').value;
   const mid = parseInt(midStr) || null;
@@ -1231,6 +1283,12 @@ function getConfig() {
     shallow_extra_depth_m: mooringOptionsHidden ? 0 : num('shallow_extra_depth_m', 0),
     calendar_enabled: document.getElementById('calendar_enabled').checked ? 1 : 0,
     use_observations: document.getElementById('use_observations').checked ? 1 : 0,
+    // Tender fields are only meaningful when a mooring ID is set and the
+    // mooring dries. Zero them out when mooring-options is hidden so an
+    // anonymous calculation cannot leak stale toggle state.
+    tender_access_enabled: mooringOptionsHidden ? 0 :
+      (document.getElementById('tender_access_enabled').checked ? 1 : 0),
+    tender_min_depth_m: mooringOptionsHidden ? 0.3 : num('tender_min_depth_m', 0.3),
   };
 }
 
@@ -1247,7 +1305,11 @@ function setConfig(cfg) {
   document.getElementById('shallow_extra_depth_m').value = cfg.shallow_extra_depth_m ?? 0;
   document.getElementById('calendar_enabled').checked = !!cfg.calendar_enabled;
   document.getElementById('use_observations').checked = !!cfg.use_observations;
+  document.getElementById('tender_access_enabled').checked = !!cfg.tender_access_enabled;
+  document.getElementById('tender_min_depth_m').value = cfg.tender_min_depth_m ?? 0.3;
   toggleWindConfig();
+  toggleTenderConfig();
+  updateTenderVisibility();
   updateMooringOptions();
   updateFeedUrl(cfg);
   toggleObsPanel();
@@ -1422,8 +1484,12 @@ async function deleteMooring() {
     document.getElementById('wind_offset_enabled').checked = false;
     document.getElementById('calendar_enabled').checked = false;
     document.getElementById('use_observations').checked = false;
+    document.getElementById('tender_access_enabled').checked = false;
+    document.getElementById('tender_min_depth_m').value = '0.3';
     updateMooringOptions();
     toggleWindConfig();
+    toggleTenderConfig();
+    updateTenderVisibility();
     toggleObsPanel();
     document.getElementById('feed-url-section').classList.add('hidden');
     showStatus('cfg-status',
@@ -1453,6 +1519,8 @@ async function calculate(source) {
     wind_offset_enabled: cfg.wind_offset_enabled,
     shallow_direction: cfg.shallow_direction,
     shallow_extra_depth_m: cfg.shallow_extra_depth_m,
+    tender_access_enabled: cfg.tender_access_enabled,
+    tender_min_depth_m: cfg.tender_min_depth_m,
   };
   if (source === 'harmonic') {
     body.days = parseInt(document.getElementById('harmonic_days').value) || 30;
@@ -1586,6 +1654,24 @@ function renderResults(data) {
         `<td>${fmtTime(w.start_time)}</td><td>${fmtTime(w.end_time)}</td>` +
         `<td>${w.duration_minutes} min${windMark}</td><td>${badge}</td></tr>`;
     }
+
+    // Tender sub-row. Rendered immediately under the main row when the
+    // backend has attached tender_* fields to this window. Three states:
+    // always-accessible, normal (start/end times), or below-threshold
+    // (sailing below but tender is wider; spec also allows this case but
+    // currently only main-window-bearing rows reach this branch).
+    const hasTender = (w.tender_start_time && w.tender_end_time)
+      || w.tender_always_accessible;
+    if (hasTender && !w.below_threshold) {
+      let tenderText;
+      if (w.tender_always_accessible) {
+        tenderText = 'Tender access throughout this tidal cycle';
+      } else {
+        tenderText = `Tender access from ${fmtTime(w.tender_start_time)} to ${fmtTime(w.tender_end_time)}`;
+      }
+      html += `<tr class="tender-row"><td colspan="2"></td>` +
+        `<td colspan="5" class="tender-label">${tenderText}</td></tr>`;
+    }
   }
   html += '</tbody></table>';
   container.innerHTML = html;
@@ -1650,6 +1736,7 @@ async function updateFeed() {
         draught_m: cfg.draught_m,
         drying_height_m: cfg.drying_height_m,
         safety_margin_m: cfg.safety_margin_m,
+        tender_min_depth_m: cfg.tender_min_depth_m,
       },
       wind_info: lastWindInfo,
     };
@@ -2525,10 +2612,16 @@ async function loadMooringConfigs() {
             `<div><span class="label">Calendar feed:</span> <span class="value">${m.calendar_enabled ? 'Enabled' : 'Disabled'}</span></div>` +
             `<div><span class="label">Observational data:</span> <span class="value">${m.use_observations ? 'Enabled' : 'Disabled'}</span></div>` +
             `<div><span class="label">Wind offset:</span> <span class="value">${m.wind_offset_enabled ? 'Enabled' : 'Disabled'}</span></div>` +
+            `<div><span class="label">Tender access:</span> <span class="value">${m.tender_access_enabled ? 'Enabled' : 'Disabled'}</span></div>` +
           `</div>`;
       if (m.wind_offset_enabled && m.shallow_direction) {
         html += `<div style="font-size:12px;margin-top:6px;color:var(--text-light);">` +
           `Shallow side: <b>${m.shallow_direction}</b>, extra drying: <b>+${(m.shallow_extra_depth_m || 0).toFixed(2)}m</b>` +
+          `</div>`;
+      }
+      if (m.tender_access_enabled) {
+        html += `<div style="font-size:12px;margin-top:6px;color:var(--text-light);">` +
+          `Tender minimum depth: <b>${(m.tender_min_depth_m ?? 0.3).toFixed(2)}m</b>` +
           `</div>`;
       }
       html += `<div style="margin-top:10px;">` +
