@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Tidal Access Window Predictor</title>
+<title>Tidal Access at TSC</title>
 <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
 <style>
   :root {
@@ -34,7 +34,7 @@
   header h1 { font-size: 18px; font-weight: 600; }
   header .subtitle { font-size: 12px; color: var(--sea-light); }
   .container { max-width: 960px; margin: 0 auto; padding: 16px; }
-
+ }	
   /* Tab bar */
   .tabs {
     display: flex; gap: 4px; margin-bottom: 16px;
@@ -393,6 +393,23 @@
     font-size: 10px; color: var(--text-light); margin-top: 8px;
     text-align: right; opacity: 0.6;
   }
+  footer {
+    background: var(--navy); color: #fff; padding: 16px 20px;
+    font-size: 14px; line-height: 1.6; margin-top: 24px;
+  }
+  footer a {
+    color: var(--sea-light); text-decoration: none;
+  }
+  footer a:hover {
+    text-decoration: underline;
+  }
+  footer .footer-disclaimer {
+    margin-bottom: 12px; opacity: 0.85;
+  }
+  footer .footer-links {
+    display: flex; flex-wrap: wrap; gap: 16px;
+    font-size: 13px;
+  }
   @media (max-width: 600px) {
     .conditions-body { grid-template-columns: 1fr; }
     .conditions-col:first-child { border-right: none; border-bottom: 1px solid var(--sand-dark); }
@@ -408,8 +425,8 @@
 
 <header>
   <div>
-    <h1>Tidal Access Window Predictor</h1>
-    <div class="subtitle">Langstone Harbour — Swing Mooring Access</div>
+    <h1>Tidal Access at TSC</h1>
+    <div class="subtitle">Weather & tide conditions in Langstone Harbour - including a calculator for predicting access to swing moorings</div>
   </div>
 </header>
 
@@ -823,6 +840,17 @@
   </div>
 
 </div><!-- end container -->
+
+<footer>
+  <div class="footer-disclaimer">
+    This tool provides tidal and weather information for general planning purposes only. Predictions are based on modelled data and may not reflect actual conditions. It should not be relied upon for navigation, safety-critical decisions, or any purpose where inaccurate data could result in harm. Always verify conditions against official sources before going afloat.
+  </div>
+  <div class="footer-links">
+    <a href="https://easytide.admiralty.co.uk/?PortID=0066" target="_blank" rel="noopener">UKHO EasyTide (Langstone)</a>
+    <a href="https://weather.metoffice.gov.uk/forecast/gcp2cm19" target="_blank" rel="noopener">Met Office (Langstone)</a>
+    <a href="https://github.com/Consiliarius/TSCTide/issues" target="_blank" rel="noopener">Report an issue</a>
+  </div>
+</footer>
 
 <!-- PIN modal (v2) -->
 <div id="pin-modal-overlay" class="hidden">
