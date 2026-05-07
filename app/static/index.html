@@ -112,9 +112,9 @@
     font-size: 13px; font-weight: 600; cursor: pointer; user-select: none;
     display: flex; justify-content: space-between; align-items: center;
   }
-  .panel-header .toggle { font-size: 11px; color: var(--sea-light); }
+  .panel-header .toggle { font-size: 11px; color: var(--sand); }
   .panel-header-help {
-    color: var(--est);
+    color: var(--sand);
   }
   .panel-body { padding: 14px; }
   .panel-body.collapsed { display: none; }
@@ -447,7 +447,7 @@
   <!-- Getting Started -->
   <div class="panel">
     <div class="panel-header panel-header-help" onclick="togglePanel('help')">
-      <span>ℹ️ Getting Started</span> <span class="toggle" id="help-toggle">▶</span>
+      <span>ℹ️ Getting Started <i>(click to expand)</i></span> <span class="toggle" id="help-toggle">▶</span>
     </div>
     <div class="panel-body collapsed" id="help-body" style="font-size:13px;line-height:1.6;">
       <p>This tool predicts when your boat has enough water to safely leave or return to a swing mooring in Langstone Harbour.</p>
@@ -472,7 +472,7 @@
   <!-- Configuration Panel -->
   <div class="panel">
     <div class="panel-header" onclick="togglePanel('cfg')">
-      Configuration <span class="toggle" id="cfg-toggle">▼</span>
+      ⚙️ Configuration <span class="toggle" id="cfg-toggle">▼</span>
     </div>
     <div class="panel-body" id="cfg-body">
       <div class="row">
@@ -635,7 +635,7 @@
   <!-- Data Source & Calculate Panel -->
   <div class="panel">
     <div class="panel-header" onclick="togglePanel('calc')">
-      Calculate Access Windows <span class="toggle" id="calc-toggle">▼</span>
+      🧮 Calculate Access Windows <span class="toggle" id="calc-toggle">▼</span>
     </div>
     <div class="panel-body" id="calc-body">
       <div class="btn-group mb-8">
@@ -703,7 +703,7 @@
   <!-- Results Panel -->
   <div class="panel">
     <div class="panel-header" onclick="togglePanel('results')">
-      Access Windows <span class="toggle" id="results-toggle">▼</span>
+      📅 Access Windows <span class="toggle" id="results-toggle">▼</span>
     </div>
     <div class="panel-body" id="results-body">
       <div id="wind-info-display"></div>
