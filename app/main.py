@@ -40,7 +40,8 @@ from app.ukho import fetch_tidal_events
 from app.khm_parser import parse_khm_paste
 from app.harmonic import predict_events as harmonic_predict_events
 from app.secondary_port import apply_offset
-from app.wind import fetch_current_wind, should_apply_offset
+from app.wind import fetch_current_wind, fetch_current_weather, should_apply_offset
+from app.conditions import get_current_conditions
 from app.access_calc import compute_access_windows, generate_event_uid
 from app.ical_manager import (
     generate_export_ics, store_windows_as_events,
@@ -1589,6 +1590,23 @@ async def serve_langstone_harmonic_180d():
             "Expires": "0",
         },
     )
+
+
+# --- Current Conditions ---
+
+@app.get("/api/conditions")
+async def current_conditions():
+    """
+    Return combined tide and weather conditions at Langstone Harbour.
+
+    Cached for 15 minutes. The scheduler refresh job keeps the cache
+    warm and the pressure history populated even when no user is
+    viewing the page.
+
+    Ungated (no PIN required) - weather and tide state are public.
+    """
+    result = await get_current_conditions()
+    return result
 
 
 # --- Wind ---

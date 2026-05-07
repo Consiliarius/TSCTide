@@ -42,10 +42,19 @@ def start_scheduler():
         replace_existing=True,
         name="Daily UKHO tide data fetch",
     )
+    scheduler.add_job(
+        conditions_refresh,
+        "interval",
+        minutes=15,
+        id="conditions_refresh",
+        replace_existing=True,
+        name="Current conditions refresh (weather + pressure history)",
+    )
     scheduler.start()
     logger.info(
         f"Scheduler started. Daily UKHO fetch at "
-        f"{UKHO_FETCH_HOUR:02d}:{UKHO_FETCH_MINUTE:02d}"
+        f"{UKHO_FETCH_HOUR:02d}:{UKHO_FETCH_MINUTE:02d}. "
+        f"Conditions refresh every 15 min."
     )
     log_activity(
         event_type="scheduler_start",
@@ -577,6 +586,23 @@ async def wind_observation_job(hw_timestamp: str):
             generate_feed_for_mooring(m["mooring_id"], m.get("boat_name", ""), cal)
         except Exception as e:
             logger.error(f"Wind recalc failed for mooring {m['mooring_id']}: {e}")
+
+
+async def conditions_refresh():
+    """
+    Scheduled every 15 minutes: fetches fresh weather from OWM, computes
+    current tide state, stores the pressure reading for trend calculation,
+    and warms the conditions cache so /api/conditions serves instantly.
+
+    This job runs independently of any user viewing the page. Without it
+    the pressure_history table would only accumulate readings when a user
+    happens to visit, making the 3-hour pressure trend unreliable.
+    """
+    try:
+        from app.conditions import get_current_conditions
+        await get_current_conditions(force_refresh=True)
+    except Exception as e:
+        logger.error(f"Conditions refresh failed: {e}")
 
 
 def shutdown_scheduler():

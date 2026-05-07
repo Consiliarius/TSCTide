@@ -339,6 +339,62 @@
   .mt-8 { margin-top: 8px; }
   .mb-8 { margin-bottom: 8px; }
 
+  /* Current Conditions dashboard (v2.6) */
+  .conditions-dashboard {
+    background: #fff; border: 1px solid var(--border);
+    border-radius: var(--radius); margin-bottom: 16px;
+    overflow: hidden;
+  }
+  .conditions-header {
+    background: var(--navy); color: #fff; padding: 8px 14px;
+    font-size: 13px; font-weight: 600;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .conditions-header .conditions-updated {
+    font-size: 11px; font-weight: 400; opacity: 0.7;
+  }
+  .conditions-body {
+    display: grid; grid-template-columns: 1fr 1fr;
+    gap: 0; padding: 0;
+  }
+  .conditions-col {
+    padding: 12px 16px;
+  }
+  .conditions-col:first-child {
+    border-right: 1px solid var(--sand-dark);
+  }
+  .conditions-col-title {
+    font-size: 11px; font-weight: 700; text-transform: uppercase;
+    color: var(--sea); letter-spacing: 0.5px; margin-bottom: 6px;
+  }
+  .conditions-row {
+    font-size: 13px; margin: 3px 0;
+    display: flex; justify-content: space-between;
+  }
+  .conditions-row .c-label { color: var(--text-light); }
+  .conditions-row .c-value { font-weight: 600; color: var(--navy); }
+  .conditions-state {
+    font-size: 14px; font-weight: 700; color: var(--sea);
+    margin: 4px 0 2px;
+  }
+  .conditions-next {
+    font-size: 12px; color: var(--text); margin-top: 4px;
+    background: var(--sand); border-radius: var(--radius);
+    padding: 4px 8px;
+  }
+  .conditions-unavailable {
+    font-size: 12px; color: var(--text-light); font-style: italic;
+    padding: 8px 0;
+  }
+  .conditions-source {
+    font-size: 10px; color: var(--text-light); margin-top: 8px;
+    text-align: right; opacity: 0.6;
+  }
+  @media (max-width: 600px) {
+    .conditions-body { grid-template-columns: 1fr; }
+    .conditions-col:first-child { border-right: none; border-bottom: 1px solid var(--sand-dark); }
+  }
+
   @media (max-width: 600px) {
     .row > * { min-width: 100%; }
     .container { padding: 8px; }
@@ -355,6 +411,24 @@
 </header>
 
 <div class="container">
+
+  <!-- Current Conditions (v2.6) -->
+  <div class="conditions-dashboard" id="conditions-dashboard">
+    <div class="conditions-header">
+      <span>Current Conditions at Langstone Harbour</span>
+      <span class="conditions-updated" id="conditions-updated"></span>
+    </div>
+    <div class="conditions-body">
+      <div class="conditions-col" id="conditions-tide">
+        <div class="conditions-col-title">Tide</div>
+        <div class="conditions-unavailable">Loading...</div>
+      </div>
+      <div class="conditions-col" id="conditions-weather">
+        <div class="conditions-col-title">Weather</div>
+        <div class="conditions-unavailable">Loading...</div>
+      </div>
+    </div>
+  </div>
 
   <!-- Tab navigation -->
   <div class="tabs">
@@ -2478,6 +2552,136 @@ function loadMooringActivity(mooringId) {
       if (target) target.innerHTML = '<em style="color:var(--warn);">Failed to load activity.</em>';
     });
 }
+
+// --- Current Conditions (v2.6) ---
+
+function fmtConditionsTime(isoStr) {
+  if (!isoStr) return '';
+  const d = new Date(isoStr);
+  return d.toLocaleTimeString('en-GB', {
+    hour: '2-digit', minute: '2-digit', timeZone: 'Europe/London'
+  });
+}
+
+function fmtMinutesUntil(mins) {
+  if (mins == null) return '';
+  const m = Math.round(mins);
+  if (m < 1) return 'now';
+  if (m < 60) return `in ${m} min`;
+  const h = Math.floor(m / 60);
+  const rm = m % 60;
+  return rm > 0 ? `in ${h}h ${rm}m` : `in ${h}h`;
+}
+
+function renderConditionsTide(tide) {
+  const el = document.getElementById('conditions-tide');
+  if (!tide || tide.height_m == null) {
+    el.innerHTML = '<div class="conditions-col-title">Tide</div>' +
+      '<div class="conditions-unavailable">' +
+      (tide ? tide.state_description || 'Tide data unavailable' : 'Tide data unavailable') +
+      '</div>';
+    return;
+  }
+  const stateIcons = {
+    flooding: '\u25B2', ebbing: '\u25BC',
+    high_water: '\u2014', low_water: '\u2014'
+  };
+  const icon = stateIcons[tide.state] || '';
+  // Upcoming events: show up to 3 (a full HW/LW/HW or LW/HW/LW cycle).
+  // First event gets a time-until countdown; subsequent ones show time only.
+  let upcomingHtml = '';
+  const upcoming = tide.upcoming_events || [];
+  if (upcoming.length > 0) {
+    const rows = upcoming.map((ne, i) => {
+      const timeStr = fmtConditionsTime(ne.time);
+      const label = ne.type === 'HighWater' ? 'High Water' : 'Low Water';
+      const countdown = i === 0 ? ` <span style="color:var(--text-light);">(${fmtMinutesUntil(ne.minutes_until)})</span>` : '';
+      return `<div>${label} ${ne.height_m}m at ${timeStr}${countdown}</div>`;
+    }).join('');
+    upcomingHtml = `<div class="conditions-next">${rows}</div>`;
+  }
+  el.innerHTML = '<div class="conditions-col-title">Tide</div>' +
+    `<div class="conditions-row">` +
+    `<span class="c-label">Current height of tide:</span> ` +
+    `<span class="c-value">${tide.height_m}m above CD</span>` +
+    `</div>` +
+    `<div class="conditions-state">${tide.state_description || ''} ${icon}</div>` +
+    upcomingHtml +
+    `<div class="conditions-source">Source: UKHO Admiralty</div>`;
+}
+
+function renderConditionsWeather(weather) {
+  const el = document.getElementById('conditions-weather');
+  if (!weather) {
+    el.innerHTML = '<div class="conditions-col-title">Weather</div>' +
+      '<div class="conditions-unavailable">Weather data unavailable</div>';
+    return;
+  }
+  const w = weather.wind || {};
+  const p = weather.pressure || {};
+  const r = weather.precipitation || {};
+  const v = weather.visibility || {};
+
+  // Wind line
+  const gustStr = w.gust_ms != null ? ` (gusts ${w.gust_ms} m/s)` : '';
+  const windLine = `${w.direction_compass || '?'} ${w.speed_ms || 0} m/s${gustStr}`;
+  const beaufortLine = w.beaufort_description ? ` \u2014 F${w.beaufort_force} ${w.beaufort_description}` : '';
+
+  // Pressure line with trend arrow
+  const pressureVal = p.hpa != null ? `${p.hpa} hPa` : '?';
+  const trendArrow = p.trend_arrow || '';
+  const trendDesc = p.trend || '';
+  const pressureLine = trendDesc && trendDesc !== 'Unknown'
+    ? `${pressureVal} ${trendArrow} ${trendDesc}` : pressureVal;
+
+  el.innerHTML = '<div class="conditions-col-title">Weather</div>' +
+    `<div class="conditions-row">` +
+    `<span class="c-label">Wind:</span> ` +
+    `<span class="c-value">${windLine}${beaufortLine}</span>` +
+    `</div>` +
+    `<div class="conditions-row">` +
+    `<span class="c-label">Pressure:</span> ` +
+    `<span class="c-value">${pressureLine}</span>` +
+    `</div>` +
+    `<div class="conditions-row">` +
+    `<span class="c-label">Precipitation:</span> ` +
+    `<span class="c-value">${r.description || 'Unknown'}${r.rain_mm_h > 0 ? ` (${r.rain_mm_h} mm/h)` : ''}</span>` +
+    `</div>` +
+    `<div class="conditions-row">` +
+    `<span class="c-label">Visibility:</span> ` +
+    `<span class="c-value">${v.description || 'Unknown'}</span>` +
+    `</div>` +
+    `<div class="conditions-source">Source: OpenWeatherMap</div>`;
+}
+
+async function loadConditions() {
+  try {
+    const resp = await fetch('/api/conditions');
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+
+    renderConditionsTide(data.tide);
+    renderConditionsWeather(data.weather);
+
+    // Update timestamp
+    const updatedEl = document.getElementById('conditions-updated');
+    const ts = (data.weather && data.weather.fetched_at)
+      || (data.tide && data.tide.computed_at)
+      || null;
+    if (ts && updatedEl) {
+      updatedEl.textContent = 'Updated ' + fmtConditionsTime(ts);
+    }
+  } catch (e) {
+    console.warn('Conditions fetch failed:', e);
+    // Leave whatever was last displayed; do not blank the panel on a
+    // transient network error. On first load the "Loading..." text
+    // remains visible which is correct.
+  }
+}
+
+// Initial load + 15-minute refresh
+loadConditions();
+setInterval(loadConditions, 15 * 60 * 1000);
 </script>
 
 </body>
