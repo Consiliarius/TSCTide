@@ -19,3 +19,7 @@ data/*
 # OS
 .DS_Store
 Thumbs.db
+
+#Claude
+Claude.md
+.claude/*

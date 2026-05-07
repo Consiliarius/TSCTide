@@ -129,6 +129,14 @@ CREATE TABLE IF NOT EXISTS harmonic_predictions (
 );
 CREATE INDEX IF NOT EXISTS idx_harm_timestamp ON harmonic_predictions(timestamp);
 CREATE INDEX IF NOT EXISTS idx_harm_generated ON harmonic_predictions(generated_at);
+
+CREATE TABLE IF NOT EXISTS pressure_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,           -- ISO UTC time of the reading
+    pressure_hpa REAL NOT NULL,        -- atmospheric pressure at sea level, hPa
+    UNIQUE(timestamp)
+);
+CREATE INDEX IF NOT EXISTS idx_pressure_ts ON pressure_history(timestamp);
 """
 
 
@@ -1590,6 +1598,48 @@ def get_wind_observations_in_range(start: str, end: str) -> list[dict]:
             (start, end)
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+# --- Pressure History ---
+#
+# Stores atmospheric pressure readings at ~15-min intervals to support
+# pressure-trend calculation for the Current Conditions panel. Each row
+# is one OWM observation. Rows older than 24 hours are pruned by the
+# conditions refresh job; only the most recent ~3 hours are needed for
+# trend calculation but 24 hours is retained for debugging.
+
+def store_pressure_reading(timestamp: str, pressure_hpa: float) -> None:
+    """Store a single pressure reading. Duplicate timestamps are ignored."""
+    with db_connection() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO pressure_history (timestamp, pressure_hpa) "
+            "VALUES (?, ?)",
+            (timestamp, pressure_hpa),
+        )
+
+
+def get_pressure_history(hours: int = 4) -> list[dict]:
+    """
+    Return pressure readings from the last N hours, oldest first.
+    Default 4 hours gives comfortable margin for the 3-hour trend window.
+    """
+    cutoff = to_utc_str(datetime.now(timezone.utc) - timedelta(hours=hours))
+    with db_connection() as conn:
+        rows = conn.execute(
+            "SELECT timestamp, pressure_hpa FROM pressure_history "
+            "WHERE timestamp >= ? ORDER BY timestamp",
+            (cutoff,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def cleanup_old_pressure_history(hours: int = 24) -> None:
+    """Remove pressure readings older than the given number of hours."""
+    cutoff = to_utc_str(datetime.now(timezone.utc) - timedelta(hours=hours))
+    with db_connection() as conn:
+        conn.execute(
+            "DELETE FROM pressure_history WHERE timestamp < ?", (cutoff,)
+        )
 
 
 # --- Activity Log ---
