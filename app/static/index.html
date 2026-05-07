@@ -432,14 +432,14 @@
 
   <!-- Tab navigation -->
   <div class="tabs">
-    <button class="tab active" data-view="main" onclick="switchView('main')">Access Windows</button>
-    <button class="tab" data-view="tides" onclick="switchView('tides')">Tides</button>
-    <button class="tab" data-view="system" onclick="switchView('system')">System Activity</button>
+    <button class="tab active" data-view="tides" onclick="switchView('tides')">Tides</button>
+    <button class="tab" data-view="main" onclick="switchView('main')">Access Windows</button>
     <button class="tab" data-view="moorings" onclick="switchView('moorings')">Mooring Configs</button>
+    <button class="tab" data-view="system" onclick="switchView('system')">System Activity</button>
   </div>
 
   <!-- Main view -->
-  <div class="view active" id="view-main">
+  <div class="view" id="view-main">
 
   <!-- Getting Started -->
   <div class="panel">
@@ -719,7 +719,7 @@
   </div><!-- end #view-main -->
 
   <!-- Tides view -->
-  <div class="view" id="view-tides">
+  <div class="view active" id="view-tides">
     <div class="panel">
       <div class="panel-header" style="cursor:default;">Tides at Langstone Harbour</div>
       <div class="panel-body">
@@ -2682,6 +2682,9 @@ async function loadConditions() {
 // Initial load + 15-minute refresh
 loadConditions();
 setInterval(loadConditions, 15 * 60 * 1000);
+
+// Tides is the default view; load its data on page open.
+loadTides();
 </script>
 
 </body>
