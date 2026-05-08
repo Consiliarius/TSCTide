@@ -147,6 +147,17 @@ async def daily_ukho_fetch():
                 safety_margin_m=m["safety_margin_m"],
                 source="ukho",
             )
+            tender_windows = None
+            tender_depth = None
+            if m.get("tender_access_enabled"):
+                tender_depth = float(m.get("tender_min_depth_m") or 0.3)
+                tender_windows = compute_access_windows(
+                    events=calc_events,
+                    draught_m=0.0,
+                    drying_height_m=m["drying_height_m"],
+                    safety_margin_m=tender_depth,
+                    source="ukho",
+                )
             cal = calibrate_drying_height(m["mooring_id"])
             calc_params = {
                 "draught_m": m["draught_m"],
@@ -157,6 +168,8 @@ async def daily_ukho_fetch():
             store_windows_as_events(
                 windows, m["mooring_id"], "ukho", m.get("boat_name", ""),
                 calc_params=calc_params,
+                tender_windows=tender_windows,
+                tender_min_depth_m=tender_depth,
             )
             if cal.get("confidence") == "none":
                 cal = None
@@ -564,6 +577,19 @@ async def wind_observation_job(hw_timestamp: str):
                 wind_offset_hw_timestamp=next_hw_ts,
                 source="ukho",
             )
+            tender_windows = None
+            tender_depth = None
+            if m.get("tender_access_enabled"):
+                tender_depth = float(m.get("tender_min_depth_m") or 0.3)
+                tender_windows = compute_access_windows(
+                    events=next_events,
+                    draught_m=0.0,
+                    drying_height_m=m["drying_height_m"],
+                    safety_margin_m=tender_depth,
+                    wind_offset_m=wind_offset,
+                    wind_offset_hw_timestamp=next_hw_ts,
+                    source="ukho",
+                )
 
             cal = calibrate_drying_height(m["mooring_id"])
             calc_params = {
@@ -580,6 +606,8 @@ async def wind_observation_job(hw_timestamp: str):
             store_windows_as_events(
                 windows, m["mooring_id"], "ukho", m.get("boat_name", ""),
                 calc_params=calc_params, wind_details=wind_details,
+                tender_windows=tender_windows,
+                tender_min_depth_m=tender_depth,
             )
             if cal.get("confidence") == "none":
                 cal = None
