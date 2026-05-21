@@ -1365,6 +1365,89 @@ def cleanup_old_harmonic_predictions(days: int = 365):
             )
 
 
+def get_harmonic_residual_pairs(
+    start: str, end: str
+) -> list[dict]:
+    """
+    Return per-event paired residuals between harmonic predictions and
+    UKHO actuals for the specified time range.
+
+    Each returned dict represents one matched physical tide:
+
+        {
+            "cycle_number": int,
+            "event_type": "HighWater" | "LowWater",
+            "ukho_timestamp": ISO UTC string,
+            "ukho_height_m": float,
+            "harmonic_timestamp": ISO UTC string,
+            "harmonic_height_m": float,
+            "height_residual_m": float,   # predicted - actual
+            "timing_residual_min": float,  # predicted - actual, minutes
+        }
+
+    Matching logic is identical to compute_harmonic_residuals: join on
+    (cycle_number, event_type), freshest harmonic prediction per cycle,
+    both sides Langstone-corrected. Sign convention matches
+    scripts/calibrate_from_ukho_week.py (positive = over-predicts).
+
+    Returns an empty list if no pairs match. Unmatched UKHO events are
+    silently skipped (use compute_harmonic_residuals for match/unmatch
+    counts).
+    """
+    ukho_events = get_ukho_tide_events(start, end)
+
+    harm_query_start = to_utc_str(
+        datetime.fromisoformat(start.replace("Z", "+00:00"))
+        - timedelta(hours=7)
+    )
+    harm_query_end = to_utc_str(
+        datetime.fromisoformat(end.replace("Z", "+00:00"))
+        + timedelta(hours=7)
+    )
+    harm_events = get_harmonic_predictions(
+        harm_query_start, harm_query_end, latest_only=True
+    )
+
+    harm_index: dict[tuple[int, str], dict] = {}
+    for h in harm_events:
+        cyc = h.get("cycle_number")
+        if cyc is None:
+            continue
+        harm_index[(cyc, h["event_type"])] = h
+
+    pairs: list[dict] = []
+    for u in ukho_events:
+        et = u["event_type"]
+        if et not in ("HighWater", "LowWater"):
+            continue
+        u_cyc = _compute_cycle_number(u["timestamp"])
+        h = harm_index.get((u_cyc, et))
+        if h is None:
+            continue
+        try:
+            u_dt = datetime.fromisoformat(
+                u["timestamp"].replace("Z", "+00:00")
+            )
+            h_dt = datetime.fromisoformat(
+                h["timestamp"].replace("Z", "+00:00")
+            )
+        except (ValueError, KeyError):
+            continue
+        pairs.append({
+            "cycle_number": u_cyc,
+            "event_type": et,
+            "ukho_timestamp": u["timestamp"],
+            "ukho_height_m": u["height_m"],
+            "harmonic_timestamp": h["timestamp"],
+            "harmonic_height_m": h["height_m"],
+            "height_residual_m": round(h["height_m"] - u["height_m"], 3),
+            "timing_residual_min": round(
+                (h_dt - u_dt).total_seconds() / 60.0, 1
+            ),
+        })
+    return pairs
+
+
 def compute_harmonic_residuals(days: int = 30) -> dict:
     """
     Compare stored harmonic predictions against actual UKHO HW/LW events for
