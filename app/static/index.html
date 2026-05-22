@@ -482,6 +482,13 @@
   .tcv-event-dot { fill: var(--navy); }
   .tcv-event-label { fill: var(--navy); font-size: 10px; font-weight: 600; }
   .tcv-clip-mark { fill: var(--warn); font-size: 14px; font-weight: 700; }
+  /* Access threshold lines (v2.8): show the tide height the boat / tender
+     needs to clear. Drawn only when a Mooring ID is set. */
+  .tcv-access-line { stroke: var(--ok); stroke-width: 1.2; stroke-dasharray: 5 4; fill: none; opacity: 0.85; pointer-events: none; }
+  .tcv-access-label { fill: var(--ok); font-size: 10px; font-weight: 600; pointer-events: none; }
+  .tcv-tender-line { stroke: var(--ok); stroke-width: 1; stroke-dasharray: 2 3; fill: none; opacity: 0.7; pointer-events: none; }
+  .tcv-tender-label { fill: var(--ok); font-size: 10px; font-weight: 600; opacity: 0.85; pointer-events: none; }
+  .tcv-access-clip { fill: var(--ok); font-size: 12px; font-weight: 700; pointer-events: none; }
   .tcv-hover-line { stroke: var(--navy); stroke-width: 1; stroke-dasharray: 3 3; fill: none; pointer-events: none; opacity: 0.7; }
   .tcv-hover-dot { fill: var(--navy); stroke: #fff; stroke-width: 1.5; pointer-events: none; }
   #tcv-tooltip {
@@ -621,7 +628,7 @@
       <div class="row">
         <div>
           <label>Mooring ID (1–100, optional)</label>
-          <input type="number" id="mooring_id" min="1" max="100" placeholder="e.g. 42" oninput="updateMooringOptions()">
+          <input type="number" id="mooring_id" min="1" max="100" placeholder="e.g. 42" oninput="updateMooringOptions(); _tcvSyncAccessThreshold();">
         </div>
         <div>
           <label>Boat Name (optional)</label>
@@ -631,15 +638,15 @@
       <div class="row">
         <div>
           <label>Draught (m)</label>
-          <input type="number" id="draught_m" step="0.01" value="1.0">
+          <input type="number" id="draught_m" step="0.01" value="1.0" oninput="_tcvSyncAccessThreshold()">
         </div>
         <div>
           <label>Drying Height (m)</label>
-          <input type="number" id="drying_height_m" step="0.01" value="2.0" oninput="updateTenderVisibility()">
+          <input type="number" id="drying_height_m" step="0.01" value="2.0" oninput="updateTenderVisibility(); _tcvSyncAccessThreshold();">
         </div>
         <div>
           <label>Safety Margin (m)</label>
-          <input type="number" id="safety_margin_m" step="0.01" value="0.3">
+          <input type="number" id="safety_margin_m" step="0.01" value="0.3" oninput="_tcvSyncAccessThreshold()">
         </div>
       </div>
 
@@ -679,7 +686,7 @@
       <div id="tender-section" class="hidden">
         <div class="switch-row">
           <label class="switch">
-            <input type="checkbox" id="tender_access_enabled" onchange="toggleTenderConfig()">
+            <input type="checkbox" id="tender_access_enabled" onchange="toggleTenderConfig(); _tcvSyncAccessThreshold();">
             <span class="slider"></span>
           </label>
           <span style="font-size:13px;font-weight:600;">Tender Access</span>
@@ -689,7 +696,7 @@
           <div class="row">
             <div>
               <label>Minimum Tender Depth (m)</label>
-              <input type="number" id="tender_min_depth_m" step="0.05" min="0" value="0.3">
+              <input type="number" id="tender_min_depth_m" step="0.05" min="0" value="0.3" oninput="_tcvSyncAccessThreshold()">
             </div>
           </div>
         </div>
@@ -1431,6 +1438,7 @@ function setConfig(cfg) {
   updateMooringOptions();
   updateFeedUrl(cfg);
   toggleObsPanel();
+  if (typeof _tcvSyncAccessThreshold === 'function') _tcvSyncAccessThreshold();
 }
 
 function updateFeedUrl(cfg) {
@@ -3184,6 +3192,7 @@ function renderTideCurve(data) {
       <path class="tcv-curve" d="${pathD}"/>
       ${eventMarkers}
       ${clipMark}
+      <g id="tcv-access-group"></g>
       <g id="tcv-now-group"></g>
       <g id="tcv-hover-group"></g>
       ${overlayRect}
@@ -3193,6 +3202,90 @@ function renderTideCurve(data) {
   document.getElementById('tide-curve-svg-wrap').innerHTML = svg;
   updateTideCurveNowLine();
   _tcvSetupHover(pts);
+  _tcvSyncAccessThreshold();
+}
+
+function _tcvComputeThresholds() {
+  // Read mooring config from the form. Returns access / tender threshold
+  // heights (m above CD), or null for either if not applicable.
+  const mooringIdEl = document.getElementById('mooring_id');
+  if (!mooringIdEl) return { access: null, tender: null };
+  const mooringId = mooringIdEl.value.trim();
+  if (!mooringId) return { access: null, tender: null };
+
+  const num = (id, fallback) => {
+    const v = parseFloat(document.getElementById(id).value);
+    return Number.isFinite(v) ? v : fallback;
+  };
+  const drying = num('drying_height_m', 0);
+  const draught = num('draught_m', 0);
+  const safety = num('safety_margin_m', 0);
+  const access = drying + draught + safety;
+
+  let tender = null;
+  const tenderEnabled = document.getElementById('tender_access_enabled');
+  if (tenderEnabled && tenderEnabled.checked) {
+    const tenderDepth = num('tender_min_depth_m', 0);
+    tender = drying + tenderDepth;
+  }
+  return { access, tender };
+}
+
+function _tcvDrawAccessLines(thresholds) {
+  const group = document.getElementById('tcv-access-group');
+  if (!group) return;
+
+  if (thresholds.access == null) {
+    group.innerHTML = '';
+    return;
+  }
+
+  const { vbWidth, vbHeight, marginL, marginR, marginT, marginB, ymax } = TIDE_CURVE_CFG;
+  const xL = marginL;
+  const xR = vbWidth - marginR;
+  const labelX = xR - 4;
+
+  function buildLine(value, opts) {
+    // opts: { cssLine, cssLabel, label, labelYOffset, clipCssLine }
+    if (value == null) return '';
+    if (value > ymax) {
+      // Clip at the chart top and place an arrow marker near the label.
+      const y = _tcvYFor(ymax);
+      const lineY = (y + 1).toFixed(2);
+      return `
+        <line class="${opts.cssLine}" x1="${xL}" y1="${lineY}" x2="${xR}" y2="${lineY}"/>
+        <text class="tcv-access-clip" x="${labelX}" y="${(y + 12).toFixed(2)}" text-anchor="end">↑ ${opts.label} > ${ymax.toFixed(1)} m</text>
+      `;
+    }
+    if (value < 0) return '';
+    const y = _tcvYFor(value);
+    const labelY = (y + opts.labelYOffset).toFixed(2);
+    return `
+      <line class="${opts.cssLine}" x1="${xL}" y1="${y.toFixed(2)}" x2="${xR}" y2="${y.toFixed(2)}"/>
+      <text class="${opts.cssLabel}" x="${labelX}" y="${labelY}" text-anchor="end">${opts.label} ${value.toFixed(2)} m</text>
+    `;
+  }
+
+  // Access label sits just above its line; tender label sits below its
+  // own line. If the two thresholds are close together, the offsets keep
+  // them from colliding (access above, tender below, ~12px apart minimum).
+  const accessHtml = buildLine(thresholds.access, {
+    cssLine: 'tcv-access-line',
+    cssLabel: 'tcv-access-label',
+    label: 'Access',
+    labelYOffset: -3,
+  });
+  const tenderHtml = buildLine(thresholds.tender, {
+    cssLine: 'tcv-tender-line',
+    cssLabel: 'tcv-tender-label',
+    label: 'Tender access',
+    labelYOffset: 12,
+  });
+  group.innerHTML = accessHtml + tenderHtml;
+}
+
+function _tcvSyncAccessThreshold() {
+  _tcvDrawAccessLines(_tcvComputeThresholds());
 }
 
 function _tcvHourFractionToHM(hr) {
