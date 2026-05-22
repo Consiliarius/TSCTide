@@ -128,6 +128,124 @@ Recalibration is **not automatic**; it is a deliberate workstream:
 
 No action. Continue monitoring. Revisit at day 180 or 365.
 
+## Findings from the 21 May 2026 analysis session
+
+The following was established using the 30-day logged data and the
+half-hourly calibration corpus (now 25+ days spanning 14 April to
+27 May). These findings should inform the day-30 and day-90 reviews.
+
+### HW and LW residuals behave differently
+
+`scripts/review_logged_residuals.py` (run against 30 days of logged
+HW/LW pairs) showed that the "per-day oscillation" documented in
+item 3 of CALIBRATION_NOTES.md is not a single phenomenon:
+
+  - **HW residuals are consistently negative** (harmonic under-predicts
+    HW heights). Range -0.12m to -0.35m across the 30-day window.
+    The pattern is a steady negative trend, not an oscillation.
+    This is item 4 (HW peak undershoot).
+
+  - **LW residuals oscillate around zero**. Range -0.29m to +0.28m.
+    The oscillation has a period of roughly 14-15 days, consistent
+    with the spring-neap cycle.
+
+  - **The combined per-day mean** (which earlier analysis reported as
+    a ~15-day oscillation) is a mixture of these two signals. The
+    apparent oscillation in the combined mean is partly driven by the
+    day-to-day variation in HW vs LW event count per date (3 vs 4
+    events), which changes the weight of the HW and LW contributions.
+
+Implication: the recalibration harness should fit HW and LW residuals
+separately rather than minimising a combined height residual. M2
+amplitude (which dominates HW peak height) is likely the highest-
+priority parameter.
+
+### S2 is NOT the primary driver of the oscillation
+
+`scripts/probe_s2_sensitivity.py` was run against the same 30-day
+window. The probe perturbed S2 amplitude by +/-0.03m and phase_lag
+by +/-6 degrees (49 combinations), re-running `predict_events ->
+apply_offset` for each perturbation and computing both height and
+timing residuals against UKHO actuals.
+
+Result: **4% height oscillation reduction** at the best perturbation
+(d_amp=-0.03m, d_phase=0). This is a weak signal. The height and
+timing optima were at different S2 perturbations, confirming S2
+alone is not the driver.
+
+Possible explanations for why S2 perturbation did not help:
+
+  1. Multiple constituents contribute to the spring-neap modulation
+     (N2, K2, etc.) and S2 alone cannot compensate.
+  2. The oscillation is partly meteorological (atmospheric pressure,
+     wind setup correlating loosely with the spring-neap cycle).
+  3. The apparent oscillation in the combined daily mean is partly
+     an artefact of mixing HW and LW signals with different
+     characteristics, as described above.
+
+Implication: there is no shortcut via a single-constituent S2 fix.
+The full M2+S2+N2 recalibration documented below remains the correct
+approach.
+
+### Timing residuals
+
+The logged data showed HW mean +6.1min, LW mean +6.3min (harmonic
+predicts ~6 minutes late on average). RMS ~15 minutes for both,
+consistent with the documented Admiralty-convention offset calibration
+(HW stdev 14.6min, LW stdev 19.5min from the 710-point validation).
+
+One outlier: 40.4min timing error on 12 May HW. Worth investigating
+if recurrent. Could be a data-quality issue on the UKHO side or a
+genuine model failure for that specific tide.
+
+### Tools available for the reviews
+
+Four analysis scripts are now available, all analysis-only (no
+production behaviour changes):
+
+```powershell
+# Per-day time series from logged HW/LW data (replaces manual
+# activity_log queries for trend analysis)
+docker exec tidal-access python -m scripts.review_logged_residuals
+docker exec tidal-access python -m scripts.review_logged_residuals --days 90
+docker exec tidal-access python -m scripts.review_logged_residuals --start 2026-04-30 --end 2026-07-28
+
+# S2 sensitivity probe (or re-run with wider grid if needed)
+docker exec tidal-access python -m scripts.probe_s2_sensitivity --days 90
+
+# Half-hourly corpus analysis (requires manual CSV data addition)
+docker exec tidal-access python -m scripts.calibrate_from_ukho_week
+
+# Phase-position diagnostic (requires half-hourly corpus)
+docker exec tidal-access python -m scripts.diagnose_residual_position
+```
+
+`review_logged_residuals` is the primary tool for the day-30 and
+day-90 reviews because it works from automatically-gathered data.
+The half-hourly scripts require manual addition of calibration CSVs
+to `app/calibration_data/`.
+
+### Revised recalibration priorities
+
+Based on the 21 May 2026 findings, the priority order for the
+eventual M2+S2+N2 recalibration is:
+
+  1. **M2 amplitude** - the HW peak undershoot (item 4, -0.12 to
+     -0.35m) is the largest single residual and is consistent with
+     M2 amplitude being slightly too low.
+  2. **M2 phase** - the +6min systematic timing bias may be partly
+     M2 phase error (partly absorbed by the Admiralty convention
+     offset, but the offset was calibrated against the current
+     constituents and would need re-evaluation after a phase change).
+  3. **S2 amplitude and phase** - contributes to the spring-neap
+     modulation but not the dominant driver per the probe.
+  4. **N2 amplitude and phase** - contributes to the longer-period
+     modulation (~27.6 day beat with M2).
+
+The fitting harness should weight HW height residuals more heavily
+than LW (or fit them separately), because HW accuracy directly
+affects access-window calculations for the boater use case.
+
 ## What "taking action" actually looks like
 
 To be concrete: the most likely action that monitoring drives is a
