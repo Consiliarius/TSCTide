@@ -2,7 +2,7 @@
 
 A Docker-containerised application for predicting when a boat on a swing mooring in Langstone Harbour has sufficient water depth to depart and arrive.
 
-**Version 2** — adds per-mooring 6-digit PIN protection, decouples iCal feed updates from calculation, restructures the calibration system to split base drying height from shallow-side wind offset, and adds standalone Langstone tide feeds (UKHO 7-day and combined UKHO+harmonic 180-day). The v1.0 release is preserved on the tag `v1.0`.
+**Version 2** — adds per-mooring 6-digit PIN protection, decouples iCal feed updates from calculation, restructures the calibration system to split base drying height from shallow-side wind offset, and adds standalone Langstone tide feeds (UKHO 7-day and combined UKHO+harmonic 180-day). **v2.8** adds an interactive Tidal Curve panel showing today's predicted heights with crosshair hover, a live "now" line, and access-threshold lines for the loaded mooring, and relocates the tab navigation to a static top menu bar flush with the page header. The v1.0 release is preserved on the tag `v1.0`.
 
 ## Overview
 
@@ -21,6 +21,7 @@ The tool computes access windows — the periods around each high water when the
 - **Empirical calibration** — record observations (afloat/aground) to refine the drying height estimate, with confidence rating
 - **Subscribable iCal feed** per mooring, auto-updated daily, with proper subscription metadata
 - **Standalone Langstone tide feeds** — two non-mooring feeds providing HW/LW times and heights at Langstone Harbour: a 7-day UKHO feed and a 180-day combined UKHO+harmonic feed
+- **Visual Tidal Curve** (v2.8) — plots today's predicted tidal height in an interactive panel with crosshair hover for time/height readouts, a red "now" line, and dashed green access-threshold lines for the loaded mooring's boat-access and (optionally) tender-access depths
 - **Wind offset** — adjusts the next tide's access window based on observed wind direction and the mooring's shallow-water geometry
 - **ICS export** from any data source, with harmonic-derived events prefixed "est."
 - **XLSX batch import** for observations recorded on a phone over time
@@ -328,6 +329,44 @@ UKHO data remains the most accurate source (Langstone-native, 7-day range). KHM 
 ## UKHO API Licensing
 
 This application uses the **Discovery tier** (free) of the Admiralty Tidal API for development and proof-of-concept purposes. The Discovery tier terms do not permit caching of data. For production use with persistent data storage, upgrade to the **Foundation tier**. See [UKHO developer portal](https://admiraltyapi.portal.azure-api.net/).
+
+## Tidal Curve (v2.8)
+
+Beneath the Current Conditions dashboard, a collapsible **Tidal Curve** panel renders today's predicted Langstone tidal height on a 24-hour, 0–5.5m chart. The panel is always-visible (outside the tab views) so it remains useful regardless of which tab is active.
+
+### What's drawn
+
+- The full-day height curve, sampled at 5-minute resolution using the same asymmetric Langstone tidal model that the access-window calculator uses internally (so the curve and the windows can never disagree).
+- A shaded area under the curve, a dashed Chart Datum reference line at 0m, and gridlines every 1m up to 5.5m.
+- HW and LW markers with small labels showing the predicted height and local clock time (e.g. `H 4.49m 17:05`, `L 1.36m 09:32`).
+- A red **vertical "now" line** at the current local time, with a small label reading the present-moment tide height. Updates every 5 minutes; the day rolls over automatically at local midnight.
+
+### Hover crosshair
+
+Moving the mouse (or dragging a finger on touch devices) over the chart snaps a navy crosshair to the nearest 5-minute sample. Dashed lines extend from the snap point to both axes, and a small tooltip near the cursor shows `HH:MM — H.HH m`.
+
+### Access threshold lines
+
+When a Mooring ID is entered (or loaded from a stored config), two horizontal dashed green lines appear:
+
+- **Access** — at `drying_height + draught + safety_margin`, the tide height the boat needs to clear to be safely afloat with the configured margin.
+- **Tender access** — at `drying_height + tender_min_depth_m`, drawn only when Tender Access is enabled in the configuration.
+
+The lines update live as the user edits any of the relevant inputs in the Configuration panel — no need to save or recalculate for the chart to reflect new values. If a threshold exceeds the 5.5m chart ceiling (e.g. an unusually deep-draught boat on a high mooring), the line is clipped at the top and labelled `↑ Access > 5.5 m` to make the off-scale value visible without misrepresenting it.
+
+The Access line shows the **baseline** threshold; it does not represent the wind-offset adjustment (which is dynamic per-tide and per-cycle).
+
+### Data source
+
+The curve is **UKHO-only by policy**. If no UKHO data is in the database for the requested day, the panel triggers a one-shot UKHO fetch automatically (subject to a 30-second cooldown to prevent excessive retries during an outage); the placeholder switches from "Loading tide curve…" to "Fetching today's UKHO data…" if the fetch takes more than a second. If UKHO data still cannot be obtained, the panel shows "UKHO data unavailable for today" with a Retry link. No fallback to harmonic data is offered — the curve is meant to be an authoritative "today" visual rather than a long-range approximation.
+
+### Behaviour across tabs
+
+The panel is expanded by default on first load and persists its collapsed/expanded state to `localStorage`. To reduce visual noise on admin views, the panel **auto-collapses when the Mooring Configs or System Activity tab is selected** and restores the user's persisted intent when switching back to Tides or Access Windows. Auto-collapsing does not overwrite the saved state — manually collapsing the panel on the Tides tab is still what's remembered between sessions.
+
+### Page layout
+
+In v2.8 the four tab buttons were moved out of the page body and into a static, full-width menu bar flush with the bottom of the navy header. A faint dashed separator below the Tidal Curve marks the boundary between always-visible page-level content (header, menu bar, Current Conditions, Tidal Curve) and the tab-specific views below it.
 
 ## Wind Offset
 
