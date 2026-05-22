@@ -40,6 +40,31 @@
     display: flex; gap: 4px; margin-bottom: 16px;
     border-bottom: 2px solid var(--border);
   }
+  /* Top-anchored variant of the tab bar (v2.8): full-width menu bar that
+     sits directly under the page header with no gap, and centres its
+     items horizontally regardless of viewport width. */
+  .tabs.tabs-top {
+    margin: 0;
+    background: #fff;
+    padding: 0 16px;
+    border: none;
+    border-bottom: 1px solid var(--border);
+    border-radius: 0;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+    justify-content: center;
+  }
+  .tabs.tabs-top .tab {
+    font-size: 14px;
+    padding: 10px 22px;
+  }
+  /* Separator between always-visible page-level content (header, tabs,
+     conditions, tidal curve) and the tab-specific views below. */
+  .section-divider {
+    border: none;
+    border-top: 1px dashed var(--border);
+    margin: 20px 0 16px;
+    height: 0;
+  }
   .tab {
     padding: 8px 16px; background: transparent; color: var(--text);
     border: none; border-radius: var(--radius) var(--radius) 0 0;
@@ -426,8 +451,9 @@
   }
   .tide-curve-body.collapsed { display: none; }
   .tide-curve-svg-wrap {
-    width: 100%;
-    /* Aspect-ratio sized; ViewBox handles the actual coordinate system. */
+    width: 100%; position: relative;
+    /* Aspect-ratio sized; ViewBox handles the actual coordinate system.
+       position: relative anchors the absolutely-positioned hover tooltip. */
   }
   .tide-curve-svg-wrap svg {
     width: 100%; height: auto; display: block;
@@ -456,6 +482,15 @@
   .tcv-event-dot { fill: var(--navy); }
   .tcv-event-label { fill: var(--navy); font-size: 10px; font-weight: 600; }
   .tcv-clip-mark { fill: var(--warn); font-size: 14px; font-weight: 700; }
+  .tcv-hover-line { stroke: var(--navy); stroke-width: 1; stroke-dasharray: 3 3; fill: none; pointer-events: none; opacity: 0.7; }
+  .tcv-hover-dot { fill: var(--navy); stroke: #fff; stroke-width: 1.5; pointer-events: none; }
+  #tcv-tooltip {
+    position: absolute; display: none; pointer-events: none;
+    background: var(--navy); color: #fff;
+    padding: 4px 8px; border-radius: 4px;
+    font-size: 12px; font-weight: 600; white-space: nowrap;
+    z-index: 5; box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+  }
   @media (max-width: 600px) {
     .tide-curve-body { padding: 8px 10px; }
     .tcv-event-label, .tcv-tick-label, .tcv-now-label { font-size: 9px; }
@@ -498,6 +533,14 @@
   </div>
 </header>
 
+<!-- Top navigation (v2.8): full-width menu bar, flush with header. -->
+<div class="tabs tabs-top">
+  <button class="tab active" data-view="tides" onclick="switchView('tides')">Tides</button>
+  <button class="tab" data-view="main" onclick="switchView('main')">Access Windows</button>
+  <button class="tab" data-view="moorings" onclick="switchView('moorings')">Mooring Configs</button>
+  <button class="tab" data-view="system" onclick="switchView('system')">System Activity</button>
+</div>
+
 <div class="container">
 
   <!-- Current Conditions (v2.6) -->
@@ -538,13 +581,8 @@
     </div>
   </div>
 
-  <!-- Tab navigation -->
-  <div class="tabs">
-    <button class="tab active" data-view="tides" onclick="switchView('tides')">Tides</button>
-    <button class="tab" data-view="main" onclick="switchView('main')">Access Windows</button>
-    <button class="tab" data-view="moorings" onclick="switchView('moorings')">Mooring Configs</button>
-    <button class="tab" data-view="system" onclick="switchView('system')">System Activity</button>
-  </div>
+  <!-- Separator: above = always-visible page-level content; below = current tab's view -->
+  <hr class="section-divider">
 
   <!-- Main view -->
   <div class="view" id="view-main">
@@ -2256,6 +2294,7 @@ function switchView(viewName) {
   if (viewName === 'system') loadSystemLog();
   if (viewName === 'moorings') loadMooringConfigs();
   if (viewName === 'tides') loadTides();
+  if (typeof _tcvApplyCollapseForTab === 'function') _tcvApplyCollapseForTab(viewName);
 }
 
 // --- Tides tab ---
@@ -2958,30 +2997,48 @@ function _tcvYFor(heightM) {
   return marginT + (1 - h / ymax) * usable;
 }
 
-function toggleTideCurve() {
+function _tcvApplyCollapsed(collapsed) {
+  // Apply visual collapsed/expanded state without persisting to localStorage.
   const body = document.getElementById('tide-curve-body');
   const toggle = document.getElementById('tide-curve-toggle');
-  const collapsed = body.classList.toggle('collapsed');
-  toggle.textContent = collapsed ? '▶' : '▼';
-  try {
-    localStorage.setItem(TIDE_CURVE_CFG.storageKey, collapsed ? 'collapsed' : 'expanded');
-  } catch (e) { /* localStorage may be unavailable */ }
-}
-
-function _tcvInitPanelState() {
-  let state = 'expanded';
-  try {
-    const v = localStorage.getItem(TIDE_CURVE_CFG.storageKey);
-    if (v === 'collapsed') state = 'collapsed';
-  } catch (e) { /* ignore */ }
-  const body = document.getElementById('tide-curve-body');
-  const toggle = document.getElementById('tide-curve-toggle');
-  if (state === 'collapsed') {
+  if (!body || !toggle) return;
+  if (collapsed) {
     body.classList.add('collapsed');
     toggle.textContent = '▶';
   } else {
     body.classList.remove('collapsed');
     toggle.textContent = '▼';
+  }
+}
+
+function _tcvUserIntentExpanded() {
+  // The user's last explicit collapse/expand choice (default: expanded).
+  try {
+    return localStorage.getItem(TIDE_CURVE_CFG.storageKey) !== 'collapsed';
+  } catch (e) { return true; }
+}
+
+function toggleTideCurve() {
+  // Manual header click. Persists the new state as the user's intent.
+  const body = document.getElementById('tide-curve-body');
+  const newCollapsed = !body.classList.contains('collapsed');
+  _tcvApplyCollapsed(newCollapsed);
+  try {
+    localStorage.setItem(TIDE_CURVE_CFG.storageKey, newCollapsed ? 'collapsed' : 'expanded');
+  } catch (e) { /* localStorage may be unavailable */ }
+}
+
+function _tcvInitPanelState() {
+  _tcvApplyCollapsed(!_tcvUserIntentExpanded());
+}
+
+function _tcvApplyCollapseForTab(viewName) {
+  // Auto-collapse on admin tabs without overwriting the user's persisted
+  // intent. On Tides/Access Windows, restore whatever the user last chose.
+  if (viewName === 'moorings' || viewName === 'system') {
+    _tcvApplyCollapsed(true);
+  } else {
+    _tcvApplyCollapsed(!_tcvUserIntentExpanded());
   }
 }
 
@@ -3110,6 +3167,14 @@ function renderTideCurve(data) {
     clipMark = `<text class="tcv-clip-mark" x="${firstClip.x.toFixed(2)}" y="${(marginT + 10).toFixed(2)}" text-anchor="middle">+</text>`;
   }
 
+  // Overlay rect spans the chart area and captures hover events without
+  // visually blocking anything (transparent fill).
+  const chartLeft = marginL;
+  const chartRight = vbWidth - marginR;
+  const chartTop = marginT;
+  const chartBottom = vbHeight - marginB;
+  const overlayRect = `<rect id="tcv-hover-overlay" x="${chartLeft}" y="${chartTop}" width="${(chartRight - chartLeft).toFixed(2)}" height="${(chartBottom - chartTop).toFixed(2)}" fill="transparent" pointer-events="all"/>`;
+
   const svg = `
     <svg viewBox="0 0 ${vbWidth} ${vbHeight}" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Tidal curve for ${data.date}">
       ${gridlines.join('\n')}
@@ -3120,10 +3185,93 @@ function renderTideCurve(data) {
       ${eventMarkers}
       ${clipMark}
       <g id="tcv-now-group"></g>
+      <g id="tcv-hover-group"></g>
+      ${overlayRect}
     </svg>
+    <div id="tcv-tooltip"></div>
   `;
   document.getElementById('tide-curve-svg-wrap').innerHTML = svg;
   updateTideCurveNowLine();
+  _tcvSetupHover(pts);
+}
+
+function _tcvHourFractionToHM(hr) {
+  const total = Math.max(0, Math.min(24 * 60, Math.round(hr * 60)));
+  const h = Math.floor(total / 60) % 24;
+  const m = total % 60;
+  return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`;
+}
+
+function _tcvSetupHover(pts) {
+  if (!pts || pts.length === 0) return;
+  const wrap = document.getElementById('tide-curve-svg-wrap');
+  const svg = wrap.querySelector('svg');
+  const overlay = wrap.querySelector('#tcv-hover-overlay');
+  const hoverGroup = wrap.querySelector('#tcv-hover-group');
+  const tooltip = wrap.querySelector('#tcv-tooltip');
+  if (!svg || !overlay || !hoverGroup || !tooltip) return;
+
+  const { vbWidth, vbHeight, marginL, marginR, marginT, marginB } = TIDE_CURVE_CFG;
+  const chartLeft = marginL;
+  const chartRight = vbWidth - marginR;
+  const chartTop = marginT;
+  const chartBottom = vbHeight - marginB;
+
+  function clientXToViewBoxX(clientX) {
+    // Convert a clientX pixel coordinate into the SVG viewBox X coordinate.
+    const ctm = svg.getScreenCTM();
+    if (!ctm) return null;
+    const pt = svg.createSVGPoint();
+    pt.x = clientX; pt.y = 0;
+    return pt.matrixTransform(ctm.inverse()).x;
+  }
+
+  function handleMove(clientX, clientY) {
+    const vbX = clientXToViewBoxX(clientX);
+    if (vbX == null) return;
+    // Snap to the nearest sample.
+    let nearest = pts[0], best = Infinity;
+    for (const p of pts) {
+      const dx = Math.abs(p.x - vbX);
+      if (dx < best) { best = dx; nearest = p; }
+    }
+    // Draw the crosshair: vertical to x-axis, horizontal to y-axis, plus a dot.
+    hoverGroup.innerHTML = `
+      <line class="tcv-hover-line" x1="${nearest.x.toFixed(2)}" y1="${chartTop}" x2="${nearest.x.toFixed(2)}" y2="${chartBottom}"/>
+      <line class="tcv-hover-line" x1="${chartLeft}" y1="${nearest.y.toFixed(2)}" x2="${nearest.x.toFixed(2)}" y2="${nearest.y.toFixed(2)}"/>
+      <circle class="tcv-hover-dot" cx="${nearest.x.toFixed(2)}" cy="${nearest.y.toFixed(2)}" r="4"/>
+    `;
+    // Position the HTML tooltip near the cursor, flipping sides near edges.
+    const timeStr = _tcvHourFractionToHM(nearest.hr);
+    tooltip.textContent = `${timeStr} — ${nearest.h.toFixed(2)} m`;
+    tooltip.style.display = 'block';
+    const wrapRect = wrap.getBoundingClientRect();
+    const localX = clientX - wrapRect.left;
+    const localY = clientY - wrapRect.top;
+    const tipW = tooltip.offsetWidth || 110;
+    const tipH = tooltip.offsetHeight || 26;
+    let tx = localX + 12;
+    let ty = localY - tipH - 10;
+    if (tx + tipW > wrapRect.width - 4) tx = localX - tipW - 12;
+    if (ty < 4) ty = localY + 14;
+    tooltip.style.left = tx.toFixed(0) + 'px';
+    tooltip.style.top = ty.toFixed(0) + 'px';
+  }
+
+  function clear() {
+    hoverGroup.innerHTML = '';
+    tooltip.style.display = 'none';
+  }
+
+  overlay.addEventListener('mousemove', e => handleMove(e.clientX, e.clientY));
+  overlay.addEventListener('mouseleave', clear);
+  // Basic touch support: track-and-show on touchmove; clear on touchend.
+  overlay.addEventListener('touchmove', e => {
+    if (e.touches && e.touches.length > 0) {
+      handleMove(e.touches[0].clientX, e.touches[0].clientY);
+    }
+  }, { passive: true });
+  overlay.addEventListener('touchend', clear);
 }
 
 function updateTideCurveNowLine() {
