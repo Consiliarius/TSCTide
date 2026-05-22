@@ -2,7 +2,7 @@
 
 A Docker-containerised application for predicting when a boat on a swing mooring in Langstone Harbour has sufficient water depth to depart and arrive.
 
-**Version 2** — adds per-mooring 6-digit PIN protection, decouples iCal feed updates from calculation, restructures the calibration system to split base drying height from shallow-side wind offset, and adds standalone Langstone tide feeds (UKHO 7-day and combined UKHO+harmonic 180-day). The v1.0 release is preserved on the tag `v1.0`.
+**Version 2** — adds per-mooring 6-digit PIN protection, decouples iCal feed updates from calculation, restructures the calibration system to split base drying height from shallow-side wind offset, and adds standalone Langstone tide feeds (UKHO 7-day and combined UKHO+harmonic 180-day). **v2.8** adds an interactive Tidal Curve panel showing predicted heights with crosshair hover, a live "now" line, access-threshold lines and shaded access bands for the loaded mooring, sunrise/sunset markers, a Spring/Neap/Mid classification, and a date selector for panning across the UKHO window; the tab navigation has also been relocated to a static top menu bar flush with the page header. The v1.0 release is preserved on the tag `v1.0`.
 
 ## Overview
 
@@ -21,6 +21,7 @@ The tool computes access windows — the periods around each high water when the
 - **Empirical calibration** — record observations (afloat/aground) to refine the drying height estimate, with confidence rating
 - **Subscribable iCal feed** per mooring, auto-updated daily, with proper subscription metadata
 - **Standalone Langstone tide feeds** — two non-mooring feeds providing HW/LW times and heights at Langstone Harbour: a 7-day UKHO feed and a 180-day combined UKHO+harmonic feed
+- **Visual Tidal Curve** (v2.8) — plots predicted tidal height in an interactive panel with crosshair hover for time/height readouts, a red "now" line, shaded access bands for the loaded mooring (solid green for boat access, hatched for tender), sunrise/sunset markers with night shading, a Spring/Neap/Mid classification badge, and a date selector for panning across the UKHO 7-day window
 - **Wind offset** — adjusts the next tide's access window based on observed wind direction and the mooring's shallow-water geometry
 - **ICS export** from any data source, with harmonic-derived events prefixed "est."
 - **XLSX batch import** for observations recorded on a phone over time
@@ -328,6 +329,84 @@ UKHO data remains the most accurate source (Langstone-native, 7-day range). KHM 
 ## UKHO API Licensing
 
 This application uses the **Discovery tier** (free) of the Admiralty Tidal API for development and proof-of-concept purposes. The Discovery tier terms do not permit caching of data. For production use with persistent data storage, upgrade to the **Foundation tier**. See [UKHO developer portal](https://admiraltyapi.portal.azure-api.net/).
+
+## Tidal Curve (v2.8)
+
+Beneath the Current Conditions dashboard, a collapsible **Tidal Curve** panel renders today's predicted Langstone tidal height on a 24-hour, 0–5.5m chart. The panel is always-visible (outside the tab views) so it remains useful regardless of which tab is active.
+
+### What's drawn
+
+- The full-day height curve, sampled at 5-minute resolution using the same asymmetric Langstone tidal model that the access-window calculator uses internally (so the curve and the windows can never disagree).
+- A shaded area under the curve, a dashed Chart Datum reference line at 0m, and gridlines every 1m up to 5.5m.
+- HW and LW markers with small labels showing the predicted height and local clock time (e.g. `H 4.49m 17:05`, `L 1.36m 09:32`).
+- A red **vertical "now" line** at the current local time (only on today's date), with a small label reading the present-moment tide height. Updates every 5 minutes; the day rolls over automatically at local midnight.
+- **Shaded access bands** for the loaded mooring (see *Access threshold lines and shaded bands* below).
+- **Sunrise and sunset markers** and faint night-period shading (see *Sunrise and sunset* below).
+
+### Hover crosshair
+
+Moving the mouse (or dragging a finger on touch devices) over the chart snaps a navy crosshair to the nearest 5-minute sample. Dashed lines extend from the snap point to both axes, and a small tooltip near the cursor shows `HH:MM — H.HH m`.
+
+### Access threshold lines and shaded bands
+
+When a Mooring ID is entered (or loaded from a stored config), two horizontal dashed green lines appear:
+
+- **Access** — at `drying_height + draught + safety_margin`, the tide height the boat needs to clear to be safely afloat with the configured margin.
+- **Tender access** — at `drying_height + tender_min_depth_m`, drawn only when Tender Access is enabled in the configuration.
+
+Each threshold also drives a coloured **band** highlighting the time spans when access is available:
+
+- **Solid green wedge** between the Access line and the curve, marking the windows when the boat itself has water.
+- **Diagonally hatched ribbon** between the Tender line and either the curve or the Access line (whichever is lower), marking the tender-only windows that bracket the boat windows.
+
+The two bands never overlap — the hatched ribbon caps at the Access line — so the two-tier hierarchy reads cleanly: solid green = "boat can move", hatch = "tender only".
+
+The lines and bands update live as the user edits any of the relevant inputs in the Configuration panel — no need to save or recalculate for the chart to reflect new values. If a threshold exceeds the 5.5m chart ceiling (e.g. an unusually deep-draught boat on a high mooring), the line is clipped at the top and labelled `↑ Access > 5.5 m` to make the off-scale value visible without misrepresenting it.
+
+The Access line shows the **baseline** threshold; it does not represent the wind-offset adjustment (which is dynamic per-tide and per-cycle).
+
+### Spring/Neap/Mid classification
+
+A small chip on the Current Conditions tide column and an inline label in the Tidal Curve header indicate whether the displayed day's tides are running spring, neap, or mid-range. Classification is computed in `app/tide_state.py` by comparing the day's highest predicted High Water against percentile thresholds (p30 / p70) derived from a rolling 90-day window of UKHO HW heights ending at the displayed date:
+
+- HW ≥ p70 → **Spring tide**
+- HW ≤ p30 → **Neap tide**
+- otherwise → **Mid tide**
+
+Percentiles are computed from local data rather than hard-coded so the classifier auto-tunes as the dataset grows and across seasonal drift. When fewer than 14 stored HW samples are available, classification is suppressed (no chip shown) rather than guessed.
+
+### Sunrise and sunset
+
+Two gold dashed vertical markers, with compact `Sunrise HH:MM` / `Sunset HH:MM` labels above the x-axis, indicate the displayed day's astronomical sunrise and sunset. The pre-dawn (00:00 → sunrise) and post-dusk (sunset → 24:00) regions of the chart are faintly tinted navy so daylight hours are visible at a glance — useful for deciding whether a planned departure or return falls in the dark.
+
+Sun times are computed astronomically from the configured `LOCATION_LAT` / `LOCATION_LON` via the [`astral`](https://astral.readthedocs.io/) Python package. No external API call is made; the calculation is deterministic and works for any past or future date.
+
+### Date selector
+
+Chevron buttons in the panel header let the user pan to other days; a separate **Today** button (visible only when off today) jumps back to the present. The selectable range is bounded by `[earliest stored UKHO date, today + 7]` — the seven-day forward horizon matches the UKHO API window. Chevrons grey out at the bounds.
+
+The lazy UKHO fetch (one-shot retrieval when today's data is missing) is **only triggered for the today's date**. Panning to past or future days never triggers a UKHO call — if data isn't stored for the selected date, the panel shows "UKHO data unavailable for this date" rather than spamming the API. The daily 02:00 scheduler keeps the next-7-days window populated.
+
+When viewing a date that isn't today, the red "now" line is hidden (it would be meaningless). The access threshold lines, shaded bands, Spring/Neap classification, sunrise/sunset markers, and hover crosshair all work as on the today view.
+
+### Data source
+
+The curve is **UKHO-only by policy**. If no UKHO data is in the database for the requested day, the panel triggers a one-shot UKHO fetch automatically (subject to a 30-second cooldown to prevent excessive retries during an outage); the placeholder switches from "Loading tide curve…" to "Fetching today's UKHO data…" if the fetch takes more than a second. If UKHO data still cannot be obtained, the panel shows "UKHO data unavailable for today" with a Retry link. No fallback to harmonic data is offered — the curve is meant to be an authoritative "today" visual rather than a long-range approximation.
+
+### Behaviour across tabs
+
+The panel is expanded by default on first load and persists its collapsed/expanded state to `localStorage`. To reduce visual noise on admin views, the panel **auto-collapses when the Mooring Configs or System Activity tab is selected** and restores the user's persisted intent when switching back to Tides or Access Windows. Auto-collapsing does not overwrite the saved state — manually collapsing the panel on the Tides tab is still what's remembered between sessions.
+
+### Page layout
+
+In v2.8 the four tab buttons were moved out of the page body and into a static, full-width menu bar flush with the bottom of the navy header. A faint dashed separator below the Tidal Curve marks the boundary between always-visible page-level content (header, menu bar, Current Conditions, Tidal Curve) and the tab-specific views below it.
+
+### Current Conditions enhancements
+
+The Current Conditions dashboard gains two small but useful additions in v2.8:
+
+- The Spring/Neap/Mid chip (described above) appears in the Tide column next to the state description.
+- All three upcoming tide events now carry an "in Nh Mm" countdown (previously only the next event did), making it easier to think relatively when planning a short trip.
 
 ## Wind Offset
 

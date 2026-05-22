@@ -20,6 +20,7 @@ from dateutil import parser as dtparse
 from app.config import (
     ensure_dirs, load_model_config,
     FEEDS_DIR, DEFAULT_TIMEZONE, UKHO_STATION_ID, OWM_API_KEY,
+    LOCATION_LAT, LOCATION_LON,
     to_utc_str,
 )
 from app.database import (
@@ -43,7 +44,7 @@ from app.harmonic import predict_events as harmonic_predict_events
 from app.secondary_port import apply_offset
 from app.wind import fetch_current_wind, fetch_current_weather, should_apply_offset
 from app.conditions import get_current_conditions
-from app.access_calc import compute_access_windows, generate_event_uid
+from app.access_calc import compute_access_windows, generate_event_uid, _interpolate_from_parsed
 from app.ical_manager import (
     generate_export_ics, store_windows_as_events,
     generate_feed_for_mooring,
@@ -1631,6 +1632,257 @@ async def get_tides(range: str = "forecast"):
         "ukho_count": len(ukho_events),
         "harmonic_count": len(filtered_harmonic),
     }
+
+
+# --- Tidal curve (v2.8) ---
+#
+# Sampled height-vs-time series for the requested local day, used by the
+# Tidal Curve panel in the UI. UKHO-only by policy: if the DB has no
+# UKHO events bracketing the day, the endpoint triggers a one-shot lazy
+# UKHO fetch (subject to a 30s cooldown to bound retries on outages).
+# Harmonic fallback is intentionally NOT offered here - the curve panel
+# is meant to be an authoritative "today" visual, not an approximation.
+
+_tide_curve_lazy_fetch_last_attempt: Optional[datetime] = None
+_TIDE_CURVE_LAZY_FETCH_COOLDOWN_SECONDS = 30
+
+
+def _ukho_available_range(reference_local_date) -> dict:
+    """
+    Return the inclusive UTC date range (as local YYYY-MM-DD strings)
+    over which the UI may select dates for the tide curve.
+
+    Currently bounded by:
+      - earliest: the earliest UKHO timestamp stored in tide_data.
+      - latest:   today + 7 (UKHO API horizon; harmonic data is not used
+                  by the curve per v2.8 policy).
+    """
+    try:
+        import pytz
+        from app.database import db_connection
+        tz = pytz.timezone(DEFAULT_TIMEZONE)
+        with db_connection() as conn:
+            row = conn.execute(
+                "SELECT MIN(timestamp), MAX(timestamp) FROM tide_data WHERE source = 'ukho'"
+            ).fetchone()
+        earliest_iso, latest_iso = (row[0], row[1]) if row else (None, None)
+        if earliest_iso:
+            earliest_local = dtparse.parse(earliest_iso).astimezone(tz).date()
+        else:
+            earliest_local = reference_local_date
+        # Latest is the later of (stored UKHO max) and (today + 7), so
+        # users can freely pan into the UKHO 7-day horizon even when only
+        # part of it has been fetched yet.
+        latest_local = reference_local_date + timedelta(days=7)
+        return {
+            "earliest": earliest_local.isoformat(),
+            "latest": latest_local.isoformat(),
+        }
+    except Exception as e:
+        logger.warning(f"available_range query failed: {e}")
+        return {"earliest": reference_local_date.isoformat(),
+                "latest": reference_local_date.isoformat()}
+
+
+@app.get("/api/tide-curve")
+async def get_tide_curve(date: Optional[str] = None, step_minutes: int = 5):
+    """
+    Return a sampled tidal height curve for the requested local day.
+
+    Query params:
+      date: ISO date YYYY-MM-DD in Europe/London. Default = today (local).
+      step_minutes: sample interval in minutes (default 5, min 1, max 60).
+
+    Returns:
+      {
+        "date": "YYYY-MM-DD",
+        "step_minutes": int,
+        "samples": [{"time": "...Z", "height_m": float}, ...],
+        "events_in_window": [{"type": "HighWater"|"LowWater", "time": "...Z", "height_m": float}, ...],
+        "source_used": "ukho" | null,
+        "reason": "no_ukho_data" | None,
+        "lazy_fetch_attempted": bool,
+      }
+
+    UKHO-only (per v2.8 spec). If no bracketing UKHO data, attempts a
+    one-shot fetch subject to a 30s cooldown.
+    """
+    global _tide_curve_lazy_fetch_last_attempt
+
+    if step_minutes < 1 or step_minutes > 60:
+        raise HTTPException(400, "step_minutes must be between 1 and 60")
+
+    import pytz
+    tz = pytz.timezone(DEFAULT_TIMEZONE)
+    now_utc = datetime.now(timezone.utc)
+
+    if date:
+        try:
+            local_date = datetime.strptime(date, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(400, "date must be YYYY-MM-DD")
+    else:
+        local_date = now_utc.astimezone(tz).date()
+
+    # Local-day window: 00:00 inclusive to 24:00 inclusive (sample at both endpoints).
+    local_midnight = tz.localize(datetime.combine(local_date, datetime.min.time()))
+    local_end = local_midnight + timedelta(days=1)
+    day_start_utc = local_midnight.astimezone(timezone.utc)
+    day_end_utc = local_end.astimezone(timezone.utc)
+
+    # Query a wider window so we have bracketing HW/LW events. Spring tides
+    # at Langstone are ~6h12m apart, so ±18h is comfortably more than one
+    # cycle either side and guarantees bracketing if any UKHO data exists.
+    query_start = to_utc_str(day_start_utc - timedelta(hours=18))
+    query_end = to_utc_str(day_end_utc + timedelta(hours=18))
+
+    def _bracketed(events: list[dict]) -> bool:
+        """True iff events contain at least one entry before day_start_utc
+        and at least one entry after day_end_utc."""
+        has_before = any(dtparse.parse(e["timestamp"]) <= day_start_utc for e in events)
+        has_after = any(dtparse.parse(e["timestamp"]) >= day_end_utc for e in events)
+        return has_before and has_after
+
+    events = get_ukho_tide_events(query_start, query_end)
+    lazy_fetch_attempted = False
+
+    # Lazy fetch is only attempted for today's date. For other days, the
+    # endpoint returns whatever data is stored without ever calling out
+    # to UKHO - prevents an accidental fetch storm if a user pans through
+    # many days that happen to be unstored.
+    today_local = now_utc.astimezone(tz).date()
+    is_today = (local_date == today_local)
+
+    if not _bracketed(events) and is_today:
+        # Try a lazy UKHO fetch, subject to cooldown.
+        now = datetime.now(timezone.utc)
+        last = _tide_curve_lazy_fetch_last_attempt
+        cooldown_active = (
+            last is not None
+            and (now - last).total_seconds() < _TIDE_CURVE_LAZY_FETCH_COOLDOWN_SECONDS
+        )
+
+        if not cooldown_active:
+            _tide_curve_lazy_fetch_last_attempt = now
+            lazy_fetch_attempted = True
+            try:
+                fetched, station_used = await fetch_tidal_events()
+                if fetched:
+                    station_label = "langstone" if station_used == UKHO_STATION_ID else "portsmouth"
+                    store_tide_events(fetched, source="ukho", station=station_label)
+                    log_activity(
+                        event_type="ukho_fetch",
+                        message=f"Tide curve lazy fetch: {len(fetched)} events stored",
+                        severity="info",
+                        details={
+                            "event_count": len(fetched),
+                            "trigger": "tide_curve_lazy_fetch",
+                            "station_used": station_used,
+                            "station_label": station_label,
+                            "requested_date": local_date.isoformat(),
+                        },
+                    )
+                    events = get_ukho_tide_events(query_start, query_end)
+            except Exception as e:
+                logger.warning(f"Tide curve lazy UKHO fetch failed: {e}")
+
+    if not _bracketed(events):
+        sun_times_fallback = _compute_sun_times(local_date)
+        return {
+            "date": local_date.isoformat(),
+            "step_minutes": step_minutes,
+            "samples": [],
+            "events_in_window": [],
+            "source_used": None,
+            "reason": "no_ukho_data",
+            "lazy_fetch_attempted": lazy_fetch_attempted,
+            "spring_neap": None,
+            "sunrise": sun_times_fallback["sunrise"],
+            "sunset": sun_times_fallback["sunset"],
+            "available_range": _ukho_available_range(today_local),
+        }
+
+    # Parse + sort once for the inner sampling loop.
+    parsed = []
+    for ev in events:
+        dt = dtparse.parse(ev["timestamp"])
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        parsed.append((dt, ev["height_m"], ev["event_type"]))
+    parsed.sort(key=lambda x: x[0])
+
+    # Sample from day_start_utc to day_end_utc inclusive at step_minutes.
+    step = timedelta(minutes=step_minutes)
+    samples = []
+    t = day_start_utc
+    while t <= day_end_utc:
+        h = _interpolate_from_parsed(t, parsed)
+        if h is not None:
+            samples.append({
+                "time": to_utc_str(t),
+                "height_m": round(h, 3),
+            })
+        t += step
+
+    # Events strictly inside the day window (for HW/LW markers).
+    events_in_window = [
+        {
+            "type": et,
+            "time": to_utc_str(dt),
+            "height_m": round(h, 3),
+        }
+        for (dt, h, et) in parsed
+        if day_start_utc <= dt <= day_end_utc
+    ]
+
+    # Spring/Neap/Mid classification for the displayed date (v2.8).
+    try:
+        from app.tide_state import classify_spring_neap
+        spring_neap = classify_spring_neap(local_date)
+    except Exception as e:
+        logger.warning(f"Spring/neap classification skipped: {e}")
+        spring_neap = None
+
+    sun_times = _compute_sun_times(local_date)
+
+    return {
+        "date": local_date.isoformat(),
+        "step_minutes": step_minutes,
+        "samples": samples,
+        "events_in_window": events_in_window,
+        "source_used": "ukho",
+        "reason": None,
+        "lazy_fetch_attempted": lazy_fetch_attempted,
+        "spring_neap": spring_neap,
+        "sunrise": sun_times["sunrise"],
+        "sunset": sun_times["sunset"],
+        "available_range": _ukho_available_range(today_local),
+    }
+
+
+def _compute_sun_times(local_date) -> dict:
+    """
+    Astronomical sunrise/sunset for the configured lat/lon on a local
+    date. Returns ISO-Z UTC strings, or None for either if astral fails.
+    Adding ~30 KB of pip-installed code; the computation is deterministic
+    and doesn't need an external API call.
+    """
+    try:
+        import pytz
+        from astral import LocationInfo
+        from astral.sun import sun
+        loc = LocationInfo(
+            name="Langstone", region="UK", timezone=DEFAULT_TIMEZONE,
+            latitude=LOCATION_LAT, longitude=LOCATION_LON,
+        )
+        s = sun(loc.observer, date=local_date, tzinfo=pytz.timezone(DEFAULT_TIMEZONE))
+        return {
+            "sunrise": to_utc_str(s["sunrise"]),
+            "sunset": to_utc_str(s["sunset"]),
+        }
+    except Exception as e:
+        logger.warning(f"Sun-times computation failed: {e}")
+        return {"sunrise": None, "sunset": None}
 
 
 # --- Standalone Langstone tide feeds ---
