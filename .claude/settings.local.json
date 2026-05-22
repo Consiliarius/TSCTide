@@ -1,7 +1,33 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -c \"import ast; [ast.parse\\(open\\(f\\).read\\(\\)\\) for f in ['app/main.py','app/database.py','app/ical_manager.py','app/khm_parser.py','app/secondary_port.py','app/scheduler.py']]; print\\('OK'\\)\")"
+      "Bash(python -c \"import ast; [ast.parse\\(open\\(f\\).read\\(\\)\\) for f in ['app/main.py','app/database.py','app/ical_manager.py','app/khm_parser.py','app/secondary_port.py','app/scheduler.py']]; print\\('OK'\\)\")",
+      "Bash(git commit -m ' *)",
+      "Bash(git checkout *)",
+      "Bash(python -c \"import ast; [ast.parse\\(open\\(f\\).read\\(\\)\\) for f in ['app/main.py','app/database.py','app/ical_manager.py','app/khm_parser.py','app/secondary_port.py','app/scheduler.py','app/access_calc.py']]; print\\('OK'\\)\")",
+      "Bash(docker compose *)",
+      "Bash(curl -s -w \"\\\\nHTTP %{http_code} in %{time_total}s\\\\n\" \"http://localhost:8866/api/tide-curve?step_minutes=5\")",
+      "Bash(python -c \"import sys,json; raw=sys.stdin.read\\(\\); pre,_,tail=raw.rpartition\\('HTTP'\\); d=json.loads\\(pre.strip\\(\\)\\); print\\('date:', d.get\\('date'\\)\\); print\\('source:', d.get\\('source_used'\\)\\); print\\('reason:', d.get\\('reason'\\)\\); print\\('lazy_fetch:', d.get\\('lazy_fetch_attempted'\\)\\); print\\('sample_count:', len\\(d.get\\('samples',[]\\)\\)\\); print\\('events_in_window:', len\\(d.get\\('events_in_window',[]\\)\\)\\); s=d.get\\('samples',[]\\); print\\('first sample:', s[0] if s else None\\); print\\('last sample:', s[-1] if s else None\\); hs=[x['height_m'] for x in s]; print\\('h min/max:', \\(min\\(hs\\) if hs else None, max\\(hs\\) if hs else None\\)\\); print\\('events:', d.get\\('events_in_window'\\)\\); print\\('HTTP'+tail\\)\")",
+      "Bash(curl -s -o nul -w \"HTTP %{http_code}\\\\n\" \"http://localhost:8866/api/tide-curve?date=2026-05-25&step_minutes=10\")",
+      "Bash(curl -s -o nul -w \"HTTP %{http_code} \\(bad step\\)\\\\n\" \"http://localhost:8866/api/tide-curve?step_minutes=99\")",
+      "Bash(curl -s -o nul -w \"HTTP %{http_code} \\(bad date\\)\\\\n\" \"http://localhost:8866/api/tide-curve?date=bogus\")",
+      "mcp__Claude_Preview__preview_start",
+      "Bash(curl -s \"http://localhost:8866/\")",
+      "Bash(findstr /C:\"tide-curve-panel\" /C:\"tide-curve-header\" /C:\"tide-curve-body\" /C:\"loadTideCurve\" /C:\"renderTideCurve\" /C:\"updateTideCurveNowLine\")",
+      "Bash(findstr \"tide-curve-panel\")",
+      "Bash(findstr \"loadTideCurve\")",
+      "Bash(findstr \"tabs-top section-divider\")",
+      "Bash(findstr /v \"^$\")",
+      "Bash(findstr \"tabs-top\")",
+      "Bash(findstr \"section-divider\")",
+      "Bash(git add *)",
+      "Bash(git push *)",
+      "Bash(findstr \"tcv-access-group _tcvSyncAccessThreshold\")",
+      "Bash(curl -s \"http://localhost:8866/api/tide-curve\")",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\('sunrise:', d.get\\('sunrise'\\)\\); print\\('sunset:', d.get\\('sunset'\\)\\); print\\('spring_neap:', d.get\\('spring_neap'\\)\\)\")",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\('date:', d.get\\('date'\\)\\); print\\('available_range:', d.get\\('available_range'\\)\\); print\\('sunrise:', d.get\\('sunrise'\\)\\); print\\('sunset:', d.get\\('sunset'\\)\\)\")",
+      "Bash(curl -s \"http://localhost:8866/api/tide-curve?date=2026-05-28\")",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\('explicit date:', d.get\\('date'\\), 'samples:', len\\(d.get\\('samples',[]\\)\\), 'lazy:', d.get\\('lazy_fetch_attempted'\\)\\)\")"
     ]
   }
 }
