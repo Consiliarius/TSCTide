@@ -413,6 +413,16 @@
     font-size: 14px; font-weight: 700; color: var(--sea);
     margin: 4px 0 2px;
   }
+  /* Spring/Neap/Mid chip (v2.8). Colour-coded subtly without dominating. */
+  .tide-cycle-chip {
+    display: inline-block; font-size: 10px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 0.4px;
+    padding: 2px 6px; border-radius: 3px;
+    vertical-align: middle; margin-left: 6px;
+  }
+  .tide-cycle-spring { background: #e3ecf3; color: var(--navy); }
+  .tide-cycle-mid { background: var(--sand-dark); color: var(--text); }
+  .tide-cycle-neap { background: #f5e8d8; color: #7a5020; }
   .conditions-next {
     font-size: 12px; color: var(--text); margin-top: 4px;
     background: var(--sand); border-radius: var(--radius);
@@ -446,6 +456,30 @@
     display: inline-block; margin-left: 8px; font-size: 12px;
     transition: transform 0.15s ease;
   }
+  /* Date selector (v2.8): chevrons + label + Today button inside the panel header. */
+  .tide-curve-datesel {
+    display: inline-flex; align-items: center; gap: 4px; margin-left: 8px;
+  }
+  .tcv-date-btn {
+    background: rgba(255,255,255,0.12); color: #fff;
+    border: 1px solid rgba(255,255,255,0.25); border-radius: 3px;
+    padding: 1px 8px; font-size: 14px; font-weight: 700;
+    cursor: pointer; line-height: 1; height: 22px;
+  }
+  .tcv-date-btn:hover:not(:disabled) { background: rgba(255,255,255,0.22); }
+  .tcv-date-btn:disabled { opacity: 0.35; cursor: default; }
+  .tcv-date-label {
+    min-width: 110px; text-align: center; font-weight: 600;
+    font-size: 12px; color: #fff; opacity: 0.95;
+  }
+  .tcv-date-today {
+    background: rgba(255,255,255,0.12); color: #fff;
+    border: 1px solid rgba(255,255,255,0.25); border-radius: 3px;
+    padding: 1px 8px; font-size: 11px; font-weight: 600;
+    cursor: pointer; line-height: 1; height: 22px;
+  }
+  .tcv-date-today:hover { background: rgba(255,255,255,0.22); }
+  .tcv-date-today.hidden { display: none; }
   .tide-curve-body {
     padding: 12px 16px; background: #fff;
   }
@@ -484,12 +518,27 @@
   .tcv-clip-mark { fill: var(--warn); font-size: 14px; font-weight: 700; }
   /* Access threshold lines (v2.8): show the tide height the boat / tender
      needs to clear. Drawn only when a Mooring ID is set. */
-  .tcv-access-line { stroke: var(--ok); stroke-width: 1.2; stroke-dasharray: 5 4; fill: none; opacity: 0.85; pointer-events: none; }
+  .tcv-access-line { stroke: var(--ok); stroke-width: 1.8; stroke-dasharray: 6 3; fill: none; opacity: 1; pointer-events: none; }
   .tcv-access-label { fill: var(--ok); font-size: 10px; font-weight: 600; pointer-events: none; }
   .tcv-tender-line { stroke: var(--ok); stroke-width: 1; stroke-dasharray: 2 3; fill: none; opacity: 0.7; pointer-events: none; }
   .tcv-tender-label { fill: var(--ok); font-size: 10px; font-weight: 600; opacity: 0.85; pointer-events: none; }
   .tcv-access-clip { fill: var(--ok); font-size: 12px; font-weight: 700; pointer-events: none; }
+  /* Access bands (v2.8): contiguous time spans where the curve is above
+     the boat (or tender) access threshold. Drawn between the curve and
+     the threshold line so the band depth visually conveys "how much
+     extra water beyond the minimum". Opacity is high enough to override
+     the blue water fill below so the band reads as a clean green. */
+  .tcv-access-band { fill: var(--ok); fill-opacity: 0.55; pointer-events: none; }
+  /* Tender band: faint solid fill + real diagonal SVG lines clipped to
+     the same polygon. Real lines antialiase natively, giving a crisp
+     hatch without the pattern-tile boundary artefacts. */
+  .tcv-tender-fill { fill: #27ae60; fill-opacity: 0.14; pointer-events: none; }
+  .tcv-tender-hatch-line { stroke: #27ae60; stroke-width: 7; stroke-opacity: 0.45; pointer-events: none; shape-rendering: geometricPrecision; }
   .tcv-hover-line { stroke: var(--navy); stroke-width: 1; stroke-dasharray: 3 3; fill: none; pointer-events: none; opacity: 0.7; }
+  /* Sunrise/sunset markers (v2.8). Gold dashed verticals with sun-glyph labels. */
+  .tcv-sun-line { stroke: #c98a1e; stroke-width: 1; stroke-dasharray: 2 3; fill: none; opacity: 0.85; pointer-events: none; }
+  .tcv-sun-label { fill: #c98a1e; font-size: 10px; font-weight: 600; pointer-events: none; }
+  .tcv-night-band { fill: var(--navy); fill-opacity: 0.06; pointer-events: none; }
   .tcv-hover-dot { fill: var(--navy); stroke: #fff; stroke-width: 1.5; pointer-events: none; }
   #tcv-tooltip {
     position: absolute; display: none; pointer-events: none;
@@ -571,8 +620,17 @@
   <!-- Tidal Curve (v2.8) -->
   <div class="tide-curve-panel" id="tide-curve-panel">
     <div class="tide-curve-header" id="tide-curve-header" onclick="toggleTideCurve()">
-      <span>Tidal Curve <span id="tide-curve-date-label" class="tide-curve-meta"></span></span>
       <span>
+        Tidal Curve
+        <span class="tide-curve-datesel" onclick="event.stopPropagation();">
+          <button class="tcv-date-btn" id="tcv-date-prev" title="Previous day" onclick="event.stopPropagation(); tcvDateShift(-1)">‹</button>
+          <span id="tide-curve-date-label" class="tide-curve-meta tcv-date-label"></span>
+          <button class="tcv-date-btn" id="tcv-date-next" title="Next day" onclick="event.stopPropagation(); tcvDateShift(1)">›</button>
+          <button class="tcv-date-today" id="tcv-date-today" title="Jump to today" onclick="event.stopPropagation(); tcvDateGoToday()">Today</button>
+        </span>
+      </span>
+      <span>
+        <span id="tide-curve-cycle-label" class="tide-curve-meta"></span>
         <span class="tide-curve-meta" id="tide-curve-source-label"></span>
         <span class="tide-curve-toggle" id="tide-curve-toggle">▼</span>
       </span>
@@ -2839,24 +2897,34 @@ function renderConditionsTide(tide) {
   };
   const icon = stateIcons[tide.state] || '';
   // Upcoming events: show up to 3 (a full HW/LW/HW or LW/HW/LW cycle).
-  // First event gets a time-until countdown; subsequent ones show time only.
+  // Each event gets a time-until countdown for at-a-glance trip planning.
   let upcomingHtml = '';
   const upcoming = tide.upcoming_events || [];
   if (upcoming.length > 0) {
-    const rows = upcoming.map((ne, i) => {
+    const rows = upcoming.map(ne => {
       const timeStr = fmtConditionsTime(ne.time);
       const label = ne.type === 'HighWater' ? 'High Water' : 'Low Water';
-      const countdown = i === 0 ? ` <span style="color:var(--text-light);">(${fmtMinutesUntil(ne.minutes_until)})</span>` : '';
+      const countdown = ne.minutes_until != null
+        ? ` <span style="color:var(--text-light);">(${fmtMinutesUntil(ne.minutes_until)})</span>`
+        : '';
       return `<div>${label} ${ne.height_m}m at ${timeStr}${countdown}</div>`;
     }).join('');
     upcomingHtml = `<div class="conditions-next">${rows}</div>`;
   }
+  // Spring/Neap/Mid chip (v2.8). Only shown when the classifier has
+  // enough data to be honest.
+  let springNeapHtml = '';
+  if (tide.spring_neap) {
+    const label = tide.spring_neap.charAt(0).toUpperCase() + tide.spring_neap.slice(1);
+    springNeapHtml = ` <span class="tide-cycle-chip tide-cycle-${tide.spring_neap}" title="Spring/neap classification based on a rolling 90-day window of HW heights">${label} tide</span>`;
+  }
+
   el.innerHTML = '<div class="conditions-col-title">Tide</div>' +
     `<div class="conditions-row">` +
     `<span class="c-label">Current height of tide:</span> ` +
     `<span class="c-value">${tide.height_m}m above CD</span>` +
     `</div>` +
-    `<div class="conditions-state">${tide.state_description || ''} ${icon}</div>` +
+    `<div class="conditions-state">${tide.state_description || ''} ${icon}${springNeapHtml}</div>` +
     upcomingHtml +
     `<div class="conditions-source">Source: UKHO Admiralty</div>`;
 }
@@ -2952,6 +3020,8 @@ const TIDE_CURVE_CFG = {
 let _tideCurveData = null;
 let _tideCurveDateLocal = null;
 let _tideCurveLoadInFlight = false;
+let _tideCurveSelectedDate = null;  // null = follow today; string = explicit YYYY-MM-DD
+let _tideCurveAvailableRange = null;  // { earliest, latest }
 
 function _tcvLocalDateStr(d) {
   // Returns YYYY-MM-DD in Europe/London for a Date object (default now).
@@ -3062,16 +3132,19 @@ async function loadTideCurve() {
   const sourceLabel = document.getElementById('tide-curve-source-label');
   _tcvSetStatus('Loading tide curve…');
 
-  // After slowFetchHintMs, swap message to flag a likely lazy-fetch.
+  // After slowFetchHintMs, swap message to flag a likely lazy-fetch
+  // (lazy fetch only fires for today's date).
+  const isTodaySelected = _tideCurveSelectedDate == null;
   const slowHint = setTimeout(() => {
-    _tcvSetStatus('Fetching today’s UKHO data…');
+    _tcvSetStatus(isTodaySelected ? 'Fetching today’s UKHO data…' : 'Loading tide curve…');
   }, TIDE_CURVE_CFG.slowFetchHintMs);
 
   const ctrl = new AbortController();
   const timeoutId = setTimeout(() => ctrl.abort(), TIDE_CURVE_CFG.fetchTimeoutMs);
 
   try {
-    const resp = await fetch('/api/tide-curve?step_minutes=5', { signal: ctrl.signal });
+    const dateQ = _tideCurveSelectedDate ? `&date=${encodeURIComponent(_tideCurveSelectedDate)}` : '';
+    const resp = await fetch(`/api/tide-curve?step_minutes=5${dateQ}`, { signal: ctrl.signal });
     clearTimeout(slowHint);
     clearTimeout(timeoutId);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -3079,9 +3152,20 @@ async function loadTideCurve() {
 
     _tideCurveData = data;
     _tideCurveDateLocal = data.date;
+    _tideCurveAvailableRange = data.available_range || null;
 
-    dateLabel.textContent = data.date ? `— ${data.date}` : '';
+    dateLabel.textContent = data.date ? _tcvFormatDateLabel(data.date) : '';
     sourceLabel.textContent = data.source_used === 'ukho' ? 'UKHO' : '';
+    _tcvUpdateDateControls();
+    const cycleLabel = document.getElementById('tide-curve-cycle-label');
+    if (cycleLabel) {
+      if (data.spring_neap) {
+        const txt = data.spring_neap.charAt(0).toUpperCase() + data.spring_neap.slice(1);
+        cycleLabel.textContent = txt + ' tide · ';
+      } else {
+        cycleLabel.textContent = '';
+      }
+    }
 
     if (!data.samples || data.samples.length === 0) {
       const retry = ` <span class="retry-link" onclick="loadTideCurve()">Retry</span>`;
@@ -3183,15 +3267,22 @@ function renderTideCurve(data) {
   const chartBottom = vbHeight - marginB;
   const overlayRect = `<rect id="tcv-hover-overlay" x="${chartLeft}" y="${chartTop}" width="${(chartRight - chartLeft).toFixed(2)}" height="${(chartBottom - chartTop).toFixed(2)}" fill="transparent" pointer-events="all"/>`;
 
+  // Sunrise/sunset markers (v2.8). Drawn for the displayed date so they
+  // remain accurate when panning to other days (#3).
+  const sunHtml = _tcvBuildSunMarkers(data, renderedDate);
+
   const svg = `
     <svg viewBox="0 0 ${vbWidth} ${vbHeight}" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Tidal curve for ${data.date}">
       ${gridlines.join('\n')}
       ${xticks.join('\n')}
+      ${sunHtml.bands}
       ${frame}
       <path class="tcv-fill" d="${fillD}"/>
+      <g id="tcv-access-bands-group"></g>
       <path class="tcv-curve" d="${pathD}"/>
       ${eventMarkers}
       ${clipMark}
+      ${sunHtml.markers}
       <g id="tcv-access-group"></g>
       <g id="tcv-now-group"></g>
       <g id="tcv-hover-group"></g>
@@ -3285,7 +3376,194 @@ function _tcvDrawAccessLines(thresholds) {
 }
 
 function _tcvSyncAccessThreshold() {
-  _tcvDrawAccessLines(_tcvComputeThresholds());
+  const thresholds = _tcvComputeThresholds();
+  _tcvDrawAccessLines(thresholds);
+  _tcvDrawAccessBands(thresholds);
+}
+
+function _tcvDrawAccessBands(thresholds) {
+  // Render contiguous time-spans where the curve sits above each
+  // threshold, between the curve and the threshold line.
+  // Stack order: tender (wider, hatched) drawn first, then boat (solid)
+  // on top so the boat-access band reads as a subset of tender access.
+  const group = document.getElementById('tcv-access-bands-group');
+  if (!group) return;
+  if (!_tideCurveData || !_tideCurveData.samples || _tideCurveData.samples.length === 0) {
+    group.innerHTML = '';
+    return;
+  }
+
+  const { vbWidth, marginL, marginR, ymax } = TIDE_CURVE_CFG;
+  const renderedDate = _tideCurveData.date;
+
+  // Rebuild a points array matching what renderTideCurve did (we don't
+  // keep them on a module variable to avoid stale references after
+  // re-renders).
+  const pts = _tideCurveData.samples.map(s => {
+    const utc = new Date(s.time);
+    const hr = _tcvHourFractionForRenderedDay(utc, renderedDate);
+    return { x: _tcvXFor(hr), y: _tcvYFor(s.height_m), h: s.height_m };
+  });
+
+  function findSpans(threshold) {
+    // Return list of [startIdx, endIdx] index pairs where curve >= threshold.
+    // Uses linear interpolation between samples to refine the band edges so
+    // they don't visibly snap at sample boundaries.
+    if (threshold == null || threshold >= ymax) return [];
+    const spans = [];
+    let spanStart = null;
+    for (let i = 0; i < pts.length; i++) {
+      const above = pts[i].h >= threshold;
+      if (above && spanStart === null) spanStart = i;
+      if (!above && spanStart !== null) {
+        spans.push([spanStart, i - 1]);
+        spanStart = null;
+      }
+    }
+    if (spanStart !== null) spans.push([spanStart, pts.length - 1]);
+    return spans;
+  }
+
+  function interpolateX(idxA, idxB, threshold) {
+    // Linear-interpolate the x at which a line between samples idxA and
+    // idxB crosses the threshold height. idxA and idxB must straddle.
+    const a = pts[idxA], b = pts[idxB];
+    if (a.h === b.h) return a.x;
+    const t = (threshold - a.h) / (b.h - a.h);
+    return a.x + (b.x - a.x) * t;
+  }
+
+  function buildBandPath(threshold) {
+    if (threshold == null || threshold >= ymax) return '';
+    const yThreshold = _tcvYFor(threshold);
+    const spans = findSpans(threshold);
+    return spans.map(([si, ei]) => {
+      // Refine left edge: if sample si-1 exists and is below threshold,
+      // interpolate the crossing between si-1 and si.
+      let leftX = pts[si].x;
+      if (si > 0 && pts[si - 1].h < threshold) {
+        leftX = interpolateX(si - 1, si, threshold);
+      }
+      // Refine right edge similarly.
+      let rightX = pts[ei].x;
+      if (ei < pts.length - 1 && pts[ei + 1].h < threshold) {
+        rightX = interpolateX(ei, ei + 1, threshold);
+      }
+      // Polygon: along the threshold line from leftX to rightX, up the
+      // curve back to leftX.
+      let d = `M${leftX.toFixed(2)},${yThreshold.toFixed(2)}`;
+      d += ` L${rightX.toFixed(2)},${yThreshold.toFixed(2)}`;
+      for (let i = ei; i >= si; i--) {
+        d += ` L${pts[i].x.toFixed(2)},${pts[i].y.toFixed(2)}`;
+      }
+      d += ' Z';
+      return d;
+    }).join(' ');
+  }
+
+  function buildTenderBandPath(tenderThreshold, accessThreshold) {
+    // Tender-only ribbon: between the tender threshold and the LESSER of
+    // (curve, access threshold). This keeps the tender band strictly
+    // beneath the boat band so the two never share pixels and the hatch
+    // doesn't bleed into the solid green region above.
+    if (tenderThreshold == null || tenderThreshold >= ymax) return '';
+    const yTender = _tcvYFor(tenderThreshold);
+    const yAccess = (accessThreshold != null && accessThreshold < ymax)
+      ? _tcvYFor(accessThreshold) : null;
+    const spans = findSpans(tenderThreshold);
+    return spans.map(([si, ei]) => {
+      let leftX = pts[si].x;
+      if (si > 0 && pts[si - 1].h < tenderThreshold) {
+        leftX = interpolateX(si - 1, si, tenderThreshold);
+      }
+      let rightX = pts[ei].x;
+      if (ei < pts.length - 1 && pts[ei + 1].h < tenderThreshold) {
+        rightX = interpolateX(ei, ei + 1, tenderThreshold);
+      }
+      // Bottom edge along the tender threshold line.
+      let d = `M${leftX.toFixed(2)},${yTender.toFixed(2)}`;
+      d += ` L${rightX.toFixed(2)},${yTender.toFixed(2)}`;
+      // Top edge from right to left. At each sample, the top is at
+      // min(curve_height, access_threshold) - in pixel coords, that's
+      // max(curve_y_px, yAccess) because higher height = smaller pixel-y.
+      for (let i = ei; i >= si; i--) {
+        const topY = (yAccess != null) ? Math.max(pts[i].y, yAccess) : pts[i].y;
+        d += ` L${pts[i].x.toFixed(2)},${topY.toFixed(2)}`;
+      }
+      d += ' Z';
+      return d;
+    }).join(' ');
+  }
+
+  function buildHatchLines() {
+    // Real diagonal SVG lines spanning the chart, to be clipped to the
+    // tender band polygon. Spacing in user units. Thick bands rather
+    // than thin lines read as deliberate hatching and avoid the
+    // antialiasing artefacts that pinstripe-style hatching shows at
+    // viewport scale.
+    const SPACING = 18;
+    const chartLeft = marginL;
+    const chartRight = vbWidth - marginR;
+    const chartTop = TIDE_CURVE_CFG.marginT;
+    const chartBottom = TIDE_CURVE_CFG.vbHeight - TIDE_CURVE_CFG.marginB;
+    const h = chartBottom - chartTop;
+    const lines = [];
+    // 45° down-right diagonals: each line goes from (x, top) to (x + h, bottom).
+    // Sweep x from (left - h) to right so coverage is complete.
+    for (let x = chartLeft - h; x <= chartRight; x += SPACING) {
+      lines.push(`<line class="tcv-tender-hatch-line" x1="${x.toFixed(2)}" y1="${chartTop}" x2="${(x + h).toFixed(2)}" y2="${chartBottom}"/>`);
+    }
+    return lines.join('');
+  }
+
+  let html = '';
+  // Tender ribbon (between tender threshold and access line / curve).
+  if (thresholds.tender != null) {
+    const tenderD = buildTenderBandPath(thresholds.tender, thresholds.access);
+    if (tenderD) {
+      html += `<defs><clipPath id="tcv-tender-clip"><path d="${tenderD}"/></clipPath></defs>`;
+      html += `<path class="tcv-tender-fill" d="${tenderD}"/>`;
+      html += `<g clip-path="url(#tcv-tender-clip)">${buildHatchLines()}</g>`;
+    }
+  }
+  // Boat-access wedge (between access threshold and curve).
+  if (thresholds.access != null) {
+    const accessD = buildBandPath(thresholds.access);
+    if (accessD) html += `<path class="tcv-access-band" d="${accessD}"/>`;
+  }
+  group.innerHTML = html;
+}
+
+function _tcvBuildSunMarkers(data, renderedDate) {
+  // Returns { bands, markers } SVG strings. Empty if sun-times unavailable.
+  const empty = { bands: '', markers: '' };
+  if (!data.sunrise || !data.sunset) return empty;
+  const { vbWidth, vbHeight, marginL, marginR, marginT, marginB } = TIDE_CURVE_CFG;
+  const chartLeft = marginL;
+  const chartRight = vbWidth - marginR;
+  const chartTop = marginT;
+  const chartBottom = vbHeight - marginB;
+
+  const sunriseHr = _tcvHourFractionForRenderedDay(new Date(data.sunrise), renderedDate);
+  const sunsetHr = _tcvHourFractionForRenderedDay(new Date(data.sunset), renderedDate);
+  const sxRise = _tcvXFor(Math.max(0, Math.min(24, sunriseHr)));
+  const sxSet = _tcvXFor(Math.max(0, Math.min(24, sunsetHr)));
+
+  // Faint navy night bands: from chart-left to sunrise, and sunset to chart-right.
+  const bands =
+    `<rect class="tcv-night-band" x="${chartLeft}" y="${chartTop}" width="${(sxRise - chartLeft).toFixed(2)}" height="${(chartBottom - chartTop).toFixed(2)}"/>` +
+    `<rect class="tcv-night-band" x="${sxSet.toFixed(2)}" y="${chartTop}" width="${(chartRight - sxSet).toFixed(2)}" height="${(chartBottom - chartTop).toFixed(2)}"/>`;
+
+  // Gold dashed verticals + compact labels positioned just below the curve area.
+  const labelY = (chartBottom - 4).toFixed(2);
+  const riseLabel = `Sunrise ${_tcvLocalHM(data.sunrise)}`;
+  const setLabel = `Sunset ${_tcvLocalHM(data.sunset)}`;
+  const markers =
+    `<line class="tcv-sun-line" x1="${sxRise.toFixed(2)}" y1="${chartTop}" x2="${sxRise.toFixed(2)}" y2="${chartBottom}"/>` +
+    `<line class="tcv-sun-line" x1="${sxSet.toFixed(2)}" y1="${chartTop}" x2="${sxSet.toFixed(2)}" y2="${chartBottom}"/>` +
+    `<text class="tcv-sun-label" x="${(sxRise + 3).toFixed(2)}" y="${labelY}" text-anchor="start">${riseLabel}</text>` +
+    `<text class="tcv-sun-label" x="${(sxSet - 3).toFixed(2)}" y="${labelY}" text-anchor="end">${setLabel}</text>`;
+  return { bands, markers };
 }
 
 function _tcvHourFractionToHM(hr) {
@@ -3410,13 +3688,74 @@ function updateTideCurveNowLine() {
 }
 
 function _tcvPeriodicTick() {
-  // If the local date has rolled over since render, refetch. Otherwise just move the line.
+  // If the user is following today and the local date has rolled over,
+  // refetch. If they have explicitly selected a non-today date, leave
+  // their selection alone - just update the now line (which will
+  // self-hide because the displayed date is no longer today).
   const todayLocal = _tcvLocalDateStr(new Date());
-  if (_tideCurveDateLocal && todayLocal !== _tideCurveDateLocal) {
+  const followingToday = _tideCurveSelectedDate == null;
+  if (followingToday && _tideCurveDateLocal && todayLocal !== _tideCurveDateLocal) {
     loadTideCurve();
   } else {
     updateTideCurveNowLine();
+    _tcvUpdateDateControls();
   }
+}
+
+function _tcvFormatDateLabel(isoDate) {
+  // Display "22 May 2026 (Today)" or "23 May 2026".
+  try {
+    const [y, m, d] = isoDate.split('-').map(n => parseInt(n, 10));
+    const utc = new Date(Date.UTC(y, m - 1, d));
+    const formatted = utc.toLocaleDateString('en-GB', {
+      day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC'
+    });
+    const todayStr = _tcvLocalDateStr(new Date());
+    return isoDate === todayStr ? `${formatted} (Today)` : formatted;
+  } catch (e) { return isoDate; }
+}
+
+function _tcvShiftDate(isoDate, deltaDays) {
+  const [y, m, d] = isoDate.split('-').map(n => parseInt(n, 10));
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + deltaDays);
+  const yy = dt.getUTCFullYear();
+  const mm = String(dt.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(dt.getUTCDate()).padStart(2, '0');
+  return `${yy}-${mm}-${dd}`;
+}
+
+function _tcvUpdateDateControls() {
+  const prev = document.getElementById('tcv-date-prev');
+  const next = document.getElementById('tcv-date-next');
+  const today = document.getElementById('tcv-date-today');
+  if (!prev || !next || !today) return;
+  const currentDate = _tideCurveDateLocal;
+  const range = _tideCurveAvailableRange;
+  if (!currentDate || !range) {
+    prev.disabled = true; next.disabled = true;
+    today.classList.add('hidden');
+    return;
+  }
+  prev.disabled = (currentDate <= range.earliest);
+  next.disabled = (currentDate >= range.latest);
+  const todayStr = _tcvLocalDateStr(new Date());
+  today.classList.toggle('hidden', currentDate === todayStr);
+}
+
+function tcvDateShift(delta) {
+  if (!_tideCurveDateLocal || !_tideCurveAvailableRange) return;
+  const target = _tcvShiftDate(_tideCurveDateLocal, delta);
+  if (delta < 0 && target < _tideCurveAvailableRange.earliest) return;
+  if (delta > 0 && target > _tideCurveAvailableRange.latest) return;
+  const todayStr = _tcvLocalDateStr(new Date());
+  _tideCurveSelectedDate = (target === todayStr) ? null : target;
+  loadTideCurve();
+}
+
+function tcvDateGoToday() {
+  _tideCurveSelectedDate = null;
+  loadTideCurve();
 }
 
 _tcvInitPanelState();

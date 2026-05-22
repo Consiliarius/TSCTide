@@ -239,6 +239,16 @@ def _compute_tide_state(now_utc: datetime) -> dict:
                 break
     result["upcoming_events"] = future_events
 
+    # Spring / Neap / Mid classification for today (v2.8). Returns None
+    # when there's insufficient stored UKHO history; the UI then omits
+    # the chip rather than guessing.
+    try:
+        from app.tide_state import classify_spring_neap
+        result["spring_neap"] = classify_spring_neap()
+    except Exception as e:
+        logger.warning(f"Spring/neap classification skipped: {e}")
+        result["spring_neap"] = None
+
     return result
 
 
