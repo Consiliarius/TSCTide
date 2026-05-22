@@ -401,6 +401,66 @@
     font-size: 10px; color: var(--text-light); margin-top: 8px;
     text-align: right; opacity: 0.6;
   }
+
+  /* Tidal Curve panel (v2.8) */
+  .tide-curve-panel {
+    background: #fff; border: 1px solid var(--border);
+    border-radius: var(--radius); margin-bottom: 16px;
+    overflow: hidden;
+  }
+  .tide-curve-header {
+    background: var(--navy); color: #fff; padding: 8px 14px;
+    font-size: 13px; font-weight: 600;
+    display: flex; justify-content: space-between; align-items: center;
+    cursor: pointer; user-select: none;
+  }
+  .tide-curve-header .tide-curve-meta {
+    font-size: 11px; font-weight: 400; opacity: 0.75;
+  }
+  .tide-curve-header .tide-curve-toggle {
+    display: inline-block; margin-left: 8px; font-size: 12px;
+    transition: transform 0.15s ease;
+  }
+  .tide-curve-body {
+    padding: 12px 16px; background: #fff;
+  }
+  .tide-curve-body.collapsed { display: none; }
+  .tide-curve-svg-wrap {
+    width: 100%;
+    /* Aspect-ratio sized; ViewBox handles the actual coordinate system. */
+  }
+  .tide-curve-svg-wrap svg {
+    width: 100%; height: auto; display: block;
+  }
+  .tide-curve-status {
+    font-size: 12px; color: var(--text-light); font-style: italic;
+    padding: 24px 8px; text-align: center;
+  }
+  .tide-curve-status .retry-link {
+    color: var(--sea); cursor: pointer; text-decoration: underline;
+    font-style: normal; margin-left: 6px;
+  }
+  .tide-curve-footer {
+    font-size: 10px; color: var(--text-light); margin-top: 6px;
+    display: flex; justify-content: space-between; opacity: 0.7;
+  }
+  /* SVG element styling */
+  .tcv-grid { stroke: var(--sand-dark); stroke-width: 1; fill: none; }
+  .tcv-axis { stroke: var(--border); stroke-width: 1; fill: none; }
+  .tcv-cd { stroke: var(--navy); stroke-width: 1; stroke-dasharray: 4 3; fill: none; opacity: 0.4; }
+  .tcv-fill { fill: var(--sea-light); fill-opacity: 0.45; }
+  .tcv-curve { stroke: var(--sea); stroke-width: 2; fill: none; }
+  .tcv-now { stroke: var(--warn); stroke-width: 1.5; fill: none; }
+  .tcv-now-label { fill: var(--warn); font-size: 10px; font-weight: 600; }
+  .tcv-tick-label { fill: var(--text-light); font-size: 10px; }
+  .tcv-event-dot { fill: var(--navy); }
+  .tcv-event-label { fill: var(--navy); font-size: 10px; font-weight: 600; }
+  .tcv-clip-mark { fill: var(--warn); font-size: 14px; font-weight: 700; }
+  @media (max-width: 600px) {
+    .tide-curve-body { padding: 8px 10px; }
+    .tcv-event-label, .tcv-tick-label, .tcv-now-label { font-size: 9px; }
+  }
+
   footer {
     background: var(--navy); color: #fff; padding: 16px 20px;
     font-size: 14px; line-height: 1.6; margin-top: 24px;
@@ -454,6 +514,26 @@
       <div class="conditions-col" id="conditions-weather">
         <div class="conditions-col-title">Weather</div>
         <div class="conditions-unavailable">Loading...</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tidal Curve (v2.8) -->
+  <div class="tide-curve-panel" id="tide-curve-panel">
+    <div class="tide-curve-header" id="tide-curve-header" onclick="toggleTideCurve()">
+      <span>Tidal Curve <span id="tide-curve-date-label" class="tide-curve-meta"></span></span>
+      <span>
+        <span class="tide-curve-meta" id="tide-curve-source-label"></span>
+        <span class="tide-curve-toggle" id="tide-curve-toggle">▼</span>
+      </span>
+    </div>
+    <div class="tide-curve-body" id="tide-curve-body">
+      <div class="tide-curve-svg-wrap" id="tide-curve-svg-wrap">
+        <div class="tide-curve-status" id="tide-curve-status">Loading tide curve…</div>
+      </div>
+      <div class="tide-curve-footer">
+        <span>Heights above Chart Datum. Local time (Europe/London).</span>
+        <span id="tide-curve-now-readout"></span>
       </div>
     </div>
   </div>
@@ -2809,6 +2889,301 @@ setInterval(loadConditions, 15 * 60 * 1000);
 
 // Tides is the default view; load its data on page open.
 loadTides();
+
+// --- Tidal Curve (v2.8) ---
+
+const TIDE_CURVE_CFG = {
+  ymax: 5.5,
+  vbWidth: 1000, vbHeight: 360,
+  marginL: 44, marginR: 16, marginT: 14, marginB: 28,
+  storageKey: 'tide_curve_panel_state',
+  nowUpdateMs: 5 * 60 * 1000,
+  fetchTimeoutMs: 25 * 1000,
+  slowFetchHintMs: 1000,
+};
+
+let _tideCurveData = null;
+let _tideCurveDateLocal = null;
+let _tideCurveLoadInFlight = false;
+
+function _tcvLocalDateStr(d) {
+  // Returns YYYY-MM-DD in Europe/London for a Date object (default now).
+  const dt = d || new Date();
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Europe/London', year: 'numeric', month: '2-digit', day: '2-digit'
+  }).formatToParts(dt);
+  const get = t => parts.find(p => p.type === t).value;
+  return `${get('year')}-${get('month')}-${get('day')}`;
+}
+
+function _tcvLocalHM(isoUtc) {
+  return new Date(isoUtc).toLocaleTimeString('en-GB', {
+    hour: '2-digit', minute: '2-digit', timeZone: 'Europe/London'
+  });
+}
+
+function _tcvLocalHourFraction(utcDate) {
+  // Fractional hours-of-day in Europe/London (0.0 .. ~23.999).
+  // Midnight is always reported as 0 by Intl.DateTimeFormat regardless of
+  // which day's midnight it is; callers that need a value in [0, 24] for
+  // a fixed reference day must use _tcvHourFractionForRenderedDay.
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Europe/London', hour: '2-digit', minute: '2-digit',
+    second: '2-digit', hourCycle: 'h23',
+  }).formatToParts(utcDate);
+  const get = t => parseInt(parts.find(p => p.type === t).value, 10);
+  return get('hour') + get('minute') / 60 + get('second') / 3600;
+}
+
+function _tcvHourFractionForRenderedDay(utcDate, renderedDateStr) {
+  // Returns a value in [0, 24]. Samples whose local calendar date is the
+  // day AFTER renderedDateStr (i.e. the inclusive 24:00 endpoint) get
+  // 24 + their wall-clock fraction, so the path's last point lands at
+  // the right edge of the chart instead of wrapping back to x=0.
+  const sampleLocalDate = _tcvLocalDateStr(utcDate);
+  const fraction = _tcvLocalHourFraction(utcDate);
+  return sampleLocalDate === renderedDateStr ? fraction : 24 + fraction;
+}
+
+function _tcvXFor(hourFraction) {
+  const { vbWidth, marginL, marginR } = TIDE_CURVE_CFG;
+  const usable = vbWidth - marginL - marginR;
+  return marginL + (hourFraction / 24) * usable;
+}
+
+function _tcvYFor(heightM) {
+  const { vbHeight, marginT, marginB, ymax } = TIDE_CURVE_CFG;
+  const usable = vbHeight - marginT - marginB;
+  const h = Math.max(0, Math.min(ymax, heightM));
+  return marginT + (1 - h / ymax) * usable;
+}
+
+function toggleTideCurve() {
+  const body = document.getElementById('tide-curve-body');
+  const toggle = document.getElementById('tide-curve-toggle');
+  const collapsed = body.classList.toggle('collapsed');
+  toggle.textContent = collapsed ? '▶' : '▼';
+  try {
+    localStorage.setItem(TIDE_CURVE_CFG.storageKey, collapsed ? 'collapsed' : 'expanded');
+  } catch (e) { /* localStorage may be unavailable */ }
+}
+
+function _tcvInitPanelState() {
+  let state = 'expanded';
+  try {
+    const v = localStorage.getItem(TIDE_CURVE_CFG.storageKey);
+    if (v === 'collapsed') state = 'collapsed';
+  } catch (e) { /* ignore */ }
+  const body = document.getElementById('tide-curve-body');
+  const toggle = document.getElementById('tide-curve-toggle');
+  if (state === 'collapsed') {
+    body.classList.add('collapsed');
+    toggle.textContent = '▶';
+  } else {
+    body.classList.remove('collapsed');
+    toggle.textContent = '▼';
+  }
+}
+
+function _tcvSetStatus(html) {
+  const wrap = document.getElementById('tide-curve-svg-wrap');
+  wrap.innerHTML = `<div class="tide-curve-status">${html}</div>`;
+}
+
+async function loadTideCurve() {
+  if (_tideCurveLoadInFlight) return;
+  _tideCurveLoadInFlight = true;
+  const dateLabel = document.getElementById('tide-curve-date-label');
+  const sourceLabel = document.getElementById('tide-curve-source-label');
+  _tcvSetStatus('Loading tide curve…');
+
+  // After slowFetchHintMs, swap message to flag a likely lazy-fetch.
+  const slowHint = setTimeout(() => {
+    _tcvSetStatus('Fetching today’s UKHO data…');
+  }, TIDE_CURVE_CFG.slowFetchHintMs);
+
+  const ctrl = new AbortController();
+  const timeoutId = setTimeout(() => ctrl.abort(), TIDE_CURVE_CFG.fetchTimeoutMs);
+
+  try {
+    const resp = await fetch('/api/tide-curve?step_minutes=5', { signal: ctrl.signal });
+    clearTimeout(slowHint);
+    clearTimeout(timeoutId);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+
+    _tideCurveData = data;
+    _tideCurveDateLocal = data.date;
+
+    dateLabel.textContent = data.date ? `— ${data.date}` : '';
+    sourceLabel.textContent = data.source_used === 'ukho' ? 'UKHO' : '';
+
+    if (!data.samples || data.samples.length === 0) {
+      const retry = ` <span class="retry-link" onclick="loadTideCurve()">Retry</span>`;
+      const msg = data.reason === 'no_ukho_data'
+        ? 'UKHO data unavailable for today.'
+        : 'Tide curve unavailable.';
+      _tcvSetStatus(msg + retry);
+      return;
+    }
+    renderTideCurve(data);
+  } catch (e) {
+    clearTimeout(slowHint);
+    clearTimeout(timeoutId);
+    const retry = ` <span class="retry-link" onclick="loadTideCurve()">Retry</span>`;
+    _tcvSetStatus('Tide curve failed to load.' + retry);
+    console.warn('Tide curve fetch failed:', e);
+  } finally {
+    _tideCurveLoadInFlight = false;
+  }
+}
+
+function renderTideCurve(data) {
+  const { vbWidth, vbHeight, marginL, marginR, marginT, marginB, ymax } = TIDE_CURVE_CFG;
+
+  // Pre-compute sample coordinates. Use the rendered-day variant so the
+  // inclusive 24:00 endpoint lands at the right edge of the chart rather
+  // than wrapping back to x=0 (Intl reports midnight as hour 0 for either
+  // day, so the next-day midnight needs +24 added to its hour fraction).
+  const renderedDate = data.date;
+  let anyClipped = false;
+  const pts = data.samples.map(s => {
+    const utc = new Date(s.time);
+    const hr = _tcvHourFractionForRenderedDay(utc, renderedDate);
+    const x = _tcvXFor(hr);
+    const yClipped = s.height_m > ymax;
+    if (yClipped) anyClipped = true;
+    const y = _tcvYFor(s.height_m);
+    return { x, y, hr, h: s.height_m, clipped: yClipped };
+  });
+  if (pts.length === 0) return;
+
+  // Build curve path (smooth line through samples).
+  const pathD = pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(2)},${p.y.toFixed(2)}`).join(' ');
+  // Fill polygon: curve + down-to-baseline + back along baseline.
+  const baselineY = _tcvYFor(0);
+  const first = pts[0], last = pts[pts.length - 1];
+  const fillD = `${pathD} L${last.x.toFixed(2)},${baselineY.toFixed(2)} L${first.x.toFixed(2)},${baselineY.toFixed(2)} Z`;
+
+  // Y-axis: gridlines + labels at every 1 m, plus 5.5 m top.
+  const gridlines = [];
+  for (let m = 0; m <= 5; m++) {
+    const y = _tcvYFor(m);
+    gridlines.push(`<line class="tcv-grid" x1="${marginL}" y1="${y.toFixed(2)}" x2="${vbWidth - marginR}" y2="${y.toFixed(2)}"/>`);
+    gridlines.push(`<text class="tcv-tick-label" x="${marginL - 6}" y="${(y + 3).toFixed(2)}" text-anchor="end">${m}m</text>`);
+  }
+  // Chart Datum dashed
+  const cdY = _tcvYFor(0);
+  gridlines.push(`<line class="tcv-cd" x1="${marginL}" y1="${cdY.toFixed(2)}" x2="${vbWidth - marginR}" y2="${cdY.toFixed(2)}"/>`);
+
+  // X-axis ticks: every 3 hours.
+  const xticks = [];
+  for (let h = 0; h <= 24; h += 3) {
+    const x = _tcvXFor(h);
+    xticks.push(`<line class="tcv-axis" x1="${x.toFixed(2)}" y1="${(vbHeight - marginB).toFixed(2)}" x2="${x.toFixed(2)}" y2="${(vbHeight - marginB + 4).toFixed(2)}"/>`);
+    const lbl = h === 24 ? '24:00' : (h < 10 ? '0' + h : h) + ':00';
+    xticks.push(`<text class="tcv-tick-label" x="${x.toFixed(2)}" y="${(vbHeight - marginB + 16).toFixed(2)}" text-anchor="middle">${lbl}</text>`);
+  }
+  // Frame
+  const frame = `<rect class="tcv-axis" fill="none" x="${marginL}" y="${marginT}" width="${(vbWidth - marginL - marginR).toFixed(2)}" height="${(vbHeight - marginT - marginB).toFixed(2)}"/>`;
+
+  // HW/LW markers — labels offset to avoid overlapping the curve.
+  const eventMarkers = (data.events_in_window || []).map(ev => {
+    const utc = new Date(ev.time);
+    const hr = _tcvLocalHourFraction(utc);
+    const x = _tcvXFor(hr);
+    const y = _tcvYFor(ev.height_m);
+    const isHW = ev.type === 'HighWater';
+    const tag = isHW ? 'H' : 'L';
+    const labelY = isHW ? Math.max(marginT + 10, y - 8) : Math.min(vbHeight - marginB - 6, y + 16);
+    const text = `${tag} ${ev.height_m.toFixed(2)}m ${_tcvLocalHM(ev.time)}`;
+    return `
+      <circle class="tcv-event-dot" cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="3"/>
+      <text class="tcv-event-label" x="${x.toFixed(2)}" y="${labelY.toFixed(2)}" text-anchor="middle">${text}</text>
+    `;
+  }).join('');
+
+  // Clip marker if any sample exceeded the 5.5 m ceiling.
+  let clipMark = '';
+  if (anyClipped) {
+    const firstClip = pts.find(p => p.clipped);
+    clipMark = `<text class="tcv-clip-mark" x="${firstClip.x.toFixed(2)}" y="${(marginT + 10).toFixed(2)}" text-anchor="middle">+</text>`;
+  }
+
+  const svg = `
+    <svg viewBox="0 0 ${vbWidth} ${vbHeight}" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Tidal curve for ${data.date}">
+      ${gridlines.join('\n')}
+      ${xticks.join('\n')}
+      ${frame}
+      <path class="tcv-fill" d="${fillD}"/>
+      <path class="tcv-curve" d="${pathD}"/>
+      ${eventMarkers}
+      ${clipMark}
+      <g id="tcv-now-group"></g>
+    </svg>
+  `;
+  document.getElementById('tide-curve-svg-wrap').innerHTML = svg;
+  updateTideCurveNowLine();
+}
+
+function updateTideCurveNowLine() {
+  if (!_tideCurveData || !_tideCurveDateLocal) return;
+  const group = document.getElementById('tcv-now-group');
+  if (!group) return;
+
+  // Only draw the "now" line if the rendered date is today.
+  const todayLocal = _tcvLocalDateStr(new Date());
+  if (todayLocal !== _tideCurveDateLocal) {
+    group.innerHTML = '';
+    document.getElementById('tide-curve-now-readout').textContent = '';
+    return;
+  }
+
+  const now = new Date();
+  const hr = _tcvLocalHourFraction(now);
+  const x = _tcvXFor(hr);
+  const { vbHeight, marginT, marginB } = TIDE_CURVE_CFG;
+  const yTop = marginT;
+  const yBottom = vbHeight - marginB;
+
+  // Find nearest sample for the current-height readout.
+  let nearest = null;
+  let bestDelta = Infinity;
+  for (const s of _tideCurveData.samples) {
+    const delta = Math.abs(new Date(s.time).getTime() - now.getTime());
+    if (delta < bestDelta) { bestDelta = delta; nearest = s; }
+  }
+  const heightStr = nearest ? `${nearest.height_m.toFixed(2)}m` : '';
+  const labelTxt = `now ${_tcvLocalHM(now.toISOString())}${heightStr ? ' — ' + heightStr : ''}`;
+  // Place label inside the chart area, offset from the line, away from the right edge.
+  const labelX = x + 4;
+  const labelAnchor = (x > TIDE_CURVE_CFG.vbWidth * 0.85) ? 'end' : 'start';
+  const labelXFinal = labelAnchor === 'end' ? x - 4 : labelX;
+
+  group.innerHTML = `
+    <line class="tcv-now" x1="${x.toFixed(2)}" y1="${yTop}" x2="${x.toFixed(2)}" y2="${yBottom}"/>
+    <text class="tcv-now-label" x="${labelXFinal.toFixed(2)}" y="${(yTop + 10).toFixed(2)}" text-anchor="${labelAnchor}">${labelTxt}</text>
+  `;
+  document.getElementById('tide-curve-now-readout').textContent =
+    nearest ? `Tide height now: ${nearest.height_m.toFixed(2)}m above CD` : '';
+}
+
+function _tcvPeriodicTick() {
+  // If the local date has rolled over since render, refetch. Otherwise just move the line.
+  const todayLocal = _tcvLocalDateStr(new Date());
+  if (_tideCurveDateLocal && todayLocal !== _tideCurveDateLocal) {
+    loadTideCurve();
+  } else {
+    updateTideCurveNowLine();
+  }
+}
+
+_tcvInitPanelState();
+loadTideCurve();
+setInterval(_tcvPeriodicTick, TIDE_CURVE_CFG.nowUpdateMs);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') _tcvPeriodicTick();
+});
 </script>
 
 </body>
