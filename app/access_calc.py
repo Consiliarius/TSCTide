@@ -203,30 +203,19 @@ def compute_access_windows(
     draught_m: float,
     drying_height_m: float,
     safety_margin_m: float,
-    wind_offset_m: float = 0.0,
-    wind_offset_hw_timestamp: Optional[str] = None,
     source: str = "ukho",
     interval_minutes: int = 3,
 ) -> list[dict]:
     """
-    Compute access windows from tide events.
+    Compute baseline access windows from tide events.
 
     An access window is the continuous period around each HW during which:
-        tide_height > drying_height + draught + safety_margin [+ wind_offset]
+        tide_height > drying_height + draught + safety_margin
 
-    Wind offset scoping:
-      - If ``wind_offset_hw_timestamp`` is provided, the ``wind_offset_m`` is
-        applied ONLY to the HW whose timestamp matches that string. All other
-        HW windows use the baseline threshold. This is the correct behaviour
-        for a just-observed wind reading, which is only a good predictor for
-        the next flood tide.
-      - If ``wind_offset_hw_timestamp`` is None (default) and ``wind_offset_m``
-        is non-zero, the offset is applied to every HW window. This preserves
-        backward compatibility but is rarely what's wanted.
-
-    Each returned window carries a ``wind_adjusted`` boolean indicating whether
-    that specific HW had the offset applied, so the caller no longer needs to
-    set this flag in a post-processing loop.
+    This computes the baseline only. The wind/shallow-water offset is applied
+    separately and start-only by compute_next_window_with_wind (driven by the
+    scheduler at each worst-case grounding); it is deliberately not a parameter
+    here, so ``wind_adjusted`` is always False on these windows.
 
     Returns list of window dicts:
         hw_timestamp, hw_height_m, start_time, end_time, duration_minutes,
@@ -270,14 +259,7 @@ def compute_access_windows(
         hw_dt = hw["dt"]
         hw_height = hw["height_m"]
         hw_ts_str = to_utc_str(hw_dt)
-
-        # Determine whether wind offset applies to THIS HW
-        if wind_offset_hw_timestamp is not None:
-            wind_applied_here = (hw_ts_str == wind_offset_hw_timestamp)
-        else:
-            wind_applied_here = (wind_offset_m > 0)
-
-        threshold = base_threshold + (wind_offset_m if wind_applied_here else 0.0)
+        threshold = base_threshold
 
         # If HW height is below threshold, no access window
         if hw_height < threshold:
@@ -289,7 +271,7 @@ def compute_access_windows(
                 "duration_minutes": 0,
                 "source": source,
                 "below_threshold": True,
-                "wind_adjusted": wind_applied_here,
+                "wind_adjusted": False,
             })
             continue
 
@@ -353,7 +335,7 @@ def compute_access_windows(
                     "below_threshold": False,
                     "incomplete_data": False,
                     "always_accessible": True,
-                    "wind_adjusted": wind_applied_here,
+                    "wind_adjusted": False,
                 })
                 continue
             # else: fall through to the incomplete-data window below
@@ -373,10 +355,132 @@ def compute_access_windows(
             "below_threshold": False,
             "incomplete_data": not (start_time and end_time),
             "always_accessible": False,
-            "wind_adjusted": wind_applied_here,
+            "wind_adjusted": False,
         })
 
     return windows
+
+
+def _window_for_hw(windows: list[dict], hw_timestamp: str) -> Optional[dict]:
+    """Pick the window whose HW matches hw_timestamp from a compute result."""
+    for w in windows:
+        if w["hw_timestamp"] == hw_timestamp:
+            return w
+    return None
+
+
+def _is_bounded(w: Optional[dict]) -> bool:
+    """True if w is a normal bounded window with a real start and end."""
+    return bool(
+        w is not None
+        and not w.get("below_threshold")
+        and not w.get("always_accessible")
+        and not w.get("incomplete_data")
+        and w.get("start_time")
+        and w.get("end_time")
+    )
+
+
+def compute_next_window_with_wind(
+    events: list[dict],
+    draught_m: float,
+    drying_height_m: float,
+    safety_margin_m: float,
+    next_hw_timestamp: str,
+    wind_offset_m: float,
+    source: str = "ukho",
+    interval_minutes: int = 3,
+) -> Optional[dict]:
+    """
+    Compute the single access window for the HW at ``next_hw_timestamp``,
+    applying the wind/shallow-water offset to the window's START only.
+
+    ``wind_offset_m`` is the extra drying height to require while the wind is
+    pushing the boat toward its shallow side (0 when the wind is favourable).
+    It is applied only to the flood-side (start) crossing of the next window;
+    the ebb-side (end / grounding) keeps the baseline threshold, because the
+    grounding is a deterministic sampling trigger that gets its own fresh wind
+    reading next cycle.
+
+    Why this lives outside ``compute_access_windows``: the offset is asymmetric
+    (start only) and the always-accessible/no-access transitions need both a
+    baseline and an offset evaluation. Rather than thread that through the core
+    threshold logic, this helper calls ``compute_access_windows`` twice -- at
+    ``safety_margin_m`` and at ``safety_margin_m + wind_offset_m`` -- and merges
+    the two results. The core function is left untouched.
+
+    Returns one window dict (same shape as ``compute_access_windows`` entries,
+    plus a ``wind_no_access`` flag for the wind-induced no-access marker), or
+    ``None`` if ``next_hw_timestamp`` is not among ``events``.
+
+    The result always carries ``wind_adjusted=True`` (this HW *was* wind-
+    evaluated) regardless of whether the offset ended up being applied, so the
+    feed can distinguish "checked, favourable" from "not checked".
+
+    Merge logic (baseline state vs state at base+offset):
+      baseline below_threshold          -> below_threshold (offset irrelevant)
+      baseline bounded, Delta-start ok  -> start = Delta-start, end = baseline end
+      baseline bounded, Delta-start gone-> wind_no_access marker (start=end=HW)
+      baseline always_accessible:
+          still always at base+Delta    -> always_accessible
+          grounds at base+Delta         -> full base+Delta window (start + end)
+    """
+    base_windows = compute_access_windows(
+        events, draught_m, drying_height_m, safety_margin_m,
+        source=source, interval_minutes=interval_minutes,
+    )
+    w_base = _window_for_hw(base_windows, next_hw_timestamp)
+    if w_base is None:
+        return None
+
+    result = dict(w_base)
+    result["wind_adjusted"] = True
+
+    # Favourable wind (or no offset configured): baseline window stands.
+    if wind_offset_m <= 0:
+        return result
+
+    # No-access even at baseline: the tide is unsafe regardless of wind, and
+    # the offset can only make it worse. Report the baseline state unchanged.
+    if w_base.get("below_threshold"):
+        return result
+
+    delta_windows = compute_access_windows(
+        events, draught_m, drying_height_m, safety_margin_m + wind_offset_m,
+        source=source, interval_minutes=interval_minutes,
+    )
+    w_delta = _window_for_hw(delta_windows, next_hw_timestamp)
+
+    if w_base.get("always_accessible"):
+        # Baseline never grounds this cycle, but the offset may push the trough
+        # below the keel and create a grounding -- surface the emergent window
+        # (start AND end). If it still never grounds, stay always-accessible.
+        if _is_bounded(w_delta):
+            result["always_accessible"] = False
+            result["start_time"] = w_delta["start_time"]
+            result["end_time"] = w_delta["end_time"]
+            result["duration_minutes"] = w_delta["duration_minutes"]
+        return result
+
+    # Baseline is a normal bounded window: apply the offset to the START only.
+    if _is_bounded(w_delta):
+        start_delta = dtparse.parse(w_delta["start_time"])
+        end_base = dtparse.parse(result["end_time"])
+        result["start_time"] = w_delta["start_time"]
+        result["duration_minutes"] = round(
+            (end_base - start_delta).total_seconds() / 60
+        )
+        return result
+
+    # The offset lifts the safe threshold above even HW: the boat still floats
+    # off (it grounds at the lower baseline keel line, which is why the chain
+    # still triggers), but there is no safe-access window this tide. Emit a
+    # zero-duration marker so the feed shows *why* the window vanished.
+    result["start_time"] = next_hw_timestamp
+    result["end_time"] = next_hw_timestamp
+    result["duration_minutes"] = 0
+    result["wind_no_access"] = True
+    return result
 
 
 def _find_crossing(

@@ -95,6 +95,14 @@ def build_event_title(window: dict, source: str,
     """
     prefix = "est. " if source == "harmonic" else ""
 
+    if window.get("wind_no_access"):
+        if boat_name:
+            return f"\u2693 {prefix}{boat_name} - No access (wind-blown to shallows)"
+        elif mooring_id:
+            return f"\u2693 {prefix}#{mooring_id} - No access (wind-blown to shallows)"
+        else:
+            return f"\u2693 {prefix}No safe access - wind-blown to shallows"
+
     if window.get("always_accessible"):
         if boat_name:
             return f"\u2693 {prefix}{boat_name} - Always afloat"
@@ -126,7 +134,15 @@ def _build_description(ev_data: dict, tz, calibration: dict = None) -> str:
     if ev_data.get("hw_height_m") is not None:
         lines.append(f"Height: {ev_data['hw_height_m']:.1f}m")
 
-    if ev_data.get("always_accessible"):
+    # A zero-duration stored event (start_time == end_time) is the wind-induced
+    # no-access marker: the boat floats off but there is no safe-access window
+    # this tide because the wind has pushed it toward the shallows. Real windows
+    # always have end_time > start_time and below-threshold tides are never
+    # stored, so this comparison uniquely identifies the marker without needing
+    # a dedicated column.
+    if ev_data.get("start_time") and ev_data.get("start_time") == ev_data.get("end_time"):
+        lines.append("No safe access this tide - wind pushed the boat toward the shallows")
+    elif ev_data.get("always_accessible"):
         lines.append("Tide stays above threshold - always afloat this cycle")
 
     lines.append(f"Source: {ev_data.get('source', 'unknown')}")
@@ -171,9 +187,9 @@ def _build_description(ev_data: dict, tz, calibration: dict = None) -> str:
         if wind_spd is not None:
             # Convert m/s to knots for sailors
             wind_kts = wind_spd * 1.944
-            lines.append(f"Wind at ebb: {wind_dir} {wind_kts:.0f}kts")
+            lines.append(f"Wind at grounding: {wind_dir} {wind_kts:.0f}kts")
         else:
-            lines.append(f"Wind at ebb: {wind_dir}")
+            lines.append(f"Wind at grounding: {wind_dir}")
         if wind_off > 0:
             lines.append(f"Offset applied: +{wind_off:.1f}m drying height")
         else:

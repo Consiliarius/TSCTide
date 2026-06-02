@@ -15,13 +15,15 @@ classified "wind_offset" only when ALL of the following hold:
      calibration is the mechanism by which that value is discovered,
      so requiring it pre-set would prevent bootstrapping.
   2. The observation has a direction_of_lay recorded.
-  3. The observation falls within the interval [HW_n + 4h, HW_{n+1}]
-     of the preceding high water HW_n, where HW_n + 4h is the nominal
-     wind sample time.
-  4. A wind observation exists within +/- 60 minutes of HW_n + 4h.
-  5. That wind was pushing the boat toward the configured shallow side
+  3. A wind observation exists during the same tidal cycle (between the
+     preceding HW and the following HW). Wind samples are now taken
+     per-mooring at each vessel's worst-case grounding, so their exact
+     time varies; matching is by cycle, not by a fixed nominal time.
+     (Historical HW+4h samples still fall within their cycle, so this is
+     backward-compatible with data recorded under the old scheduler.)
+  4. That wind was pushing the boat toward the configured shallow side
      (same three-sector test as should_apply_offset).
-  6. The observation's direction_of_lay is within one compass sector
+  5. The observation's direction_of_lay is within one compass sector
      of the matched wind direction, confirming a wind-driven grounding.
 
 The downstream calibration functions apply a further arithmetic test:
@@ -39,15 +41,10 @@ from datetime import datetime, timedelta, timezone
 from dateutil import parser as dtparse
 
 from app.wind import COMPASS_POINTS, should_apply_offset
-from app.config import WIND_SAMPLE_HW_OFFSET_HOURS
 
-# Tolerance when matching an HW+offset nominal sample time to an actual
-# stored wind observation. The scheduler normally fires on time, but
-# OWM calls can be late, the server may have been down briefly, or the
-# sample time may have shifted. 60 minutes covers these cases without
-# letting a wind reading from a neighbouring cycle leak in, since
-# successive HWs are ~12h25m apart.
-WIND_SAMPLE_TOLERANCE_MINUTES = 60
+# Average tidal cycle length, used to bound "this cycle" when the following
+# HW is not present in the supplied tide data (edge of the data window).
+_AVG_CYCLE_HOURS = 12.4167
 
 
 def _parse_utc(ts):
@@ -101,14 +98,24 @@ def _find_preceding_hw(obs_dt, sorted_hw_events):
     return preceding
 
 
-def _find_nearest_wind_sample(target_dt, wind_observations, tolerance_minutes):
+def _find_following_hw(after_dt, sorted_hw_events):
+    """Return the first HW dict strictly after after_dt, or None."""
+    for hw in sorted_hw_events:
+        if _parse_utc(hw["timestamp"]) > after_dt:
+            return hw
+    return None
+
+
+def _find_cycle_wind_sample(obs_dt, cycle_start_dt, cycle_end_dt, wind_observations):
     """
-    Return the wind observation closest to target_dt whose timestamp is
-    within +/- tolerance_minutes, or None if nothing qualifies.
+    Return the wind observation taken during this tidal cycle
+    [cycle_start_dt, cycle_end_dt) that is nearest to obs_dt, or None.
+
+    Wind samples are taken per-mooring at each vessel's worst-case grounding,
+    so the exact time varies; wind is ~constant across a cycle, so the cycle's
+    sample nearest the observation is the right correlate regardless of which
+    mooring's grounding produced it.
     """
-    window = timedelta(minutes=tolerance_minutes)
-    lo = target_dt - window
-    hi = target_dt + window
     best = None
     best_diff = None
     for w in wind_observations:
@@ -116,18 +123,16 @@ def _find_nearest_wind_sample(target_dt, wind_observations, tolerance_minutes):
         if not ts:
             continue
         w_dt = _parse_utc(ts)
-        if w_dt < lo or w_dt > hi:
+        if w_dt < cycle_start_dt or w_dt >= cycle_end_dt:
             continue
-        diff = abs((w_dt - target_dt).total_seconds())
+        diff = abs((w_dt - obs_dt).total_seconds())
         if best_diff is None or diff < best_diff:
             best = w
             best_diff = diff
     return best
 
 
-def classify_observation(obs, mooring, sorted_hw_events, wind_observations,
-                         offset_hours=WIND_SAMPLE_HW_OFFSET_HOURS,
-                         wind_tolerance_minutes=WIND_SAMPLE_TOLERANCE_MINUTES):
+def classify_observation(obs, mooring, sorted_hw_events, wind_observations):
     """
     Classify a single observation as "base" or "wind_offset".
 
@@ -189,25 +194,26 @@ def classify_observation(obs, mooring, sorted_hw_events, wind_observations,
     preceding_hw_dt = _parse_utc(preceding_hw["timestamp"])
     result["hw_timestamp"] = preceding_hw["timestamp"]
 
-    # Observation must fall in [HW + offset, next HW]. Observations before
-    # HW+offset cannot be classified against this cycle's wind sample,
-    # which only exists from that point onwards.
-    hw_plus_offset = preceding_hw_dt + timedelta(hours=offset_hours)
-    if obs_dt < hw_plus_offset:
-        result["reason"] = (
-            f"observation before HW+{offset_hours:g}h sample window"
-        )
-        return result
+    # Bound this tidal cycle: from the preceding HW to the following HW (or
+    # +1 average cycle if the next HW is beyond the supplied tide data).
+    following_hw = _find_following_hw(preceding_hw_dt, sorted_hw_events)
+    cycle_end_dt = (
+        _parse_utc(following_hw["timestamp"]) if following_hw
+        else preceding_hw_dt + timedelta(hours=_AVG_CYCLE_HOURS)
+    )
 
-    # Locate the HW+offset wind sample.
-    wind_sample = _find_nearest_wind_sample(
-        hw_plus_offset, wind_observations, wind_tolerance_minutes
+    # Match the wind sample taken during this cycle, nearest the observation.
+    # Samples are taken per-mooring at each vessel's worst-case grounding, so
+    # the exact time varies; wind is ~constant across a cycle (the persistence
+    # assumption the offset feature relies on), so the cycle's nearest sample
+    # is the right correlate regardless of which mooring's grounding produced
+    # it. Old HW+4h samples also fall within their cycle, so historical data
+    # still classifies.
+    wind_sample = _find_cycle_wind_sample(
+        obs_dt, preceding_hw_dt, cycle_end_dt, wind_observations
     )
     if not wind_sample:
-        result["reason"] = (
-            f"no HW+{offset_hours:g}h wind sample within "
-            f"+/-{wind_tolerance_minutes}min"
-        )
+        result["reason"] = "no wind sample in this tidal cycle"
         return result
 
     wind_compass = wind_sample.get("direction_compass") or ""
@@ -240,9 +246,7 @@ def classify_observation(obs, mooring, sorted_hw_events, wind_observations,
     return result
 
 
-def classify_observations(observations, mooring, hw_events, wind_observations,
-                          offset_hours=WIND_SAMPLE_HW_OFFSET_HOURS,
-                          wind_tolerance_minutes=WIND_SAMPLE_TOLERANCE_MINUTES):
+def classify_observations(observations, mooring, hw_events, wind_observations):
     """
     Classify all observations in bulk. Returns a list of dicts:
       [{"observation": <obs>, "classification": "...", "reason": "...",
@@ -258,9 +262,7 @@ def classify_observations(observations, mooring, hw_events, wind_observations,
     out = []
     for obs in observations:
         c = classify_observation(
-            obs, mooring, sorted_hws, wind_observations,
-            offset_hours=offset_hours,
-            wind_tolerance_minutes=wind_tolerance_minutes,
+            obs, mooring, sorted_hws, wind_observations
         )
         out.append({"observation": obs, **c})
     return out

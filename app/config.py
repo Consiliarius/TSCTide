@@ -35,7 +35,6 @@ UKHO_FALLBACK_STATION_ID = os.environ.get("UKHO_FALLBACK_STATION_ID", "0065")
 # Scheduling
 UKHO_FETCH_HOUR = int(os.environ.get("UKHO_FETCH_HOUR", "2"))
 UKHO_FETCH_MINUTE = int(os.environ.get("UKHO_FETCH_MINUTE", "0"))
-WIND_SAMPLE_HW_OFFSET_HOURS = float(os.environ.get("WIND_SAMPLE_HW_OFFSET_HOURS", "4"))
 
 # Location for OWM
 LOCATION_LAT = float(os.environ.get("LOCATION_LAT", "50.8185"))

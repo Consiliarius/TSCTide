@@ -3,14 +3,16 @@ Job scheduler for automated data fetching and recalculation.
 
 Two APScheduler-registered job types:
 1. Fixed: Daily UKHO fetch at 02:00 (configurable). See daily_ukho_fetch.
-2. Dynamic: OWM wind observation jobs at HW+offset, scheduled by
-   _schedule_wind_jobs from inside daily_ukho_fetch (and on manual UKHO
-   refresh). See wind_observation_job.
+2. Dynamic: per-mooring OWM wind observation jobs at each vessel's *worst-case
+   grounding* (drying + draught + shallow_extra_depth_m), enumerated by
+   ensure_wind_jobs_scheduled from the daily fetch, manual refresh, startup,
+   and the conditions-refresh safety net. See wind_observation_job.
 
-The "reactive" recalculation of access windows after a wind sample lands
-is the body of wind_observation_job - it is not a separately-registered
-job type, just the work that the dynamic job does once it has its
-wind reading.
+A wind reading taken at a grounding adjusts only the START of that mooring's
+*next* access window (vessel and tender); the next grounding -- already
+enumerated -- drives the sample for the window after that, and so on. The
+"reactive" recalculation is the body of wind_observation_job; it is not a
+separately-registered job type.
 """
 
 import asyncio
@@ -22,13 +24,23 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 
 from app.config import (to_utc_str,
-    UKHO_FETCH_HOUR, UKHO_FETCH_MINUTE, WIND_SAMPLE_HW_OFFSET_HOURS,
+    UKHO_FETCH_HOUR, UKHO_FETCH_MINUTE,
     UKHO_STATION_ID, UKHO_FALLBACK_STATION_ID, DEFAULT_TIMEZONE,
 )
 
 logger = logging.getLogger(__name__)
 
 scheduler = AsyncIOScheduler(timezone=DEFAULT_TIMEZONE)
+
+# When several moorings ground close together, reuse a recent stored wind
+# reading rather than making a near-identical OWM call per mooring. Wind is
+# assumed roughly constant over this span (consistent with the persistence
+# assumption the whole offset feature relies on).
+WIND_REUSE_MAX_AGE_MINUTES = 15
+
+# How far ahead to enumerate worst-case groundings for wind sampling. UKHO
+# data typically spans about a week; we schedule against whatever exists.
+WIND_SCHEDULE_HORIZON_DAYS = 14
 
 
 def start_scheduler():
@@ -61,15 +73,14 @@ def start_scheduler():
         message=(
             f"Application started. Daily UKHO fetch scheduled for "
             f"{UKHO_FETCH_HOUR:02d}:{UKHO_FETCH_MINUTE:02d}. "
-            f"OWM wind checks will be scheduled at HW+{WIND_SAMPLE_HW_OFFSET_HOURS:g}h "
-            f"once UKHO tide data is fetched (either at the next scheduled run "
-            f"or via manual 'Refresh UKHO Data')."
+            f"Per-mooring wind checks are scheduled at each vessel's worst-case "
+            f"grounding once UKHO tide data is fetched (at the next scheduled "
+            f"run, on startup, or via manual 'Refresh UKHO Data')."
         ),
         severity="info",
         details={
             "daily_ukho_fetch_time_local": f"{UKHO_FETCH_HOUR:02d}:{UKHO_FETCH_MINUTE:02d}",
             "timezone": DEFAULT_TIMEZONE,
-            "wind_sample_hw_offset_hours": WIND_SAMPLE_HW_OFFSET_HOURS,
         },
     )
 
@@ -131,8 +142,9 @@ async def daily_ukho_fetch():
     else:
         calc_events = events
 
-    # Schedule wind observation jobs for today's ebbing tides
-    await _schedule_wind_jobs(calc_events)
+    # Schedule per-mooring wind observation jobs at each worst-case grounding.
+    # Reads moorings + freshly-stored tide events from the DB, so no args.
+    ensure_wind_jobs_scheduled()
 
     # Recalculate access windows for all calendar-enabled moorings
     moorings = get_calendar_enabled_moorings()
@@ -368,252 +380,373 @@ async def daily_ukho_fetch():
     prune_activity_log(system_days=30, mooring_days=7)
 
 
-async def _schedule_wind_jobs(events: list[dict]) -> list[dict]:
+def _wind_enabled_moorings() -> list[dict]:
+    """Calendar-enabled moorings with a usable wind/shallow-water offset."""
+    from app.database import get_calendar_enabled_moorings
+
+    out = []
+    for m in get_calendar_enabled_moorings():
+        if not m.get("wind_offset_enabled"):
+            continue
+        if not (m.get("shallow_direction") or ""):
+            continue
+        if float(m.get("shallow_extra_depth_m") or 0.0) <= 0:
+            continue
+        out.append(m)
+    return out
+
+
+def _purge_wind_jobs():
+    """Remove all scheduled per-mooring wind-sample jobs."""
+    for job in scheduler.get_jobs():
+        if (job.id or "").startswith("wind_sample_"):
+            try:
+                scheduler.remove_job(job.id)
+            except Exception:
+                pass
+
+
+def ensure_wind_jobs_scheduled() -> list[dict]:
     """
-    Schedule OWM wind observation calls at HW+offset for each high water
-    in the fetched data. Only schedules for future times.
-    Returns a list of scheduled job details for logging.
+    (Re)schedule per-mooring wind-sample jobs at each future worst-case
+    grounding. Idempotent: purges existing wind_sample_* jobs and rebuilds
+    from current UKHO data + mooring config, so it is safe to call from
+    startup, the daily fetch, a manual refresh, a mooring-config save, and
+    the periodic conditions-refresh safety net.
+
+    Trigger time per mooring/tide is the ebb crossing of
+    ``drying + draught + shallow_extra_depth_m`` -- the *worst-case* grounding,
+    the earliest the boat could touch if the wind pushes it into the shallows.
+    Sampling there means we read the wind at the first moment grounding is
+    possible; if the wind turns out favourable we simply record no offset.
+
+    Threshold (config offset, always) vs effect (wind-conditional) is the key
+    distinction that keeps trigger times deterministic: the schedule uses the
+    configured offset unconditionally, while whether the offset is *applied* to
+    the next window depends on the wind actually read at fire time.
+
+    Where a tide is too low to reach the worst-case level but the boat still
+    floats, we fall back to the real keel-line grounding (``drying + draught``)
+    so the chain does not break on a no-access tide. A tide that never grounds
+    even in the worst case (deep mooring, high neap LW) correctly gets no
+    trigger -- there is no grounding risk to sample for.
+
+    Returns a list of scheduled job descriptors (for logging/inspection).
     """
-    from app.database import log_activity
+    from app.database import get_ukho_tide_events, log_activity
+    from app.access_calc import compute_access_windows
 
     now = datetime.now(timezone.utc)
-    offset_hours = WIND_SAMPLE_HW_OFFSET_HOURS
+    events = get_ukho_tide_events(
+        to_utc_str(now - timedelta(hours=12)),
+        to_utc_str(now + timedelta(days=WIND_SCHEDULE_HORIZON_DAYS)),
+    )
+    moorings = _wind_enabled_moorings()
 
-    hw_events = [e for e in events if e["event_type"] == "HighWater"]
+    _purge_wind_jobs()
+
+    if not events or not moorings:
+        return []
+
+    sorted_hws = sorted(
+        [e for e in events if e["event_type"] == "HighWater"],
+        key=lambda e: e["timestamp"],
+    )
+
     scheduled = []
+    for m in moorings:
+        draught = m["draught_m"]
+        drying = m["drying_height_m"]
+        offset = float(m["shallow_extra_depth_m"])
 
-    for hw in hw_events:
-        hw_dt = dtparse.parse(hw["timestamp"])
-        if hw_dt.tzinfo is None:
-            hw_dt = hw_dt.replace(tzinfo=timezone.utc)
+        # Worst-case groundings: ebb crossings of drying+draught+offset.
+        # margin=0 windows give the real keel-line grounding for the fallback.
+        worst = compute_access_windows(events, draught, drying, offset, source="ukho")
+        real = compute_access_windows(events, draught, drying, 0.0, source="ukho")
+        real_by_hw = {w["hw_timestamp"]: w for w in real}
 
-        sample_time = hw_dt + timedelta(hours=offset_hours)
+        for w in worst:
+            if w.get("always_accessible"):
+                # Never grounds even in the worst case -> no grounding risk.
+                continue
 
-        if sample_time <= now:
-            continue
+            ground_end = None
+            if not w.get("below_threshold") and not w.get("incomplete_data"):
+                ground_end = w.get("end_time")
+            if not ground_end:
+                # Worst-case threshold not reached this tide; fall back to the
+                # real keel-line grounding so a low/no-access tide still fires.
+                rw = real_by_hw.get(w["hw_timestamp"])
+                if rw and not rw.get("always_accessible") and not rw.get("below_threshold"):
+                    ground_end = rw.get("end_time")
+            if not ground_end:
+                continue
 
-        job_id = f"wind_sample_{hw_dt.strftime('%Y%m%dT%H%M')}"
+            ground_dt = dtparse.parse(ground_end)
+            if ground_dt.tzinfo is None:
+                ground_dt = ground_dt.replace(tzinfo=timezone.utc)
+            if ground_dt <= now:
+                continue
 
-        try:
-            scheduler.add_job(
-                wind_observation_job,
-                DateTrigger(run_date=sample_time),
-                id=job_id,
-                replace_existing=True,
-                name=f"Wind sample at HW+{offset_hours:g}h ({hw_dt.strftime('%H:%M')})",
-                kwargs={"hw_timestamp": hw["timestamp"]},
+            # The wind read at this grounding adjusts the NEXT high water's
+            # window start. Normalise to canonical UTC-Z form so it matches the
+            # hw_timestamp that compute_access_windows produces internally.
+            next_hw_ts = None
+            for he in sorted_hws:
+                he_dt = dtparse.parse(he["timestamp"])
+                if he_dt.tzinfo is None:
+                    he_dt = he_dt.replace(tzinfo=timezone.utc)
+                if he_dt > ground_dt:
+                    next_hw_ts = to_utc_str(he_dt)
+                    break
+            if next_hw_ts is None:
+                continue
+
+            job_id = (
+                f"wind_sample_m{m['mooring_id']}_"
+                f"{ground_dt.strftime('%Y%m%dT%H%M')}"
             )
-            logger.info(f"Scheduled wind observation at {sample_time.isoformat()}")
-            scheduled.append({
-                "hw_timestamp": hw["timestamp"],
-                "sample_time": to_utc_str(sample_time),
-            })
-        except Exception as e:
-            logger.warning(f"Could not schedule wind job: {e}")
+            try:
+                scheduler.add_job(
+                    wind_observation_job,
+                    DateTrigger(run_date=ground_dt),
+                    id=job_id,
+                    replace_existing=True,
+                    name=(
+                        f"Wind sample m{m['mooring_id']} @ worst-case grounding "
+                        f"{ground_dt.strftime('%d %b %H:%M')}"
+                    ),
+                    kwargs={
+                        "mooring_id": m["mooring_id"],
+                        "next_hw_timestamp": next_hw_ts,
+                    },
+                )
+                scheduled.append({
+                    "mooring_id": m["mooring_id"],
+                    "grounding": to_utc_str(ground_dt),
+                    "next_hw": next_hw_ts,
+                })
+            except Exception as e:
+                logger.warning(f"Could not schedule wind job {job_id}: {e}")
 
     if scheduled:
-        import pytz
-        tz = pytz.timezone(DEFAULT_TIMEZONE)
-        display_count = min(4, len(scheduled))
-        sample_times_local = []
-        for s in scheduled[:display_count]:
-            dt = dtparse.parse(s["sample_time"])
-            local = dt.astimezone(tz)
-            sample_times_local.append(local.strftime("%d %b %H:%M"))
-        more = f" (+{len(scheduled) - display_count} more)" if len(scheduled) > display_count else ""
+        logger.info(
+            f"Scheduled {len(scheduled)} wind sample(s) at worst-case "
+            f"groundings for {len(moorings)} mooring(s)"
+        )
         log_activity(
             event_type="wind_schedule",
             message=(
-                f"Scheduled {len(scheduled)} OWM wind check(s) at HW+{offset_hours:g}h. "
-                f"Next: {', '.join(sample_times_local)}{more}"
+                f"Scheduled {len(scheduled)} wind sample(s) at worst-case "
+                f"groundings across {len(moorings)} wind-enabled mooring(s)"
             ),
             severity="info",
-            details={
-                "count": len(scheduled),
-                "offset_hours": offset_hours,
-                "upcoming_sample_times": [s["sample_time"] for s in scheduled],
-            },
-        )
-    else:
-        log_activity(
-            event_type="wind_schedule",
-            message=f"No future HW events to schedule wind checks against",
-            severity="warning",
-            details={"offset_hours": offset_hours},
+            details={"count": len(scheduled), "samples": scheduled[:20]},
         )
     return scheduled
 
 
-async def wind_observation_job(hw_timestamp: str):
+async def _get_wind_for_sample():
     """
-    Triggered at HW+offset: fetch current wind and recalculate
-    the next flood tide's access window for all wind-enabled moorings.
+    Return a wind reading for an offset check, reusing a very recent stored
+    observation when one exists (so several moorings grounding close together
+    don't each trigger a near-identical OWM call), otherwise fetching fresh and
+    storing it. Returns a dict with direction_compass / direction_deg /
+    speed_ms / timestamp, or None on failure.
     """
-    from app.wind import fetch_current_wind, should_apply_offset
-    from app.database import (
-        store_wind_observation, get_calendar_enabled_moorings,
-        get_ukho_tide_events, calibrate_drying_height, log_activity,
-    )
-    from app.access_calc import compute_access_windows
-    from app.ical_manager import store_windows_as_events, generate_feed_for_mooring
+    from app.wind import fetch_current_wind
+    from app.database import get_latest_wind, store_wind_observation
 
-    logger.info(f"Running wind observation job for HW {hw_timestamp}")
+    recent = get_latest_wind()
+    if recent and recent.get("direction_compass"):
+        try:
+            ts = dtparse.parse(recent["timestamp"])
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            age_min = (datetime.now(timezone.utc) - ts).total_seconds() / 60.0
+            if 0 <= age_min <= WIND_REUSE_MAX_AGE_MINUTES:
+                return {
+                    "direction_deg": recent.get("direction_deg"),
+                    "direction_compass": recent["direction_compass"],
+                    "speed_ms": recent.get("speed_ms") or 0.0,
+                    "timestamp": recent["timestamp"],
+                }
+        except (ValueError, TypeError):
+            pass
 
     wind = await fetch_current_wind()
+    if wind:
+        store_wind_observation(
+            timestamp=wind["timestamp"],
+            direction_deg=wind["direction_deg"],
+            direction_compass=wind["direction_compass"],
+            speed_ms=wind["speed_ms"],
+        )
+    return wind
+
+
+async def wind_observation_job(mooring_id: int, next_hw_timestamp: str):
+    """
+    Fired at a mooring's worst-case grounding: read the wind now and adjust the
+    START of that mooring's NEXT access window (vessel and tender), leaving the
+    ebb-side grounding at baseline.
+
+    Writes exactly the one next-HW event (upsert by cycle UID) so it cannot
+    clobber a sibling window already adjusted by an earlier grounding's job.
+    """
+    from app.wind import should_apply_offset
+    from app.database import (
+        get_mooring, get_ukho_tide_events, calibrate_drying_height, log_activity,
+    )
+    from app.access_calc import compute_next_window_with_wind
+    from app.ical_manager import store_windows_as_events, generate_feed_for_mooring
+
+    m = get_mooring(mooring_id)
+    if not m or not m.get("wind_offset_enabled"):
+        return
+    shallow_dir = m.get("shallow_direction") or ""
+    extra_depth = float(m.get("shallow_extra_depth_m") or 0.0)
+    if not shallow_dir or extra_depth <= 0:
+        # Config changed since the job was scheduled; nothing to do.
+        return
+
+    logger.info(
+        f"Wind observation job: mooring {mooring_id}, next HW {next_hw_timestamp}"
+    )
+
+    wind = await _get_wind_for_sample()
     if not wind:
-        logger.warning("Could not fetch wind data")
         log_activity(
             event_type="wind_check",
             message="Wind check failed — OWM API did not return data",
             severity="error",
-            details={"hw_timestamp": hw_timestamp},
+            scope="mooring",
+            mooring_id=mooring_id,
+            details={"next_hw_timestamp": next_hw_timestamp},
         )
         return
 
-    store_wind_observation(
-        timestamp=wind["timestamp"],
-        direction_deg=wind["direction_deg"],
-        direction_compass=wind["direction_compass"],
-        speed_ms=wind["speed_ms"],
-    )
+    offset_triggered = should_apply_offset(wind["direction_compass"], shallow_dir)
+    wind_offset = extra_depth if offset_triggered else 0.0
+    wind_kts = (wind.get("speed_ms") or 0.0) * 1.944
 
-    wind_kts = wind["speed_ms"] * 1.944
     log_activity(
         event_type="wind_check",
-        message=f"Wind at HW+{WIND_SAMPLE_HW_OFFSET_HOURS:g}h: {wind['direction_compass']} {wind_kts:.0f}kts",
+        message=f"Wind at grounding: {wind['direction_compass']} {wind_kts:.0f}kts",
         severity="info",
+        scope="mooring",
+        mooring_id=mooring_id,
         details={
-            "hw_timestamp": hw_timestamp,
+            "next_hw_timestamp": next_hw_timestamp,
             "direction_compass": wind["direction_compass"],
-            "direction_deg": wind["direction_deg"],
-            "speed_ms": wind["speed_ms"],
+            "direction_deg": wind.get("direction_deg"),
+            "speed_ms": wind.get("speed_ms"),
             "speed_kts": round(wind_kts, 1),
         },
     )
 
-    hw_dt = dtparse.parse(hw_timestamp)
+    if offset_triggered:
+        logger.info(
+            f"Mooring {mooring_id}: wind {wind['direction_compass']}, shallow to "
+            f"{shallow_dir} — applying +{extra_depth}m to next window start"
+        )
+        log_activity(
+            event_type="wind_offset",
+            message=(
+                f"Offset APPLIED: wind {wind['direction_compass']} "
+                f"({wind_kts:.0f}kts) pushing toward shallow side ({shallow_dir}) "
+                f"— +{extra_depth:.1f}m to the next window's start"
+            ),
+            severity="warning",
+            scope="mooring",
+            mooring_id=mooring_id,
+            details={
+                "wind_direction": wind["direction_compass"],
+                "wind_speed_kts": round(wind_kts, 1),
+                "shallow_direction": shallow_dir,
+                "offset_m": extra_depth,
+                "applied": True,
+                "next_hw_timestamp": next_hw_timestamp,
+            },
+        )
+    else:
+        log_activity(
+            event_type="wind_offset",
+            message=(
+                f"Offset not applied: wind {wind['direction_compass']} "
+                f"({wind_kts:.0f}kts) not pushing toward shallow side ({shallow_dir})"
+            ),
+            severity="info",
+            scope="mooring",
+            mooring_id=mooring_id,
+            details={
+                "wind_direction": wind["direction_compass"],
+                "wind_speed_kts": round(wind_kts, 1),
+                "shallow_direction": shallow_dir,
+                "offset_m": 0,
+                "applied": False,
+                "next_hw_timestamp": next_hw_timestamp,
+            },
+        )
+
+    # Fetch enough tide data to bracket the next HW (flood LW before, ebb LW
+    # after). get_ukho_tide_events applies the Langstone offset to any
+    # Portsmouth fallback data automatically.
+    hw_dt = dtparse.parse(next_hw_timestamp)
     if hw_dt.tzinfo is None:
         hw_dt = hw_dt.replace(tzinfo=timezone.utc)
-
-    # Use get_ukho_tide_events so Portsmouth fallback data receives the
-    # Langstone offset automatically.
-    search_start = to_utc_str(hw_dt + timedelta(hours=4))
-    search_end = to_utc_str(hw_dt + timedelta(hours=18))
-    next_events = get_ukho_tide_events(search_start, search_end)
-
-    if not next_events:
-        logger.info("No upcoming tide events found for wind adjustment")
+    events = get_ukho_tide_events(
+        to_utc_str(hw_dt - timedelta(hours=8)),
+        to_utc_str(hw_dt + timedelta(hours=8)),
+    )
+    if not events:
+        logger.info("No tide events around next HW for wind adjustment")
         return
 
-    moorings = get_calendar_enabled_moorings()
-    for m in moorings:
-        if not m.get("wind_offset_enabled"):
-            continue
-
-        shallow_dir = m.get("shallow_direction", "")
-        extra_depth = m.get("shallow_extra_depth_m", 0.0)
-
-        if not shallow_dir or extra_depth <= 0:
-            continue
-
-        offset_triggered = should_apply_offset(wind["direction_compass"], shallow_dir)
-        wind_offset = extra_depth if offset_triggered else 0.0
-
-        if offset_triggered:
+    try:
+        window = compute_next_window_with_wind(
+            events, m["draught_m"], m["drying_height_m"], m["safety_margin_m"],
+            next_hw_timestamp, wind_offset, source="ukho",
+        )
+        if window is None:
             logger.info(
-                f"Mooring {m['mooring_id']}: wind from {wind['direction_compass']}, "
-                f"shallow to {shallow_dir} — applying +{extra_depth}m offset"
+                f"Next HW {next_hw_timestamp} not found in events; skipping"
             )
-            log_activity(
-                event_type="wind_offset",
-                message=(
-                    f"Offset APPLIED: wind {wind['direction_compass']} "
-                    f"({wind_kts:.0f}kts) pushing toward shallow side ({shallow_dir}) "
-                    f"— added +{extra_depth:.1f}m to drying height"
-                ),
-                severity="warning",
-                scope="mooring",
-                mooring_id=m["mooring_id"],
-                details={
-                    "wind_direction": wind["direction_compass"],
-                    "wind_speed_kts": round(wind_kts, 1),
-                    "shallow_direction": shallow_dir,
-                    "offset_m": extra_depth,
-                    "applied": True,
-                },
-            )
-        else:
-            log_activity(
-                event_type="wind_offset",
-                message=(
-                    f"Offset not applied: wind {wind['direction_compass']} "
-                    f"({wind_kts:.0f}kts) not pushing toward shallow side ({shallow_dir})"
-                ),
-                severity="info",
-                scope="mooring",
-                mooring_id=m["mooring_id"],
-                details={
-                    "wind_direction": wind["direction_compass"],
-                    "wind_speed_kts": round(wind_kts, 1),
-                    "shallow_direction": shallow_dir,
-                    "offset_m": 0,
-                    "applied": False,
-                },
-            )
+            return
 
-        try:
-            next_hw_ts = None
-            for e in sorted(next_events, key=lambda ev: ev["timestamp"]):
-                if e["event_type"] == "HighWater":
-                    next_hw_ts = e["timestamp"]
-                    break
-
-            windows = compute_access_windows(
-                events=next_events,
-                draught_m=m["draught_m"],
-                drying_height_m=m["drying_height_m"],
-                safety_margin_m=m["safety_margin_m"],
-                wind_offset_m=wind_offset,
-                wind_offset_hw_timestamp=next_hw_ts,
-                source="ukho",
+        tender_windows = None
+        tender_depth = None
+        if m.get("tender_access_enabled"):
+            tender_depth = float(m.get("tender_min_depth_m") or 0.3)
+            tw = compute_next_window_with_wind(
+                events, 0.0, m["drying_height_m"], tender_depth,
+                next_hw_timestamp, wind_offset, source="ukho",
             )
-            tender_windows = None
-            tender_depth = None
-            if m.get("tender_access_enabled"):
-                tender_depth = float(m.get("tender_min_depth_m") or 0.3)
-                tender_windows = compute_access_windows(
-                    events=next_events,
-                    draught_m=0.0,
-                    drying_height_m=m["drying_height_m"],
-                    safety_margin_m=tender_depth,
-                    wind_offset_m=wind_offset,
-                    wind_offset_hw_timestamp=next_hw_ts,
-                    source="ukho",
-                )
+            if tw is not None:
+                tender_windows = [tw]
 
-            cal = calibrate_drying_height(m["mooring_id"])
-            calc_params = {
-                "draught_m": m["draught_m"],
-                "drying_height_m": m["drying_height_m"],
-                "safety_margin_m": m["safety_margin_m"],
-                "obs_calibrated": 1 if cal.get("confidence", "none") != "none" else 0,
-            }
-            wind_details = {
-                "direction": wind["direction_compass"],
-                "speed_ms": wind["speed_ms"],
-                "offset_m": wind_offset,
-            }
-            store_windows_as_events(
-                windows, m["mooring_id"], "ukho", m.get("boat_name", ""),
-                calc_params=calc_params, wind_details=wind_details,
-                tender_windows=tender_windows,
-                tender_min_depth_m=tender_depth,
-            )
-            if cal.get("confidence") == "none":
-                cal = None
-            generate_feed_for_mooring(m["mooring_id"], m.get("boat_name", ""), cal)
-        except Exception as e:
-            logger.error(f"Wind recalc failed for mooring {m['mooring_id']}: {e}")
+        cal = calibrate_drying_height(mooring_id)
+        calc_params = {
+            "draught_m": m["draught_m"],
+            "drying_height_m": m["drying_height_m"],
+            "safety_margin_m": m["safety_margin_m"],
+            "obs_calibrated": 1 if cal.get("confidence", "none") != "none" else 0,
+        }
+        wind_details = {
+            "direction": wind["direction_compass"],
+            "speed_ms": wind.get("speed_ms"),
+            "offset_m": wind_offset,
+        }
+        store_windows_as_events(
+            [window], mooring_id, "ukho", m.get("boat_name", ""),
+            calc_params=calc_params, wind_details=wind_details,
+            tender_windows=tender_windows, tender_min_depth_m=tender_depth,
+        )
+        if cal.get("confidence") == "none":
+            cal = None
+        generate_feed_for_mooring(mooring_id, m.get("boat_name", ""), cal)
+    except Exception as e:
+        logger.error(f"Wind recalc failed for mooring {mooring_id}: {e}")
 
 
 async def conditions_refresh():
@@ -631,6 +764,17 @@ async def conditions_refresh():
         await get_current_conditions(force_refresh=True)
     except Exception as e:
         logger.error(f"Conditions refresh failed: {e}")
+
+    # Safety net for the in-memory job store: if a restart wiped the
+    # per-mooring wind-sample jobs, rebuild them. This is a cheap no-op when
+    # they already exist, so it does not churn the schedule every 15 minutes.
+    try:
+        if not any(
+            (j.id or "").startswith("wind_sample_") for j in scheduler.get_jobs()
+        ):
+            ensure_wind_jobs_scheduled()
+    except Exception as e:
+        logger.error(f"Wind-job safety-net reschedule failed: {e}")
 
 
 def shutdown_scheduler():

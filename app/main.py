@@ -42,7 +42,7 @@ from app.ukho import fetch_tidal_events
 from app.khm_parser import parse_khm_paste
 from app.harmonic import predict_events as harmonic_predict_events
 from app.secondary_port import apply_offset
-from app.wind import fetch_current_wind, fetch_current_weather, should_apply_offset
+from app.wind import fetch_current_wind, fetch_current_weather
 from app.conditions import get_current_conditions
 from app.access_calc import compute_access_windows, generate_event_uid, _interpolate_from_parsed
 from app.ical_manager import (
@@ -50,7 +50,7 @@ from app.ical_manager import (
     generate_feed_for_mooring,
     generate_langstone_ukho_7d_feed, generate_langstone_harmonic_180d_feed,
 )
-from app.scheduler import start_scheduler, shutdown_scheduler
+from app.scheduler import start_scheduler, shutdown_scheduler, ensure_wind_jobs_scheduled
 
 logging.basicConfig(
     level=logging.INFO,
@@ -242,8 +242,6 @@ def _compute_tender_windows(
     events: list[dict],
     mooring: dict,
     source: str,
-    wind_offset_m: float = 0.0,
-    wind_offset_hw_timestamp: Optional[str] = None,
 ) -> tuple[Optional[list[dict]], Optional[float]]:
     """
     Run a second compute_access_windows() pass with draught_m=0 and
@@ -251,9 +249,9 @@ def _compute_tender_windows(
     drying_height_m + tender_min_depth_m. Returns (windows, depth) when
     tender access is enabled on the mooring, else (None, None).
 
-    Wind offset is applied identically to the main pass because the
-    ground topography is the same; the same HW receives the offset in
-    both passes so on-screen totals stay consistent.
+    These are baseline (no wind) windows. Wind adjustment is applied
+    separately by the scheduler via compute_next_window_with_wind, which
+    runs its own tender pass with the same offset.
     """
     if not mooring or not mooring.get("tender_access_enabled"):
         return None, None
@@ -263,8 +261,6 @@ def _compute_tender_windows(
         draught_m=0.0,
         drying_height_m=mooring["drying_height_m"],
         safety_margin_m=depth,
-        wind_offset_m=wind_offset_m,
-        wind_offset_hw_timestamp=wind_offset_hw_timestamp,
         source=source,
     )
     return tw, depth
@@ -325,6 +321,13 @@ def _recompute_future_windows(mooring_id: int):
         feed_cal = cal if cal.get("confidence") != "none" else None
         generate_feed_for_mooring(mooring_id, m.get("boat_name", ""), feed_cal)
 
+    # Config/calibration changed -> reschedule wind jobs so the next grounding
+    # samples against the new draught/drying/offset. Idempotent global rebuild.
+    try:
+        ensure_wind_jobs_scheduled()
+    except Exception as e:
+        logger.warning(f"Wind-job reschedule after recompute failed: {e}")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -334,6 +337,14 @@ async def lifespan(app: FastAPI):
     load_model_config()  # Loads bundled config and warms the cache via _get_curve_params on first calc
     _warm_up_harmonic_predictions()
     start_scheduler()
+    # Rebuild per-mooring wind-sample jobs immediately on boot. The in-memory
+    # APScheduler store is empty after a restart, so without this the jobs would
+    # not exist until the next 02:00 daily fetch (the 15-min conditions refresh
+    # is a slower safety net).
+    try:
+        ensure_wind_jobs_scheduled()
+    except Exception as e:
+        logger.warning(f"Initial wind-job scheduling failed: {e}")
     logger.info("Tidal Access application started")
     yield
     shutdown_scheduler()
@@ -435,6 +446,13 @@ async def save_mooring_config(request: Request):
     )
 
     result = save_mooring(data)
+
+    # Reschedule wind-sample jobs so changes to wind/shallow or draught/drying
+    # settings take effect now rather than waiting for the next daily fetch.
+    try:
+        ensure_wind_jobs_scheduled()
+    except Exception as e:
+        logger.warning(f"Wind-job reschedule after config save failed: {e}")
 
     log_activity(
         event_type="mooring_config",
@@ -1038,6 +1056,78 @@ async def apply_wind_offset_calibration(mooring_id: int):
     }
 
 
+# --- Wind jobs (debug / ops, PIN-gated) ---
+
+@app.get("/api/moorings/{mooring_id}/wind-jobs",
+         dependencies=[Depends(require_mooring_pin)])
+async def list_wind_jobs(mooring_id: int):
+    """
+    PIN-gated: list the scheduled worst-case-grounding wind-sample jobs for
+    this mooring. Visibility into the per-mooring wind scheduler for ops/debug.
+    """
+    from app.scheduler import scheduler
+
+    prefix = f"wind_sample_m{mooring_id}_"
+    jobs = []
+    for j in scheduler.get_jobs():
+        if (j.id or "").startswith(prefix):
+            jobs.append({
+                "job_id": j.id,
+                "run_at": j.next_run_time.isoformat() if j.next_run_time else None,
+                "next_hw": (j.kwargs or {}).get("next_hw_timestamp"),
+            })
+    jobs.sort(key=lambda x: x["run_at"] or "")
+    return {"mooring_id": mooring_id, "count": len(jobs), "jobs": jobs}
+
+
+@app.post("/api/moorings/{mooring_id}/wind-check/run",
+          dependencies=[Depends(require_mooring_pin)])
+async def run_wind_check_now(mooring_id: int):
+    """
+    PIN-gated: force an immediate wind check for this mooring against its next
+    upcoming high water, exactly as the scheduled worst-case-grounding job
+    would. Lets the wind-offset behaviour be verified without waiting for a
+    real grounding. Returns the resulting stored event for that HW.
+    """
+    m = get_mooring(mooring_id)
+    if not m:
+        raise HTTPException(404, "Mooring not found")
+    if (not m.get("wind_offset_enabled")
+            or not (m.get("shallow_direction") or "")
+            or float(m.get("shallow_extra_depth_m") or 0.0) <= 0):
+        raise HTTPException(400, "Wind offset is not configured for this mooring")
+
+    from app.scheduler import wind_observation_job
+
+    now = datetime.now(timezone.utc)
+    events = get_ukho_tide_events(
+        to_utc_str(now - timedelta(hours=1)),
+        to_utc_str(now + timedelta(days=2)),
+    )
+    next_hw_ts = None
+    for e in sorted(events, key=lambda ev: ev["timestamp"]):
+        if e["event_type"] != "HighWater":
+            continue
+        hw_dt = dtparse.parse(e["timestamp"])
+        if hw_dt.tzinfo is None:
+            hw_dt = hw_dt.replace(tzinfo=timezone.utc)
+        if hw_dt > now:
+            next_hw_ts = to_utc_str(hw_dt)
+            break
+    if not next_hw_ts:
+        raise HTTPException(400, "No upcoming high water in stored tide data")
+
+    await wind_observation_job(mooring_id, next_hw_ts)
+
+    stored = get_calendar_events(mooring_id, start=next_hw_ts, end=next_hw_ts)
+    return {
+        "ran": True,
+        "mooring_id": mooring_id,
+        "next_hw": next_hw_ts,
+        "stored_event": stored[0] if stored else None,
+    }
+
+
 # --- UKHO Data ---
 
 @app.post("/api/fetch-ukho")
@@ -1068,16 +1158,11 @@ async def trigger_ukho_fetch():
         },
     )
 
-    from app.scheduler import _schedule_wind_jobs
-    # Mirror daily_ukho_fetch: when the API fell back to Portsmouth, schedule
-    # the wind sample against Langstone-corrected HW times, not the raw
-    # Portsmouth ones. Otherwise the manual-refresh path samples ~9 minutes
-    # earlier than the daily 02:00 path, drifting the two flows apart.
-    if station_label == "portsmouth":
-        calc_events = apply_offset(events)
-    else:
-        calc_events = events
-    await _schedule_wind_jobs(calc_events)
+    # Reschedule per-mooring wind jobs from the freshly-stored tide data.
+    # ensure_wind_jobs_scheduled reads tide events via get_ukho_tide_events,
+    # which applies the Portsmouth->Langstone correction automatically, so the
+    # manual-refresh path stays in step with the daily 02:00 path.
+    ensure_wind_jobs_scheduled()
 
     # Regenerate the standalone Langstone tide feeds so manual refresh has
     # the same effect on those feeds as the daily 02:00 job. The harmonic
@@ -1168,57 +1253,13 @@ async def calculate_access_windows(request: Request):
         default=0.3,
     )
 
+    # Wind offset is not applied in this read-only preview. The scheduler is
+    # the sole owner of wind adjustment: it applies the offset start-only to
+    # the live feed at each vessel's worst-case grounding. /calculate (and the
+    # /feed/update it feeds) therefore show and store *baseline* windows;
+    # whatever wind is blowing at the next grounding adjusts the feed then.
     wind_offset = 0.0
     wind_info = None
-    wind_data = None
-    if source == "ukho":
-        # Wind offset is only considered when a mooring ID is present.
-        # Without a mooring ID the user is doing an anonymous calculation
-        # and there is no stored mooring config to define which side is
-        # shallow. Even if the UI sends wind-offset fields in the body
-        # (because the user previously loaded a mooring and then cleared
-        # the ID), those values must be ignored.
-        if not mooring_id:
-            wind_enabled = False
-            shallow_dir = ""
-            extra_depth = 0.0
-        else:
-            posted_enabled = data.get("wind_offset_enabled")
-            if posted_enabled is None:
-                wind_enabled = bool(mooring.get("wind_offset_enabled")) if mooring else False
-            else:
-                wind_enabled = bool(posted_enabled)
-
-            posted_dir = data.get("shallow_direction")
-            if posted_dir is None:
-                shallow_dir = (mooring.get("shallow_direction", "") if mooring else "")
-            else:
-                shallow_dir = str(posted_dir)
-
-            posted_extra = data.get("shallow_extra_depth_m")
-            if posted_extra is None:
-                extra_depth = float(mooring.get("shallow_extra_depth_m", 0.0)) if mooring else 0.0
-            else:
-                try:
-                    extra_depth = float(posted_extra)
-                except (TypeError, ValueError):
-                    extra_depth = 0.0
-
-        if wind_enabled and shallow_dir and extra_depth > 0:
-            wind_data = await fetch_current_wind()
-            if wind_data and should_apply_offset(wind_data["direction_compass"], shallow_dir):
-                wind_offset = extra_depth
-                wind_info = {
-                    "applied": True,
-                    "direction": wind_data["direction_compass"],
-                    "shallow_side": shallow_dir,
-                    "offset_m": extra_depth,
-                    # speed_ms round-trips to /feed/update so that calendar
-                    # event descriptions generated later can include wind
-                    # speed, matching v1 behaviour. The UI preserves this
-                    # value verbatim between /calculate and /feed/update.
-                    "speed_ms": wind_data.get("speed_ms"),
-                }
 
     now = datetime.now(timezone.utc)
     # Look back 13 hours to ensure bracketing events for interpolation context.
@@ -1258,31 +1299,18 @@ async def calculate_access_windows(request: Request):
     if not events:
         return {"windows": [], "source": source, "event_count": 0, "message": "No tide data available"}
 
-    next_hw_ts = None
-    if wind_offset > 0:
-        now_str = to_utc_str(now)
-        for e in sorted(events, key=lambda ev: ev["timestamp"]):
-            if e["event_type"] == "HighWater" and e["timestamp"] >= now_str:
-                next_hw_ts = e["timestamp"]
-                break
-
     windows = compute_access_windows(
         events=events,
         draught_m=float(draught),
         drying_height_m=float(drying),
         safety_margin_m=float(margin),
-        wind_offset_m=wind_offset,
-        wind_offset_hw_timestamp=next_hw_ts,
         source=tide_source,
     )
 
     # Tender access pass. Uses the mooring's stored tender config; an
-    # anonymous /calculate (no mooring_id) skips it. The wind offset is
-    # passed through unchanged because the mooring's ground topography
-    # is the same for the boat and for the tender.
+    # anonymous /calculate (no mooring_id) skips it.
     tender_windows, tender_depth = _compute_tender_windows(
         events, mooring, tide_source,
-        wind_offset_m=wind_offset, wind_offset_hw_timestamp=next_hw_ts,
     )
 
     now_str = to_utc_str(now)
@@ -1390,7 +1418,6 @@ async def update_mooring_feed(mooring_id: int, request: Request):
     source = data.get("source", "")
     windows = data.get("windows", [])
     params = data.get("parameters", {}) or {}
-    wind_info = data.get("wind_info") or None
 
     m = get_mooring(mooring_id)
     if not m:
@@ -1408,16 +1435,10 @@ async def update_mooring_feed(mooring_id: int, request: Request):
         "safety_margin_m": params.get("safety_margin_m", m["safety_margin_m"]),
         "obs_calibrated": 1 if cal.get("confidence", "none") != "none" else 0,
     }
+    # Wind adjustment is owned by the scheduler (applied start-only to the live
+    # feed at each grounding), not by this manual path. Any wind_info in the
+    # request body is ignored so manual updates always store baseline windows.
     wind_details = None
-    if wind_info and wind_info.get("applied"):
-        wind_details = {
-            "direction": wind_info.get("direction"),
-            # Forwarded from /calculate so calendar event descriptions can
-            # include wind speed. Only present if the originating /calculate
-            # call actually fetched wind data.
-            "speed_ms": wind_info.get("speed_ms"),
-            "offset_m": wind_info.get("offset_m"),
-        }
 
     # Tender data round-trips on each window dict from /api/calculate.
     # Reconstruct the tender_windows list for store_windows_as_events.
