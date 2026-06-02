@@ -395,6 +395,7 @@
   }
   .conditions-col {
     padding: 12px 16px;
+    display: flex; flex-direction: column;
   }
   .conditions-col:first-child {
     border-right: 1px solid var(--sand-dark);
@@ -433,8 +434,15 @@
     padding: 8px 0;
   }
   .conditions-source {
-    font-size: 10px; color: var(--text-light); margin-top: 8px;
+    font-size: 10px; color: var(--text-light); margin-top: auto;
+    padding-top: 8px;
     text-align: right; opacity: 0.6;
+  }
+  .conditions-source a {
+    color: inherit; text-decoration: underline;
+  }
+  .conditions-source a:hover {
+    color: var(--sea);
   }
 
   /* Tidal Curve panel (v2.8) */
@@ -471,6 +479,20 @@
   .tcv-date-label {
     min-width: 110px; text-align: center; font-weight: 600;
     font-size: 12px; color: #fff; opacity: 0.95;
+    cursor: pointer;
+    padding: 1px 4px; border-radius: 3px;
+    border: 1px solid transparent;
+  }
+  .tcv-date-label:hover {
+    background: rgba(255,255,255,0.12);
+    border-color: rgba(255,255,255,0.25);
+  }
+  /* Hidden date input used to invoke the native picker via showPicker().
+     Positioned adjacent to the label so the picker pops up next to it. */
+  .tcv-date-picker-hidden {
+    position: absolute; opacity: 0; pointer-events: none;
+    width: 1px; height: 1px; padding: 0; border: 0;
+    margin-left: -1px;
   }
   .tcv-date-today {
     background: rgba(255,255,255,0.12); color: #fff;
@@ -504,6 +526,14 @@
     font-size: 10px; color: var(--text-light); margin-top: 6px;
     display: flex; justify-content: space-between; opacity: 0.7;
   }
+  /* Harmonic-source disclaimer (v2.8.1). Hidden on UKHO source, shown
+     for harmonic-source days so the est. accuracy is explicit on the
+     curve itself, not only via the source-badge text. */
+  .tide-curve-disclaimer {
+    font-size: 10px; color: var(--est); margin-top: 2px;
+    font-style: italic; opacity: 0.85;
+  }
+  .tide-curve-disclaimer.hidden { display: none; }
   /* SVG element styling */
   .tcv-grid { stroke: var(--sand-dark); stroke-width: 1; fill: none; }
   .tcv-axis { stroke: var(--border); stroke-width: 1; fill: none; }
@@ -519,9 +549,9 @@
   /* Access threshold lines (v2.8): show the tide height the boat / tender
      needs to clear. Drawn only when a Mooring ID is set. */
   .tcv-access-line { stroke: var(--ok); stroke-width: 1.8; stroke-dasharray: 6 3; fill: none; opacity: 1; pointer-events: none; }
-  .tcv-access-label { fill: var(--ok); font-size: 10px; font-weight: 600; pointer-events: none; }
+  .tcv-access-label { fill: var(--navy); font-size: 10px; font-weight: 600; pointer-events: none; }
   .tcv-tender-line { stroke: var(--ok); stroke-width: 1; stroke-dasharray: 2 3; fill: none; opacity: 0.7; pointer-events: none; }
-  .tcv-tender-label { fill: var(--ok); font-size: 10px; font-weight: 600; opacity: 0.85; pointer-events: none; }
+  .tcv-tender-label { fill: var(--navy); font-size: 10px; font-weight: 600; opacity: 0.85; pointer-events: none; }
   .tcv-access-clip { fill: var(--ok); font-size: 12px; font-weight: 700; pointer-events: none; }
   /* Access bands (v2.8): contiguous time spans where the curve is above
      the boat (or tender) access threshold. Drawn between the curve and
@@ -624,7 +654,8 @@
         Tidal Curve
         <span class="tide-curve-datesel" onclick="event.stopPropagation();">
           <button class="tcv-date-btn" id="tcv-date-prev" title="Previous day" onclick="event.stopPropagation(); tcvDateShift(-1)">‹</button>
-          <span id="tide-curve-date-label" class="tide-curve-meta tcv-date-label"></span>
+          <span id="tide-curve-date-label" class="tide-curve-meta tcv-date-label" title="Click to pick a date" onclick="event.stopPropagation(); tcvOpenDatePicker(event)"></span>
+          <input type="date" id="tcv-date-picker" class="tcv-date-picker-hidden" onchange="tcvDatePickerChanged(this.value)" onclick="event.stopPropagation();">
           <button class="tcv-date-btn" id="tcv-date-next" title="Next day" onclick="event.stopPropagation(); tcvDateShift(1)">›</button>
           <button class="tcv-date-today" id="tcv-date-today" title="Jump to today" onclick="event.stopPropagation(); tcvDateGoToday()">Today</button>
         </span>
@@ -640,8 +671,11 @@
         <div class="tide-curve-status" id="tide-curve-status">Loading tide curve…</div>
       </div>
       <div class="tide-curve-footer">
-        <span>Heights above Chart Datum. Local time (Europe/London).</span>
+        <span id="tide-curve-footer-baseline">Heights above Chart Datum. Local time (Europe/London).</span>
         <span id="tide-curve-now-readout"></span>
+      </div>
+      <div class="tide-curve-disclaimer hidden" id="tide-curve-disclaimer">
+        Heights estimated by the harmonic model. Typical accuracy &plusmn;15&nbsp;min on event times, &plusmn;0.15&nbsp;m on heights.
       </div>
     </div>
   </div>
@@ -2926,7 +2960,7 @@ function renderConditionsTide(tide) {
     `</div>` +
     `<div class="conditions-state">${tide.state_description || ''} ${icon}${springNeapHtml}</div>` +
     upcomingHtml +
-    `<div class="conditions-source">Source: UKHO Admiralty</div>`;
+    `<div class="conditions-source">Source: <a href="https://easytide.admiralty.co.uk/?PortID=0066" target="_blank" rel="noopener noreferrer">UKHO Admiralty</a></div>`;
 }
 
 function renderConditionsWeather(weather) {
@@ -2970,7 +3004,7 @@ function renderConditionsWeather(weather) {
     `<span class="c-label">Visibility:</span> ` +
     `<span class="c-value">${v.description || 'Unknown'}</span>` +
     `</div>` +
-    `<div class="conditions-source">Source: OpenWeatherMap</div>`;
+    `<div class="conditions-source">Source: <a href="https://openweathermap.org/city/7290559" target="_blank" rel="noopener noreferrer">OpenWeatherMap</a></div>`;
 }
 
 async function loadConditions() {
@@ -3155,7 +3189,17 @@ async function loadTideCurve() {
     _tideCurveAvailableRange = data.available_range || null;
 
     dateLabel.textContent = data.date ? _tcvFormatDateLabel(data.date) : '';
-    sourceLabel.textContent = data.source_used === 'ukho' ? 'UKHO' : '';
+    if (data.source_used === 'ukho') {
+      sourceLabel.textContent = 'UKHO';
+    } else if (data.source_used === 'harmonic') {
+      sourceLabel.textContent = 'Harmonic · est.';
+    } else {
+      sourceLabel.textContent = '';
+    }
+    const disclaimer = document.getElementById('tide-curve-disclaimer');
+    if (disclaimer) {
+      disclaimer.classList.toggle('hidden', data.source_used !== 'harmonic');
+    }
     _tcvUpdateDateControls();
     const cycleLabel = document.getElementById('tide-curve-cycle-label');
     if (cycleLabel) {
@@ -3168,11 +3212,17 @@ async function loadTideCurve() {
     }
 
     if (!data.samples || data.samples.length === 0) {
-      const retry = ` <span class="retry-link" onclick="loadTideCurve()">Retry</span>`;
-      const msg = data.reason === 'no_ukho_data'
-        ? 'UKHO data unavailable for today.'
-        : 'Tide curve unavailable.';
-      _tcvSetStatus(msg + retry);
+      // UKHO branch offers a Retry link (lazy fetch may succeed on
+      // a subsequent attempt). Harmonic branch does not - the table
+      // is server-side authoritative, so retrying achieves nothing.
+      if (data.reason === 'no_ukho_data') {
+        const retry = ` <span class="retry-link" onclick="loadTideCurve()">Retry</span>`;
+        _tcvSetStatus('UKHO data unavailable for this date.' + retry);
+      } else if (data.reason === 'no_harmonic_data') {
+        _tcvSetStatus('Harmonic prediction unavailable for this date. The scheduler regenerates harmonic data nightly at 02:00.');
+      } else {
+        _tcvSetStatus('Tide curve unavailable.');
+      }
       return;
     }
     renderTideCurve(data);
@@ -3755,6 +3805,36 @@ function tcvDateShift(delta) {
 
 function tcvDateGoToday() {
   _tideCurveSelectedDate = null;
+  loadTideCurve();
+}
+
+function tcvOpenDatePicker(e) {
+  // Open the native date picker anchored to the date label.
+  const input = document.getElementById('tcv-date-picker');
+  if (!input) return;
+  // Sync value / min / max before opening so the picker reflects the
+  // current state and constrains selection to the available range.
+  if (_tideCurveDateLocal) input.value = _tideCurveDateLocal;
+  if (_tideCurveAvailableRange) {
+    input.min = _tideCurveAvailableRange.earliest;
+    input.max = _tideCurveAvailableRange.latest;
+  }
+  if (typeof input.showPicker === 'function') {
+    try { input.showPicker(); return; } catch (err) { /* fall through */ }
+  }
+  // Fallback for browsers without showPicker(): focus + click usually
+  // opens the picker on user-initiated events.
+  input.focus();
+  input.click();
+}
+
+function tcvDatePickerChanged(value) {
+  if (!value || !_tideCurveAvailableRange) return;
+  // Clamp to the available range defensively.
+  if (value < _tideCurveAvailableRange.earliest) value = _tideCurveAvailableRange.earliest;
+  if (value > _tideCurveAvailableRange.latest) value = _tideCurveAvailableRange.latest;
+  const todayStr = _tcvLocalDateStr(new Date());
+  _tideCurveSelectedDate = (value === todayStr) ? null : value;
   loadTideCurve();
 }
 

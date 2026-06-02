@@ -2,7 +2,7 @@
 
 A Docker-containerised application for predicting when a boat on a swing mooring in Langstone Harbour has sufficient water depth to depart and arrive.
 
-**Version 2** — adds per-mooring 6-digit PIN protection, decouples iCal feed updates from calculation, restructures the calibration system to split base drying height from shallow-side wind offset, and adds standalone Langstone tide feeds (UKHO 7-day and combined UKHO+harmonic 180-day). **v2.8** adds an interactive Tidal Curve panel showing predicted heights with crosshair hover, a live "now" line, access-threshold lines and shaded access bands for the loaded mooring, sunrise/sunset markers, a Spring/Neap/Mid classification, and a date selector for panning across the UKHO window; the tab navigation has also been relocated to a static top menu bar flush with the page header. The v1.0 release is preserved on the tag `v1.0`.
+**Version 2** — adds per-mooring 6-digit PIN protection, decouples iCal feed updates from calculation, restructures the calibration system to split base drying height from shallow-side wind offset, and adds standalone Langstone tide feeds (UKHO 7-day and combined UKHO+harmonic 180-day). **v2.8** adds an interactive Tidal Curve panel showing predicted heights with crosshair hover, a live "now" line, access-threshold lines and shaded access bands for the loaded mooring, sunrise/sunset markers, a Spring/Neap/Mid classification, and a date selector for panning across the UKHO window; the tab navigation has also been relocated to a static top menu bar flush with the page header. **v2.8.1** extends the curve panel with a date-based UKHO → harmonic source switch (UKHO for today+0..6, harmonic for day 7+ to the 180-day horizon), a native date picker, and an `est.` accuracy disclaimer when harmonic-sourced. The v1.0 release is preserved on the tag `v1.0`.
 
 ## Overview
 
@@ -389,9 +389,26 @@ The lazy UKHO fetch (one-shot retrieval when today's data is missing) is **only 
 
 When viewing a date that isn't today, the red "now" line is hidden (it would be meaningless). The access threshold lines, shaded bands, Spring/Neap classification, sunrise/sunset markers, and hover crosshair all work as on the today view.
 
-### Data source
+### Data source and recalibration
 
-The curve is **UKHO-only by policy**. If no UKHO data is in the database for the requested day, the panel triggers a one-shot UKHO fetch automatically (subject to a 30-second cooldown to prevent excessive retries during an outage); the placeholder switches from "Loading tide curve…" to "Fetching today's UKHO data…" if the fetch takes more than a second. If UKHO data still cannot be obtained, the panel shows "UKHO data unavailable for today" with a Retry link. No fallback to harmonic data is offered — the curve is meant to be an authoritative "today" visual rather than a long-range approximation.
+The curve uses a **date-based source switch** (v2.8.1):
+
+- **Today and the next 6 days** are drawn from UKHO data. If today's data is missing from the database, the panel triggers a one-shot UKHO fetch (subject to a 30-second cooldown). The placeholder switches from "Loading tide curve…" to "Fetching today's UKHO data…" if the fetch takes more than a second. Lazy fetch is **only** triggered for today's date — panning to other days never hits UKHO. If UKHO data is unavailable for a date in the 0..6 range, the panel shows "UKHO data unavailable for this date" with a Retry link.
+- **Day 7 onwards** uses stored harmonic predictions. The source badge changes to `Harmonic · est.` and a small italic disclaimer appears under the chart noting typical accuracy (±15 min on event times, ±0.15 m on heights). No lazy generation is offered; the data is server-side authoritative.
+
+The cutoff is fixed by date, not by data availability, so curves are never mixed-source on a single day.
+
+Harmonic predictions are regenerated automatically every night at 02:00 alongside the UKHO refresh; this keeps a rolling 180-day forward horizon populated. On a fresh deployment, a one-shot **startup warm-up** runs in the FastAPI lifespan if the `harmonic_predictions` table is empty, so harmonic-source days are reachable immediately rather than waiting for the first 02:00 job.
+
+#### Manual regeneration after recalibration
+
+The harmonic constants live in `app/model_config.json` and are baked into the Docker image at build time. After editing the JSON and running `docker compose up -d --build`, the next 02:00 scheduler job will pick up the new constants — but you can refresh stored predictions immediately:
+
+```
+docker exec tidal-access python -m scripts.regenerate_harmonic
+```
+
+The script regenerates the next 180 days of HW/LW predictions using the current constants, applies the Portsmouth → Langstone secondary-port offset, and inserts the rows with a fresh `generated_at` timestamp. `get_harmonic_predictions(latest_only=True)` always returns the freshest version per cycle, so older predictions retire silently. Old rows are retained for 365 days (per the existing `cleanup_old_harmonic_predictions` policy) so residual analysis against the previous model remains possible.
 
 ### Behaviour across tabs
 

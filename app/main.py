@@ -332,11 +332,48 @@ async def lifespan(app: FastAPI):
     ensure_dirs()
     init_db()
     load_model_config()  # Loads bundled config and warms the cache via _get_curve_params on first calc
+    _warm_up_harmonic_predictions()
     start_scheduler()
     logger.info("Tidal Access application started")
     yield
     shutdown_scheduler()
     logger.info("Tidal Access application stopped")
+
+
+def _warm_up_harmonic_predictions():
+    """
+    On a fresh deployment the harmonic_predictions table is empty until
+    the first 02:00 scheduler run. Pre-populate it with 180 days of
+    Langstone-corrected predictions so the tide-curve panel can render
+    harmonic-source days (today+7..today+180) immediately.
+
+    Idempotent: only runs when the table is empty. Subsequent restarts
+    are no-ops because the daily scheduler keeps the table populated.
+    Synchronous and fast (~1-3s) for a clean process start.
+    """
+    try:
+        from app.database import db_connection, store_harmonic_predictions
+        from app.harmonic import predict_events as harmonic_predict_events
+        with db_connection() as conn:
+            count = conn.execute("SELECT COUNT(*) FROM harmonic_predictions").fetchone()[0]
+        if count > 0:
+            logger.info(f"Harmonic predictions table populated ({count} rows); skipping warm-up.")
+            return
+        logger.info("Harmonic predictions table empty; generating 180-day warm-up batch...")
+        start = datetime.now(timezone.utc)
+        end = start + timedelta(days=180)
+        raw = harmonic_predict_events(start, end)
+        langstone = apply_offset(raw) if raw else []
+        inserted = store_harmonic_predictions(langstone)
+        logger.info(f"Harmonic warm-up complete: {inserted} predictions stored.")
+        log_activity(
+            event_type="harmonic_refresh",
+            message=f"Startup warm-up: stored {inserted} harmonic predictions",
+            severity="success" if inserted else "warning",
+            details={"event_count": inserted, "window_days": 180, "trigger": "startup_warmup"},
+        )
+    except Exception as e:
+        logger.warning(f"Harmonic startup warm-up failed: {e}")
 
 
 app = FastAPI(title="Tidal Access Window Predictor", lifespan=lifespan)
@@ -1634,28 +1671,51 @@ async def get_tides(range: str = "forecast"):
     }
 
 
-# --- Tidal curve (v2.8) ---
+# --- Tidal curve (v2.8 / v2.8.1) ---
 #
 # Sampled height-vs-time series for the requested local day, used by the
-# Tidal Curve panel in the UI. UKHO-only by policy: if the DB has no
-# UKHO events bracketing the day, the endpoint triggers a one-shot lazy
-# UKHO fetch (subject to a 30s cooldown to bound retries on outages).
-# Harmonic fallback is intentionally NOT offered here - the curve panel
-# is meant to be an authoritative "today" visual, not an approximation.
+# Tidal Curve panel in the UI. Date-based source switch (v2.8.1):
+#   - days_ahead in [..., 6]: UKHO. If today's date and bracketing UKHO
+#     events are missing, a one-shot lazy UKHO fetch is triggered
+#     (subject to a 30s cooldown to bound retries on outages).
+#   - days_ahead >= 7: harmonic. Stored harmonic_predictions are queried
+#     via get_harmonic_predictions(latest_only=True) and piped through
+#     the same _interpolate_from_parsed curve model so the displayed
+#     curve and any access windows computed elsewhere stay consistent.
+#     No on-demand generation; the scheduler keeps 180 days populated
+#     at 02:00 and a startup warm-up covers the first-run gap.
+#
+# The cutoff is fixed at day 7 to avoid mixed-source curves on the same
+# date (e.g. UKHO HW + harmonic LW from a partial day) - the same
+# rationale used by /api/tides?range=extended.
 
 _tide_curve_lazy_fetch_last_attempt: Optional[datetime] = None
 _TIDE_CURVE_LAZY_FETCH_COOLDOWN_SECONDS = 30
 
+# v2.8.1: harmonic switchover offset in days. Set to 7 because the UKHO
+# Discovery tier covers the next 7 calendar days.
+_HARMONIC_SWITCHOVER_DAYS = 7
 
-def _ukho_available_range(reference_local_date) -> dict:
+# v2.8.1: forward extent of the date picker in days. Bounded by the
+# 180-day harmonic horizon. The picker greys out at this limit.
+_AVAILABLE_RANGE_FORWARD_DAYS = 180
+
+
+def _available_range(reference_local_date) -> dict:
     """
-    Return the inclusive UTC date range (as local YYYY-MM-DD strings)
-    over which the UI may select dates for the tide curve.
+    Return the inclusive local-date range (as YYYY-MM-DD strings) over
+    which the UI may select dates for the tide curve.
 
-    Currently bounded by:
-      - earliest: the earliest UKHO timestamp stored in tide_data.
-      - latest:   today + 7 (UKHO API horizon; harmonic data is not used
-                  by the curve per v2.8 policy).
+    Bounds:
+      - earliest: the earliest UKHO timestamp stored in tide_data. The
+                  curve uses UKHO for dates in the past where data exists.
+                  Harmonic predictions are forward-only in this app's
+                  storage workflow, so history is not extended into the
+                  harmonic horizon.
+      - latest:   today + 180. This is the harmonic horizon; the
+                  scheduler keeps the next 180 days populated.
+
+    Falls back to reference_local_date on either bound if a DB error occurs.
     """
     try:
         import pytz
@@ -1665,15 +1725,12 @@ def _ukho_available_range(reference_local_date) -> dict:
             row = conn.execute(
                 "SELECT MIN(timestamp), MAX(timestamp) FROM tide_data WHERE source = 'ukho'"
             ).fetchone()
-        earliest_iso, latest_iso = (row[0], row[1]) if row else (None, None)
+        earliest_iso = row[0] if row else None
         if earliest_iso:
             earliest_local = dtparse.parse(earliest_iso).astimezone(tz).date()
         else:
             earliest_local = reference_local_date
-        # Latest is the later of (stored UKHO max) and (today + 7), so
-        # users can freely pan into the UKHO 7-day horizon even when only
-        # part of it has been fetched yet.
-        latest_local = reference_local_date + timedelta(days=7)
+        latest_local = reference_local_date + timedelta(days=_AVAILABLE_RANGE_FORWARD_DAYS)
         return {
             "earliest": earliest_local.isoformat(),
             "latest": latest_local.isoformat(),
@@ -1699,13 +1756,19 @@ async def get_tide_curve(date: Optional[str] = None, step_minutes: int = 5):
         "step_minutes": int,
         "samples": [{"time": "...Z", "height_m": float}, ...],
         "events_in_window": [{"type": "HighWater"|"LowWater", "time": "...Z", "height_m": float}, ...],
-        "source_used": "ukho" | null,
-        "reason": "no_ukho_data" | None,
+        "source_used": "ukho" | "harmonic" | null,
+        "reason": "no_ukho_data" | "no_harmonic_data" | None,
         "lazy_fetch_attempted": bool,
+        "available_range": {"earliest": "YYYY-MM-DD", "latest": "YYYY-MM-DD"},
+        "spring_neap": "spring"|"mid"|"neap"|None,
+        "sunrise": "...Z" | None,
+        "sunset": "...Z" | None,
       }
 
-    UKHO-only (per v2.8 spec). If no bracketing UKHO data, attempts a
-    one-shot fetch subject to a 30s cooldown.
+    Source switch (v2.8.1): today+0..6 uses UKHO (with lazy fetch on
+    today's date if missing); today+7 onwards uses stored harmonic
+    predictions. The cutoff is fixed by date, not by data availability,
+    to avoid mixed-source curves on a single day.
     """
     global _tide_curve_lazy_fetch_last_attempt
 
@@ -1732,7 +1795,7 @@ async def get_tide_curve(date: Optional[str] = None, step_minutes: int = 5):
 
     # Query a wider window so we have bracketing HW/LW events. Spring tides
     # at Langstone are ~6h12m apart, so ±18h is comfortably more than one
-    # cycle either side and guarantees bracketing if any UKHO data exists.
+    # cycle either side and guarantees bracketing if data exists.
     query_start = to_utc_str(day_start_utc - timedelta(hours=18))
     query_end = to_utc_str(day_end_utc + timedelta(hours=18))
 
@@ -1743,66 +1806,63 @@ async def get_tide_curve(date: Optional[str] = None, step_minutes: int = 5):
         has_after = any(dtparse.parse(e["timestamp"]) >= day_end_utc for e in events)
         return has_before and has_after
 
-    events = get_ukho_tide_events(query_start, query_end)
+    today_local = now_utc.astimezone(tz).date()
+    days_ahead = (local_date - today_local).days
+    use_harmonic = days_ahead >= _HARMONIC_SWITCHOVER_DAYS
+    is_today = (local_date == today_local)
     lazy_fetch_attempted = False
 
-    # Lazy fetch is only attempted for today's date. For other days, the
-    # endpoint returns whatever data is stored without ever calling out
-    # to UKHO - prevents an accidental fetch storm if a user pans through
-    # many days that happen to be unstored.
-    today_local = now_utc.astimezone(tz).date()
-    is_today = (local_date == today_local)
+    if use_harmonic:
+        # Harmonic branch (day 7+). No lazy generation - the scheduler
+        # and the startup warm-up are responsible for keeping the table
+        # populated. If the cycle is missing, return a no_harmonic_data
+        # response and let the UI prompt the operator to regen.
+        from app.database import get_harmonic_predictions
+        events = get_harmonic_predictions(query_start, query_end, latest_only=True)
+        source_used = "harmonic"
+        no_data_reason = "no_harmonic_data"
+    else:
+        # UKHO branch (day -inf..6). Lazy fetch only fires on today's date.
+        events = get_ukho_tide_events(query_start, query_end)
+        source_used = "ukho"
+        no_data_reason = "no_ukho_data"
 
-    if not _bracketed(events) and is_today:
-        # Try a lazy UKHO fetch, subject to cooldown.
-        now = datetime.now(timezone.utc)
-        last = _tide_curve_lazy_fetch_last_attempt
-        cooldown_active = (
-            last is not None
-            and (now - last).total_seconds() < _TIDE_CURVE_LAZY_FETCH_COOLDOWN_SECONDS
-        )
+        if not _bracketed(events) and is_today:
+            now = datetime.now(timezone.utc)
+            last = _tide_curve_lazy_fetch_last_attempt
+            cooldown_active = (
+                last is not None
+                and (now - last).total_seconds() < _TIDE_CURVE_LAZY_FETCH_COOLDOWN_SECONDS
+            )
+            if not cooldown_active:
+                _tide_curve_lazy_fetch_last_attempt = now
+                lazy_fetch_attempted = True
+                try:
+                    fetched, station_used = await fetch_tidal_events()
+                    if fetched:
+                        station_label = "langstone" if station_used == UKHO_STATION_ID else "portsmouth"
+                        store_tide_events(fetched, source="ukho", station=station_label)
+                        log_activity(
+                            event_type="ukho_fetch",
+                            message=f"Tide curve lazy fetch: {len(fetched)} events stored",
+                            severity="info",
+                            details={
+                                "event_count": len(fetched),
+                                "trigger": "tide_curve_lazy_fetch",
+                                "station_used": station_used,
+                                "station_label": station_label,
+                                "requested_date": local_date.isoformat(),
+                            },
+                        )
+                        events = get_ukho_tide_events(query_start, query_end)
+                except Exception as e:
+                    logger.warning(f"Tide curve lazy UKHO fetch failed: {e}")
 
-        if not cooldown_active:
-            _tide_curve_lazy_fetch_last_attempt = now
-            lazy_fetch_attempted = True
-            try:
-                fetched, station_used = await fetch_tidal_events()
-                if fetched:
-                    station_label = "langstone" if station_used == UKHO_STATION_ID else "portsmouth"
-                    store_tide_events(fetched, source="ukho", station=station_label)
-                    log_activity(
-                        event_type="ukho_fetch",
-                        message=f"Tide curve lazy fetch: {len(fetched)} events stored",
-                        severity="info",
-                        details={
-                            "event_count": len(fetched),
-                            "trigger": "tide_curve_lazy_fetch",
-                            "station_used": station_used,
-                            "station_label": station_label,
-                            "requested_date": local_date.isoformat(),
-                        },
-                    )
-                    events = get_ukho_tide_events(query_start, query_end)
-            except Exception as e:
-                logger.warning(f"Tide curve lazy UKHO fetch failed: {e}")
-
-    if not _bracketed(events):
-        sun_times_fallback = _compute_sun_times(local_date)
-        return {
-            "date": local_date.isoformat(),
-            "step_minutes": step_minutes,
-            "samples": [],
-            "events_in_window": [],
-            "source_used": None,
-            "reason": "no_ukho_data",
-            "lazy_fetch_attempted": lazy_fetch_attempted,
-            "spring_neap": None,
-            "sunrise": sun_times_fallback["sunrise"],
-            "sunset": sun_times_fallback["sunset"],
-            "available_range": _ukho_available_range(today_local),
-        }
-
-    # Parse + sort once for the inner sampling loop.
+    # Parse + sort once for the inner sampling loop. We do NOT gate on
+    # strict bracketing here (events both before AND after the day): at
+    # the UKHO horizon the trailing bracket may be missing yet most of
+    # the day is still interpolable. Sample what we can and only
+    # short-circuit if the result is empty.
     parsed = []
     for ev in events:
         dt = dtparse.parse(ev["timestamp"])
@@ -1811,7 +1871,6 @@ async def get_tide_curve(date: Optional[str] = None, step_minutes: int = 5):
         parsed.append((dt, ev["height_m"], ev["event_type"]))
     parsed.sort(key=lambda x: x[0])
 
-    # Sample from day_start_utc to day_end_utc inclusive at step_minutes.
     step = timedelta(minutes=step_minutes)
     samples = []
     t = day_start_utc
@@ -1823,6 +1882,22 @@ async def get_tide_curve(date: Optional[str] = None, step_minutes: int = 5):
                 "height_m": round(h, 3),
             })
         t += step
+
+    if not samples:
+        sun_times_fallback = _compute_sun_times(local_date)
+        return {
+            "date": local_date.isoformat(),
+            "step_minutes": step_minutes,
+            "samples": [],
+            "events_in_window": [],
+            "source_used": None,
+            "reason": no_data_reason,
+            "lazy_fetch_attempted": lazy_fetch_attempted,
+            "spring_neap": None,
+            "sunrise": sun_times_fallback["sunrise"],
+            "sunset": sun_times_fallback["sunset"],
+            "available_range": _available_range(today_local),
+        }
 
     # Events strictly inside the day window (for HW/LW markers).
     events_in_window = [
@@ -1850,13 +1925,13 @@ async def get_tide_curve(date: Optional[str] = None, step_minutes: int = 5):
         "step_minutes": step_minutes,
         "samples": samples,
         "events_in_window": events_in_window,
-        "source_used": "ukho",
+        "source_used": source_used,
         "reason": None,
         "lazy_fetch_attempted": lazy_fetch_attempted,
         "spring_neap": spring_neap,
         "sunrise": sun_times["sunrise"],
         "sunset": sun_times["sunset"],
-        "available_range": _ukho_available_range(today_local),
+        "available_range": _available_range(today_local),
     }
 
 
