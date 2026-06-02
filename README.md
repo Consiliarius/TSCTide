@@ -22,7 +22,7 @@ The tool computes access windows — the periods around each high water when the
 - **Subscribable iCal feed** per mooring, auto-updated daily, with proper subscription metadata
 - **Standalone Langstone tide feeds** — two non-mooring feeds providing HW/LW times and heights at Langstone Harbour: a 7-day UKHO feed and a 180-day combined UKHO+harmonic feed
 - **Visual Tidal Curve** (v2.8) — plots predicted tidal height in an interactive panel with crosshair hover for time/height readouts, a red "now" line, shaded access bands for the loaded mooring (solid green for boat access, hatched for tender), sunrise/sunset markers with night shading, a Spring/Neap/Mid classification badge, and a date selector for panning across the UKHO 7-day window
-- **Wind offset** — adjusts the next tide's access window based on observed wind direction and the mooring's shallow-water geometry
+- **Wind offset** — adjusts the start of the next tide's access window based on observed wind direction and the mooring's shallow-water geometry
 - **ICS export** from any data source, with harmonic-derived events prefixed "est."
 - **XLSX batch import** for observations recorded on a phone over time
 - **HTTPS support** via Cloudflare Tunnel (zero inbound ports, automatic certificates)
@@ -119,7 +119,6 @@ tidal-access/
 | `UKHO_FALLBACK_STATION_ID` | Fallback if primary has limited data | `0065` (Portsmouth) |
 | `UKHO_FETCH_HOUR` | Hour for daily auto-fetch (local time) | `2` |
 | `UKHO_FETCH_MINUTE` | Minute for daily auto-fetch | `0` |
-| `WIND_SAMPLE_HW_OFFSET_HOURS` | Hours after HW to sample wind | `4` |
 | `LOCATION_LAT` | Latitude for OWM queries | `50.8185` |
 | `LOCATION_LON` | Longitude for OWM queries | `-0.9806` |
 | `PIN_HASH_SALT` | Site-wide salt used when hashing mooring PINs (set to any long random string; must stay stable or all PINs are invalidated) | (required for PIN operations) |
@@ -254,7 +253,7 @@ For the intended use case — a handful of friends sharing a tool, protected fro
 
 ### The scheduler bypasses the PIN
 
-The daily UKHO refresh (02:00 local) and the HW+4h wind observation job update stored events and regenerate feeds by calling internal functions directly, not through the HTTP API. They therefore bypass PIN gating by design. This is consistent with the threat model: the scheduler executes work that the mooring owner has already authorised at configuration time (by enabling calendar subscription and/or wind offset). An attacker who can reach the scheduler has already broken into the host.
+The daily UKHO refresh (02:00 local) and the per-mooring wind observation jobs update stored events and regenerate feeds by calling internal functions directly, not through the HTTP API. They therefore bypass PIN gating by design. This is consistent with the threat model: the scheduler executes work that the mooring owner has already authorised at configuration time (by enabling calendar subscription and/or wind offset). An attacker who can reach the scheduler has already broken into the host.
 
 ## iCal Feeds
 
@@ -304,7 +303,7 @@ Harmonic predictions are stored separately from UKHO data (in a dedicated `harmo
 ## Scheduled Jobs
 
 1. **Daily at 02:00** — Fetch UKHO data, store, update calendar feeds for all enabled moorings
-2. **Dynamic (HW+4h)** — Wind observation at configurable offset after each HW, recalculates next tide's window for wind-enabled moorings
+2. **Dynamic (per-mooring, at each worst-case grounding)** — Wind observation at the moment each wind-enabled vessel could first ground (`drying + draught + shallow offset`); adjusts the *start* of that mooring's next access window. Re-enumerated on the daily fetch, on startup, on manual refresh, and after a config change; a 15-minute safety net rebuilds the jobs if a restart clears them.
 
 ## Model Accuracy
 
@@ -431,9 +430,11 @@ For swing moorings at the edge of a channel, the effective drying height depends
 
 1. Configure the direction of shallow water relative to the mooring (N/NE/E/SE/S/SW/W/NW)
 2. Specify the additional drying height on the shallow side
-3. The system checks observed wind at HW+4h — if the wind was pushing the boat toward the shallow side, the extra drying height is added to calculations for the next flood tide
+3. A per-mooring wind check runs at the vessel's **worst-case grounding** — the moment the tide falls to `drying + draught + shallow offset`, i.e. the earliest the boat could touch if the wind pushed it into the shallows. If the wind is then blowing the boat toward the shallow side, the extra drying height is applied to the **start** of that mooring's next access window (the boat re-floats later). The next grounding triggers the next check, and so on down the chain.
 
 The offset uses a three-sector trigger: if shallow water is to the W, the offset activates when wind is from E, NE, or SE.
+
+If the offset is large enough that even the next high water no longer clears the safe threshold, that tide is shown as **"No access — wind-blown to shallows"** in the feed rather than as a window. Conversely, a tide that would otherwise be "always afloat" is re-evaluated and shown to ground if the wind pushes the boat shallow.
 
 Trot (fore-and-aft) moorings that cannot swing, or deep-channel moorings with negligible depth variation, should leave this feature disabled.
 

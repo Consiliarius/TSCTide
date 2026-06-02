@@ -1,0 +1,10 @@
+# Development / test-only dependencies (NOT installed in the runtime image).
+#
+#   python -m venv .venv
+#   .venv/Scripts/python -m pip install -r requirements-dev.txt   # Windows
+#   .venv/bin/python      -m pip install -r requirements-dev.txt   # POSIX
+#   python -m pytest tests/
+#
+# Pulls in the runtime deps so tests that import app.wind (httpx) etc. work.
+-r requirements.txt
+pytest>=8.0

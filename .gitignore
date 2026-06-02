@@ -5,6 +5,9 @@
 __pycache__/
 *.pyc
 *.pyo
+.venv/
+.pytest_cache/
+*.egg-info/
 
 # Data directory — bind-mounted to container at /app/data.
 # All contents are runtime/user data and must not be committed.
