@@ -203,30 +203,19 @@ def compute_access_windows(
     draught_m: float,
     drying_height_m: float,
     safety_margin_m: float,
-    wind_offset_m: float = 0.0,
-    wind_offset_hw_timestamp: Optional[str] = None,
     source: str = "ukho",
     interval_minutes: int = 3,
 ) -> list[dict]:
     """
-    Compute access windows from tide events.
+    Compute baseline access windows from tide events.
 
     An access window is the continuous period around each HW during which:
-        tide_height > drying_height + draught + safety_margin [+ wind_offset]
+        tide_height > drying_height + draught + safety_margin
 
-    Wind offset scoping:
-      - If ``wind_offset_hw_timestamp`` is provided, the ``wind_offset_m`` is
-        applied ONLY to the HW whose timestamp matches that string. All other
-        HW windows use the baseline threshold. This is the correct behaviour
-        for a just-observed wind reading, which is only a good predictor for
-        the next flood tide.
-      - If ``wind_offset_hw_timestamp`` is None (default) and ``wind_offset_m``
-        is non-zero, the offset is applied to every HW window. This preserves
-        backward compatibility but is rarely what's wanted.
-
-    Each returned window carries a ``wind_adjusted`` boolean indicating whether
-    that specific HW had the offset applied, so the caller no longer needs to
-    set this flag in a post-processing loop.
+    This computes the baseline only. The wind/shallow-water offset is applied
+    separately and start-only by compute_next_window_with_wind (driven by the
+    scheduler at each worst-case grounding); it is deliberately not a parameter
+    here, so ``wind_adjusted`` is always False on these windows.
 
     Returns list of window dicts:
         hw_timestamp, hw_height_m, start_time, end_time, duration_minutes,
@@ -270,14 +259,7 @@ def compute_access_windows(
         hw_dt = hw["dt"]
         hw_height = hw["height_m"]
         hw_ts_str = to_utc_str(hw_dt)
-
-        # Determine whether wind offset applies to THIS HW
-        if wind_offset_hw_timestamp is not None:
-            wind_applied_here = (hw_ts_str == wind_offset_hw_timestamp)
-        else:
-            wind_applied_here = (wind_offset_m > 0)
-
-        threshold = base_threshold + (wind_offset_m if wind_applied_here else 0.0)
+        threshold = base_threshold
 
         # If HW height is below threshold, no access window
         if hw_height < threshold:
@@ -289,7 +271,7 @@ def compute_access_windows(
                 "duration_minutes": 0,
                 "source": source,
                 "below_threshold": True,
-                "wind_adjusted": wind_applied_here,
+                "wind_adjusted": False,
             })
             continue
 
@@ -353,7 +335,7 @@ def compute_access_windows(
                     "below_threshold": False,
                     "incomplete_data": False,
                     "always_accessible": True,
-                    "wind_adjusted": wind_applied_here,
+                    "wind_adjusted": False,
                 })
                 continue
             # else: fall through to the incomplete-data window below
@@ -373,7 +355,7 @@ def compute_access_windows(
             "below_threshold": False,
             "incomplete_data": not (start_time and end_time),
             "always_accessible": False,
-            "wind_adjusted": wind_applied_here,
+            "wind_adjusted": False,
         })
 
     return windows

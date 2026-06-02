@@ -242,8 +242,6 @@ def _compute_tender_windows(
     events: list[dict],
     mooring: dict,
     source: str,
-    wind_offset_m: float = 0.0,
-    wind_offset_hw_timestamp: Optional[str] = None,
 ) -> tuple[Optional[list[dict]], Optional[float]]:
     """
     Run a second compute_access_windows() pass with draught_m=0 and
@@ -251,9 +249,9 @@ def _compute_tender_windows(
     drying_height_m + tender_min_depth_m. Returns (windows, depth) when
     tender access is enabled on the mooring, else (None, None).
 
-    Wind offset is applied identically to the main pass because the
-    ground topography is the same; the same HW receives the offset in
-    both passes so on-screen totals stay consistent.
+    These are baseline (no wind) windows. Wind adjustment is applied
+    separately by the scheduler via compute_next_window_with_wind, which
+    runs its own tender pass with the same offset.
     """
     if not mooring or not mooring.get("tender_access_enabled"):
         return None, None
@@ -263,8 +261,6 @@ def _compute_tender_windows(
         draught_m=0.0,
         drying_height_m=mooring["drying_height_m"],
         safety_margin_m=depth,
-        wind_offset_m=wind_offset_m,
-        wind_offset_hw_timestamp=wind_offset_hw_timestamp,
         source=source,
     )
     return tw, depth
