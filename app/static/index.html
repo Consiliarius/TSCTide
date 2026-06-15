@@ -773,6 +773,19 @@
       </div>
       </div><!-- end wind-section -->
 
+      <!-- Barometric Pressure Correction (hidden if OWM API key not configured;
+           also requires the system master flag to have any effect on windows) -->
+      <div id="barometric-section" class="hidden">
+        <div class="switch-row">
+          <label class="switch">
+            <input type="checkbox" id="barometric_enabled">
+            <span class="slider"></span>
+          </label>
+          <span style="font-size:13px;font-weight:600;">Barometric Correction</span>
+          <span style="font-size:11px;color:var(--text-light);">(adjusts heights for forecast pressure)</span>
+        </div>
+      </div><!-- end barometric-section -->
+
       <!-- Tender Access (only relevant for moorings that dry; visibility
            is controlled by updateTenderVisibility based on drying_height_m) -->
       <div id="tender-section" class="hidden">
@@ -1018,10 +1031,13 @@
             7-day UKHO: <a id="langstone-ukho-7d-url" href="/feeds/Langstone_UKHO_7d.ics">Langstone_UKHO_7d.ics</a>
           </div>
           <div class="subscribe-row">
+            7-day UKHO (pressure-corrected): <a id="langstone-ukho-7d-pc-url" href="/feeds/Langstone_UKHO_7d_PressureCorrected.ics">Langstone_UKHO_7d_PressureCorrected.ics</a>
+          </div>
+          <div class="subscribe-row">
             180-day extended: <a id="langstone-180d-url" href="/feeds/Langstone_Harmonic_180d.ics">Langstone_Harmonic_180d.ics</a>
           </div>
           <div class="subscribe-note">
-            The 7-day feed is UKHO Admiralty data only. The 180-day feed uses UKHO for the next 7 days and the built-in harmonic model for days 8–180; harmonic events are marked “est.” in their title and are accurate to roughly +/-15-20min on time and +/-0.15m on height. Both feeds refresh daily at 02:00.
+            The 7-day feed is UKHO Admiralty data only. The pressure-corrected 7-day feed applies a barometric (inverse-barometer) adjustment to the predicted heights for the next ~5 days using the latest pressure forecast — low pressure raises the tide, high pressure lowers it; event times are unchanged. The 180-day feed uses UKHO for the next 7 days and the built-in harmonic model for days 8–180; harmonic events are marked “est.” in their title and are accurate to roughly +/-15-20min on time and +/-0.15m on height. All feeds refresh daily at 02:00.
           </div>
         </div>
 
@@ -1496,6 +1512,7 @@ function getConfig() {
     // so zero these out so stale values from a previously-loaded mooring
     // cannot leak into an anonymous calculation request.
     wind_offset_enabled: mooringOptionsHidden ? 0 : (document.getElementById('wind_offset_enabled').checked ? 1 : 0),
+    barometric_enabled: mooringOptionsHidden ? 0 : (document.getElementById('barometric_enabled').checked ? 1 : 0),
     shallow_direction: mooringOptionsHidden ? '' : document.getElementById('shallow_direction').value,
     shallow_extra_depth_m: mooringOptionsHidden ? 0 : num('shallow_extra_depth_m', 0),
     calendar_enabled: document.getElementById('calendar_enabled').checked ? 1 : 0,
@@ -1518,6 +1535,7 @@ function setConfig(cfg) {
   document.getElementById('drying_height_m').value = cfg.drying_height_m ?? 2.0;
   document.getElementById('safety_margin_m').value = cfg.safety_margin_m ?? 0.3;
   document.getElementById('wind_offset_enabled').checked = !!cfg.wind_offset_enabled;
+  document.getElementById('barometric_enabled').checked = !!cfg.barometric_enabled;
   document.getElementById('shallow_direction').value = cfg.shallow_direction || '';
   document.getElementById('shallow_extra_depth_m').value = cfg.shallow_extra_depth_m ?? 0;
   document.getElementById('calendar_enabled').checked = !!cfg.calendar_enabled;
@@ -1700,6 +1718,7 @@ async function deleteMooring() {
     document.getElementById('shallow_extra_depth_m').value = '0.0';
     document.getElementById('shallow_direction').value = '';
     document.getElementById('wind_offset_enabled').checked = false;
+    document.getElementById('barometric_enabled').checked = false;
     document.getElementById('calendar_enabled').checked = false;
     document.getElementById('use_observations').checked = false;
     document.getElementById('tender_access_enabled').checked = false;
@@ -1866,11 +1885,18 @@ function renderResults(data) {
       html += `<tr class="no-access"><td>${dateStr}</td><td>${hwTime}</td>` +
         `<td>${w.hw_height_m?.toFixed(1) || '?'}m</td>` +
         `<td colspan="3">Insufficient data to compute window</td><td>${badge}</td></tr>`;
+    } else if (w.negligible_access) {
+      // Conservative 5-min rounding collapsed the window to under one grid
+      // step — too short to be usable access.
+      html += `<tr class="no-access"><td>${dateStr}</td><td>${hwTime}</td>` +
+        `<td>${w.hw_height_m?.toFixed(1) || '?'}m</td>` +
+        `<td colspan="3">Negligible window — no usable access</td><td>${badge}</td></tr>`;
     } else {
+      // Times/duration are the server's conservative-rounded display values.
       html += `<tr><td>${dateStr}</td><td>${hwTime}</td>` +
         `<td>${w.hw_height_m?.toFixed(1) || '?'}m</td>` +
-        `<td>${fmtTime(w.start_time)}</td><td>${fmtTime(w.end_time)}</td>` +
-        `<td>${w.duration_minutes} min${windMark}</td><td>${badge}</td></tr>`;
+        `<td>${fmtTime(w.display_start_time)}</td><td>${fmtTime(w.display_end_time)}</td>` +
+        `<td>${w.display_duration_minutes} min${windMark}</td><td>${badge}</td></tr>`;
     }
 
     // Tender sub-row. Rendered immediately under the main row when the
@@ -1878,14 +1904,14 @@ function renderResults(data) {
     // always-accessible, normal (start/end times), or below-threshold
     // (sailing below but tender is wider; spec also allows this case but
     // currently only main-window-bearing rows reach this branch).
-    const hasTender = (w.tender_start_time && w.tender_end_time)
+    const hasTender = (w.display_tender_start_time && w.display_tender_end_time)
       || w.tender_always_accessible;
     if (hasTender && !w.below_threshold) {
       let tenderText;
       if (w.tender_always_accessible) {
         tenderText = 'Tender access throughout this tidal cycle';
       } else {
-        tenderText = `Tender access from ${fmtTime(w.tender_start_time)} to ${fmtTime(w.tender_end_time)}`;
+        tenderText = `Tender access from ${fmtTime(w.display_tender_start_time)} to ${fmtTime(w.display_tender_end_time)}`;
       }
       html += `<tr class="tender-row"><td colspan="2"></td>` +
         `<td colspan="5" class="tender-label">${tenderText}</td></tr>`;
@@ -2372,8 +2398,9 @@ document.getElementById('obs_timestamp').value =
     const status = await res.json();
     if (status.owm_available) {
       document.getElementById('wind-section').classList.remove('hidden');
+      document.getElementById('barometric-section').classList.remove('hidden');
     }
-  } catch(e) { /* wind section stays hidden */ }
+  } catch(e) { /* wind/barometric sections stay hidden */ }
 })();
 
 // Tides tab state. Cached so range/timezone toggles re-render without
@@ -2831,6 +2858,7 @@ async function loadMooringConfigs() {
             `<div><span class="label">Calendar feed:</span> <span class="value">${m.calendar_enabled ? 'Enabled' : 'Disabled'}</span></div>` +
             `<div><span class="label">Observational data:</span> <span class="value">${m.use_observations ? 'Enabled' : 'Disabled'}</span></div>` +
             `<div><span class="label">Wind offset:</span> <span class="value">${m.wind_offset_enabled ? 'Enabled' : 'Disabled'}</span></div>` +
+            `<div><span class="label">Barometric:</span> <span class="value">${m.barometric_enabled ? 'Enabled' : 'Disabled'}</span></div>` +
             `<div><span class="label">Tender access:</span> <span class="value">${m.tender_access_enabled ? 'Enabled' : 'Disabled'}</span></div>` +
           `</div>`;
       if (m.wind_offset_enabled && m.shallow_direction) {

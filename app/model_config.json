@@ -71,5 +71,22 @@
         "epoch_iso": "2026-01-01T00:00:00Z",
         "avg_cycle_hours": 12.4167,
         "_warning": "These values ARE the dedup key for stored rows in harmonic_predictions.cycle_number AND form part of every iCal event UID issued. Changing them invalidates every existing UID (calendar apps will see delete-and-re-add) and breaks the dedup index in harmonic_predictions. Do NOT edit without a database migration plan covering the full data lifecycle. Bit-for-bit identical to the hardcoded values used pre-v2.5.6."
+    },
+
+    "barometric": {
+        "_comment": "Barometric (inverse-barometer) correction of predicted tide height. System master plus per-mooring opt-in (moorings.barometric_enabled). k validated offline against the BODC Portsmouth gauge; scale_factor has no empirical tuning source and stays 1.0 (regional effect, Portsmouth ~= Langstone). See docs/V2.9_BAROMETRIC_DESIGN.md.",
+        "enabled": false,
+        "reference_hpa": 1013.25,
+        "coefficient_m_per_hpa": 0.0100,
+        "scale_factor": 1.0,
+        "max_correction_m": 0.30,
+        "forecast_staleness_hours": 36,
+        "window_deadband_minutes": 5
+    },
+
+    "window_display": {
+        "_comment": "Display-only rounding of access-window edges to avoid false precision. Applies to ALL windows (wind/pressure/neither). Conservative inward: start rounds up, end rounds down, window always shrinks toward HW.",
+        "rounding_minutes": 5,
+        "rounding_mode": "conservative_inward"
     }
 }

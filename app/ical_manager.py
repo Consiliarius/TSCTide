@@ -56,6 +56,7 @@ from app.database import (
     get_calendar_events, upsert_calendar_event, cleanup_superseded_events,
     get_ukho_tide_events, get_harmonic_predictions,
 )
+from app.window_display import round_window_conservative
 
 logger = logging.getLogger(__name__)
 
@@ -227,12 +228,13 @@ def _format_tender_line(ev_data: dict, tz) -> Optional[str]:
     if not t_start or not t_end:
         return None
 
-    s = dtparse.parse(t_start)
-    e = dtparse.parse(t_end)
-    if s.tzinfo is None:
-        s = s.replace(tzinfo=timezone.utc)
-    if e.tzinfo is None:
-        e = e.replace(tzinfo=timezone.utc)
+    # Conservative-inward round the tender window edges (render-only), the
+    # same grid as the vessel window. If it collapses to under one grid step,
+    # omit the tender line rather than show a sub-grid window.
+    rounded = round_window_conservative(t_start, t_end)
+    if rounded is None:
+        return None
+    s, e = rounded
     s_local = s.astimezone(tz).strftime("%H:%M")
     e_local = e.astimezone(tz).strftime("%H:%M")
 
@@ -326,6 +328,18 @@ def generate_feed_for_mooring(mooring_id: int, boat_name: str = "",
         if end.tzinfo is None:
             end = end.replace(tzinfo=timezone.utc)
 
+        # Conservative-inward round the displayed window edges (render-only;
+        # the stored row keeps full precision). Skipped for always-accessible
+        # (rendered all-day) and the wind_no_access start==end marker. A
+        # window that collapses to under one grid step is omitted rather than
+        # emitted as an inverted or zero-length event.
+        is_marker = (not is_always) and (start == end)
+        if not is_always and not is_marker:
+            rounded = round_window_conservative(start, end)
+            if rounded is None:
+                continue
+            start, end = rounded
+
         # Recalculate title from current state. Pass always_accessible through
         # so the title can reflect it; pass duration in minutes for the normal
         # window case.
@@ -402,17 +416,7 @@ def generate_export_ics(windows: list[dict], source: str,
         if w.get("below_threshold"):
             continue
 
-        ical_event = Event()
         is_always = bool(w.get("always_accessible"))
-        title = build_event_title(w, source, boat_name, mooring_id)
-        ical_event.add("summary", title)
-
-        # Use the same cycle-based UID as the subscription feed.
-        # This prevents duplicates when a user both subscribes to a feed
-        # and imports an export for the same mooring.
-        from app.access_calc import generate_event_uid
-        uid = generate_event_uid(mooring_id or 0, w["hw_timestamp"])
-        ical_event["uid"] = uid
 
         start = dtparse.parse(w["start_time"])
         end = dtparse.parse(w["end_time"])
@@ -421,6 +425,31 @@ def generate_export_ics(windows: list[dict], source: str,
             start = start.replace(tzinfo=timezone.utc)
         if end.tzinfo is None:
             end = end.replace(tzinfo=timezone.utc)
+
+        # Conservative-inward round the displayed edges (render-only), as in
+        # the subscription feed. Skipped for always-accessible (all-day) and
+        # the wind_no_access start==end marker; a window that collapses to
+        # under one grid step is omitted rather than emitted zero-length.
+        is_marker = (not is_always) and (start == end)
+        if not is_always and not is_marker:
+            rounded = round_window_conservative(start, end)
+            if rounded is None:
+                continue
+            start, end = rounded
+
+        ical_event = Event()
+        # Title duration reflects the rounded edges.
+        title_window = dict(w)
+        title_window["duration_minutes"] = int((end - start).total_seconds() / 60)
+        title = build_event_title(title_window, source, boat_name, mooring_id)
+        ical_event.add("summary", title)
+
+        # Use the same cycle-based UID as the subscription feed.
+        # This prevents duplicates when a user both subscribes to a feed
+        # and imports an export for the same mooring.
+        from app.access_calc import generate_event_uid
+        uid = generate_event_uid(mooring_id or 0, w["hw_timestamp"])
+        ical_event["uid"] = uid
 
         if is_always:
             # Always-accessible: render as an all-day event on HW's local date
@@ -697,6 +726,75 @@ def generate_langstone_ukho_7d_feed() -> Path:
     _atomic_write_bytes(feed_path, cal.to_ical())
     logger.info(
         f"Generated Langstone_UKHO_7d.ics: {len(events)} events ({source_label})"
+    )
+    return feed_path
+
+
+def generate_langstone_ukho_7d_pressure_corrected_feed() -> Path:
+    """
+    Regenerate Langstone_UKHO_7d_PressureCorrected.ics: the UKHO 7-day tide
+    feed with the barometric (inverse-barometer) correction applied to event
+    HEIGHTS. Event times and cycle-based UIDs are unchanged, so this is a
+    height-only sibling of generate_langstone_ukho_7d_feed -- a subscriber sees
+    the same tide events at the same times, with pressure-adjusted heights.
+
+    Opt-in is by subscribing to this URL; there is no per-mooring toggle. The
+    correction is gated on the system master (barometric.enabled): while the
+    master is off the feed is byte-equivalent to the uncorrected 7d feed, so
+    the whole feature stays dark until it is enabled. Heights render at 0.1 m,
+    which is the implicit deadband -- a day-to-day forecast change alters the
+    feed only when it crosses a 0.1 m boundary, on a same-time, same-UID event.
+
+    Days 0..~5 are corrected where the pressure forecast reaches; days ~5..7
+    are beyond the forecast horizon and pass through identical to baseline.
+
+    Always returns the path; empty data still produces a valid (empty) feed.
+    """
+    ensure_dirs()
+    from app.config import to_utc_str, get_barometric_enabled
+    from app.database import get_tide_events
+    from app.barometric import apply_barometric_correction, make_pressure_provider
+
+    now = datetime.now(timezone.utc)
+    start = to_utc_str(now)
+    end = to_utc_str(now + timedelta(days=7))
+
+    native_check = get_tide_events(start, end, source="ukho", station="langstone")
+    if native_check:
+        source_label = "UKHO Langstone (pressure-corrected)"
+        events = native_check
+    else:
+        portsmouth = get_tide_events(start, end, source="ukho", station="portsmouth")
+        if portsmouth:
+            source_label = "UKHO Portsmouth (Langstone offset + pressure-corrected)"
+            events = get_ukho_tide_events(start, end)
+        else:
+            source_label = "UKHO (pressure-corrected)"
+            events = []
+
+    # Apply the barometric correction to event heights (times unchanged). Gated
+    # on the master flag so the feed is identical to baseline while dark.
+    if events and get_barometric_enabled(False):
+        events = apply_barometric_correction(events, make_pressure_provider())
+
+    cal = Calendar()
+    cal.add("prodid", "-//Tidal Access Langstone UKHO 7d Pressure-Corrected//EN")
+    cal.add("version", "2.0")
+    cal.add("calscale", "GREGORIAN")
+    cal.add("x-wr-calname", "Langstone Tides - UKHO 7d (pressure-corrected)")
+    cal.add("x-wr-timezone", DEFAULT_TIMEZONE)
+    cal.add("refresh-interval;value=duration", "PT12H")
+    cal.add("x-published-ttl", "PT12H")
+
+    tz = pytz.timezone(DEFAULT_TIMEZONE)
+    for ev in events:
+        cal.add_component(_build_tide_event(ev, source_label, tz, is_estimate=False))
+
+    feed_path = FEEDS_DIR / "Langstone_UKHO_7d_PressureCorrected.ics"
+    _atomic_write_bytes(feed_path, cal.to_ical())
+    logger.info(
+        f"Generated Langstone_UKHO_7d_PressureCorrected.ics: "
+        f"{len(events)} events ({source_label})"
     )
     return feed_path
 

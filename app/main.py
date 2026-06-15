@@ -49,6 +49,7 @@ from app.ical_manager import (
     generate_export_ics, store_windows_as_events,
     generate_feed_for_mooring,
     generate_langstone_ukho_7d_feed, generate_langstone_harmonic_180d_feed,
+    generate_langstone_ukho_7d_pressure_corrected_feed,
 )
 from app.scheduler import start_scheduler, shutdown_scheduler, ensure_wind_jobs_scheduled
 
@@ -470,6 +471,7 @@ async def save_mooring_config(request: Request):
             "safety_margin_m": result.get("safety_margin_m"),
             "calendar_enabled": bool(result.get("calendar_enabled")),
             "wind_offset_enabled": bool(result.get("wind_offset_enabled")),
+            "barometric_enabled": bool(result.get("barometric_enabled")),
             "shallow_direction": result.get("shallow_direction", ""),
             "shallow_extra_depth_m": result.get("shallow_extra_depth_m", 0),
             "use_observations": bool(result.get("use_observations")),
@@ -1172,6 +1174,7 @@ async def trigger_ukho_fetch():
     try:
         generate_langstone_ukho_7d_feed()
         generate_langstone_harmonic_180d_feed()
+        generate_langstone_ukho_7d_pressure_corrected_feed()
     except Exception as e:
         logger.warning(f"Langstone feed regeneration after manual fetch failed: {e}")
 
@@ -1299,6 +1302,22 @@ async def calculate_access_windows(request: Request):
     if not events:
         return {"windows": [], "source": source, "event_count": 0, "message": "No tide data available"}
 
+    # Barometric correction (v2.9): adjust predicted event heights for forecast
+    # pressure before window computation. Gated on the system master AND this
+    # mooring's opt-in, so the anonymous path (mooring is None) always stays
+    # pure. Events are already Langstone-corrected here, so pressure is sampled
+    # at the corrected event time. Per-event freshness is handled inside
+    # apply_barometric_correction (events with no fresh forecast pass through
+    # uncorrected). The reassigned list flows into both the vessel window
+    # computation below and the tender pass, which share it.
+    from app.config import get_barometric_enabled
+    barometric_applied = bool(
+        mooring and mooring.get("barometric_enabled") and get_barometric_enabled(False)
+    )
+    if barometric_applied:
+        from app.barometric import apply_barometric_correction, make_pressure_provider
+        events = apply_barometric_correction(events, make_pressure_provider())
+
     windows = compute_access_windows(
         events=events,
         draught_m=float(draught),
@@ -1330,6 +1349,16 @@ async def calculate_access_windows(request: Request):
             w["tender_always_accessible"] = bool(tw.get("always_accessible"))
             w["tender_below_threshold"] = bool(tw.get("below_threshold"))
 
+    # Conservative 5-minute display rounding (v2.9, render-only). Attaches
+    # display_* fields the UI renders, plus negligible_access when inward
+    # rounding collapses a window. The raw start_time/end_time/tender_* are
+    # left intact so this same response round-trips to /feed/update and
+    # /export-ics at full precision (storage and the iCal emit-time rounding
+    # both work from the raw edges).
+    from app.window_display import display_fields
+    for w in windows:
+        w.update(display_fields(w))
+
     # v2: This endpoint is read-only. Storing events and regenerating the
     # iCal feed now happens via POST /api/moorings/{id}/feed/update, which
     # is PIN-gated. The UI passes this response body back to that endpoint
@@ -1350,6 +1379,7 @@ async def calculate_access_windows(request: Request):
         "source": source,
         "parameters": parameters,
         "wind_info": wind_info,
+        "barometric_applied": barometric_applied,
         "event_count": len([w for w in windows if not w.get("below_threshold")]),
     }
 
@@ -1996,6 +2026,25 @@ async def serve_langstone_ukho_7d():
     feed_path = FEEDS_DIR / "Langstone_UKHO_7d.ics"
     if not feed_path.exists():
         feed_path = generate_langstone_ukho_7d_feed()
+    return Response(
+        content=feed_path.read_bytes(),
+        media_type="text/calendar",
+        headers={
+            "Content-Type": "text/calendar; charset=utf-8",
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
+
+
+@app.get("/feeds/Langstone_UKHO_7d_PressureCorrected.ics")
+async def serve_langstone_ukho_7d_pressure_corrected():
+    """Serve the barometric pressure-corrected UKHO 7-day tide feed.
+    Regenerates if missing."""
+    feed_path = FEEDS_DIR / "Langstone_UKHO_7d_PressureCorrected.ics"
+    if not feed_path.exists():
+        feed_path = generate_langstone_ukho_7d_pressure_corrected_feed()
     return Response(
         content=feed_path.read_bytes(),
         media_type="text/calendar",

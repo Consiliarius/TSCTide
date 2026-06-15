@@ -105,6 +105,7 @@ async def daily_ukho_fetch():
     from app.ical_manager import (
         store_windows_as_events, generate_feed_for_mooring,
         generate_langstone_ukho_7d_feed, generate_langstone_harmonic_180d_feed,
+        generate_langstone_ukho_7d_pressure_corrected_feed,
     )
 
     logger.info("Running daily UKHO fetch...")
@@ -259,6 +260,66 @@ async def daily_ukho_fetch():
         log_activity(
             event_type="langstone_feed_refresh",
             message=f"Langstone feed regeneration failed: {e}",
+            severity="error",
+        )
+
+    # --- Barometric pressure forecast refresh (v2.9, store-only) ---
+    # Fetch the OWM 5-day/3-hourly pressure forecast and store it for the
+    # barometric correction. STORE ONLY: no correction is applied to any feed
+    # or window here -- the read/feed paths consume this table later, and only
+    # once the master flag is enabled. A failure must not affect tide or feed
+    # generation, so it is isolated at the bottom of the job in its own guard.
+    try:
+        from app.wind import fetch_pressure_forecast
+        from app.database import (
+            store_pressure_forecast, cleanup_old_pressure_forecast,
+        )
+        forecast_steps = await fetch_pressure_forecast()
+        if forecast_steps:
+            fetched_at = to_utc_str(datetime.now(timezone.utc))
+            stored = store_pressure_forecast(forecast_steps, fetched_at)
+            cleanup_old_pressure_forecast()
+            log_activity(
+                event_type="pressure_forecast_refresh",
+                message=f"Stored {stored} pressure-forecast steps "
+                        f"({forecast_steps[0]['timestamp']} .. {forecast_steps[-1]['timestamp']})",
+                severity="success",
+                details={
+                    "step_count": stored,
+                    "horizon_start": forecast_steps[0]["timestamp"],
+                    "horizon_end": forecast_steps[-1]["timestamp"],
+                },
+            )
+        else:
+            log_activity(
+                event_type="pressure_forecast_refresh",
+                message="Pressure-forecast fetch returned no data",
+                severity="warning",
+            )
+    except Exception as e:
+        logger.error(f"Pressure forecast refresh failed: {e}")
+        log_activity(
+            event_type="pressure_forecast_refresh",
+            message=f"Pressure forecast refresh failed: {e}",
+            severity="error",
+        )
+
+    # --- Standalone pressure-corrected tide feed (v2.9) ---
+    # Regenerate AFTER the forecast refresh above so it uses today's forecast.
+    # The correction is gated on the master flag inside the generator, so while
+    # the feature is dark this feed is byte-equivalent to Langstone_UKHO_7d.ics.
+    try:
+        generate_langstone_ukho_7d_pressure_corrected_feed()
+        log_activity(
+            event_type="langstone_feed_refresh",
+            message="Regenerated Langstone_UKHO_7d_PressureCorrected.ics",
+            severity="info",
+        )
+    except Exception as e:
+        logger.error(f"Pressure-corrected feed regeneration failed: {e}")
+        log_activity(
+            event_type="langstone_feed_refresh",
+            message=f"Pressure-corrected feed regeneration failed: {e}",
             severity="error",
         )
 

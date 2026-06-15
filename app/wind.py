@@ -202,6 +202,68 @@ async def fetch_current_weather() -> dict | None:
         return None
 
 
+async def fetch_pressure_forecast() -> list[dict] | None:
+    """
+    Fetch the OWM 5-day / 3-hourly pressure forecast for the barometric
+    correction (v2.9).
+
+    Returns a list of ``{"timestamp": ISO-Z, "pressure_hpa": float}`` steps
+    (~40 entries at 3-hour spacing, ~5-day horizon), oldest first, or None on
+    failure / no key. This is store-only data: it is fetched by the daily job
+    and consumed later by the barometric pressure provider; it is never
+    written into the tide tables.
+
+    Prefers ``main.sea_level`` (sea-level pressure, what the inverse-barometer
+    correction wants) and falls back to ``main.pressure``. At the Langstone
+    lat/lon both are populated and equal (verified 15 June 2026), so the
+    fallback is belt-and-braces for a station where they might diverge.
+    """
+    if not OWM_API_KEY:
+        logger.warning("No OWM API key configured")
+        return None
+
+    url = "https://api.openweathermap.org/data/2.5/forecast"
+    params = {
+        "lat": LOCATION_LAT,
+        "lon": LOCATION_LON,
+        "appid": OWM_API_KEY,
+        "units": "metric",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+
+        steps = []
+        for entry in data.get("list", []):
+            main_block = entry.get("main", {})
+            pressure = main_block.get("sea_level")
+            if pressure is None:
+                pressure = main_block.get("pressure")
+            dt_unix = entry.get("dt")
+            if pressure is None or dt_unix is None:
+                continue
+            ts = to_utc_str(datetime.fromtimestamp(dt_unix, tz=timezone.utc))
+            steps.append({"timestamp": ts, "pressure_hpa": float(pressure)})
+
+        if not steps:
+            logger.warning("OWM forecast returned no usable pressure steps")
+            return None
+
+        steps.sort(key=lambda s: s["timestamp"])
+        logger.info(
+            f"Pressure forecast: {len(steps)} steps, "
+            f"{steps[0]['timestamp']} .. {steps[-1]['timestamp']}"
+        )
+        return steps
+
+    except Exception as e:
+        logger.error(f"OWM forecast request failed: {e}")
+        return None
+
+
 async def fetch_current_wind() -> dict | None:
     """
     Fetch current wind observation from OpenWeatherMap.

@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS moorings (
     safety_margin_m REAL NOT NULL DEFAULT 0.3,
     timezone TEXT NOT NULL DEFAULT 'Europe/London',
     wind_offset_enabled INTEGER DEFAULT 0,
+    barometric_enabled INTEGER DEFAULT 0,
     shallow_direction TEXT DEFAULT '',
     shallow_extra_depth_m REAL DEFAULT 0.0,
     calendar_enabled INTEGER DEFAULT 0,
@@ -143,6 +144,13 @@ CREATE TABLE IF NOT EXISTS pressure_history (
     UNIQUE(timestamp)
 );
 CREATE INDEX IF NOT EXISTS idx_pressure_ts ON pressure_history(timestamp);
+
+CREATE TABLE IF NOT EXISTS pressure_forecast (
+    target_time TEXT PRIMARY KEY,      -- ISO UTC time the forecast step is FOR
+    pressure_hpa REAL NOT NULL,        -- forecast sea-level pressure, hPa
+    fetched_at TEXT NOT NULL           -- ISO UTC time the forecast was retrieved
+);
+CREATE INDEX IF NOT EXISTS idx_pforecast_target ON pressure_forecast(target_time);
 """
 
 
@@ -196,6 +204,10 @@ def init_db():
     if "tender_min_depth_m" not in mooring_cols:
         conn.execute(
             "ALTER TABLE moorings ADD COLUMN tender_min_depth_m REAL DEFAULT 0.3"
+        )
+    if "barometric_enabled" not in mooring_cols:
+        conn.execute(
+            "ALTER TABLE moorings ADD COLUMN barometric_enabled INTEGER DEFAULT 0"
         )
 
     # Migrate harmonic_predictions: add cycle_number column for cycle-based
@@ -357,6 +369,7 @@ def save_mooring(data: dict) -> dict:
             conn.execute("""
                 UPDATE moorings SET boat_name=?, draught_m=?, drying_height_m=?,
                     safety_margin_m=?, timezone=?, wind_offset_enabled=?,
+                    barometric_enabled=?,
                     shallow_direction=?, shallow_extra_depth_m=?, calendar_enabled=?,
                     use_observations=?, tender_access_enabled=?, tender_min_depth_m=?,
                     updated_at=?
@@ -368,6 +381,7 @@ def save_mooring(data: dict) -> dict:
                 data["safety_margin_m"],
                 data.get("timezone", "Europe/London"),
                 data.get("wind_offset_enabled", 0),
+                1 if data.get("barometric_enabled") else 0,
                 data.get("shallow_direction", ""),
                 data.get("shallow_extra_depth_m", 0.0),
                 data.get("calendar_enabled", 0),
@@ -380,11 +394,12 @@ def save_mooring(data: dict) -> dict:
         else:
             conn.execute("""
                 INSERT INTO moorings (mooring_id, boat_name, draught_m, drying_height_m,
-                    safety_margin_m, timezone, wind_offset_enabled, shallow_direction,
+                    safety_margin_m, timezone, wind_offset_enabled, barometric_enabled,
+                    shallow_direction,
                     shallow_extra_depth_m, calendar_enabled, use_observations,
                     tender_access_enabled, tender_min_depth_m,
                     created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 data["mooring_id"],
                 data.get("boat_name", ""),
@@ -393,6 +408,7 @@ def save_mooring(data: dict) -> dict:
                 data["safety_margin_m"],
                 data.get("timezone", "Europe/London"),
                 data.get("wind_offset_enabled", 0),
+                1 if data.get("barometric_enabled") else 0,
                 data.get("shallow_direction", ""),
                 data.get("shallow_extra_depth_m", 0.0),
                 data.get("calendar_enabled", 0),
@@ -1756,6 +1772,69 @@ def cleanup_old_pressure_history(hours: int = 24) -> None:
     with db_connection() as conn:
         conn.execute(
             "DELETE FROM pressure_history WHERE timestamp < ?", (cutoff,)
+        )
+
+
+# --- Pressure Forecast (v2.9) ---
+#
+# Stores the OWM 5-day/3-hourly forecast steps used by the barometric
+# correction. Unlike pressure_history (past observations for the trend
+# panel), each row here is a FUTURE target time with the forecast pressure
+# for it, plus the fetch time so the provider can apply a staleness gate.
+#
+# Refreshed once per day by daily_ukho_fetch. Latest-fetch-wins per target
+# time: OWM returns steps on a fixed 3-hour UTC grid, so each daily fetch
+# overwrites the overlapping targets with the fresher forecast and extends
+# the horizon. Past target times are pruned. This table is store-only until
+# the barometric read/feed paths consume it; nothing here feeds the tide
+# tables or the calibration corpus.
+
+def store_pressure_forecast(steps: list[dict], fetched_at: str) -> int:
+    """
+    Store forecast pressure steps, latest-fetch-wins per target time.
+
+    Each step is ``{"timestamp": ISO-Z, "pressure_hpa": float}``. A newer
+    fetch for the same target time overwrites the older row, so the freshest
+    forecast for a given future time is always the one retained. Returns the
+    number of steps written.
+    """
+    if not steps:
+        return 0
+    rows = [(s["timestamp"], float(s["pressure_hpa"]), fetched_at) for s in steps]
+    with db_connection() as conn:
+        conn.executemany(
+            "INSERT OR REPLACE INTO pressure_forecast "
+            "(target_time, pressure_hpa, fetched_at) VALUES (?, ?, ?)",
+            rows,
+        )
+    return len(rows)
+
+
+def get_pressure_forecast() -> list[dict]:
+    """
+    Return all stored forecast steps, earliest target first. Each dict has
+    target_time, pressure_hpa, and fetched_at. Consumed by the barometric
+    pressure provider (app.barometric.make_pressure_provider).
+    """
+    with db_connection() as conn:
+        rows = conn.execute(
+            "SELECT target_time, pressure_hpa, fetched_at FROM pressure_forecast "
+            "ORDER BY target_time"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def cleanup_old_pressure_forecast(hours: int = 6) -> None:
+    """
+    Remove forecast steps whose target time is more than N hours in the past.
+
+    A small past margin (default 6 h) is kept so an interpolation for an event
+    near 'now' still has a bracketing step on the trailing side.
+    """
+    cutoff = to_utc_str(datetime.now(timezone.utc) - timedelta(hours=hours))
+    with db_connection() as conn:
+        conn.execute(
+            "DELETE FROM pressure_forecast WHERE target_time < ?", (cutoff,)
         )
 
 
