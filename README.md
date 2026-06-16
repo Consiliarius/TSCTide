@@ -2,7 +2,7 @@
 
 A Docker-containerised application for predicting when a boat on a swing mooring in Langstone Harbour has sufficient water depth to depart and arrive.
 
-**Version 2** — adds per-mooring 6-digit PIN protection, decouples iCal feed updates from calculation, restructures the calibration system to split base drying height from shallow-side wind offset, and adds standalone Langstone tide feeds (UKHO 7-day and combined UKHO+harmonic 180-day). **v2.8** adds an interactive Tidal Curve panel showing predicted heights with crosshair hover, a live "now" line, access-threshold lines and shaded access bands for the loaded mooring, sunrise/sunset markers, a Spring/Neap/Mid classification, and a date selector for panning across the UKHO window; the tab navigation has also been relocated to a static top menu bar flush with the page header. **v2.8.1** extends the curve panel with a date-based UKHO → harmonic source switch (UKHO for today+0..6, harmonic for day 7+ to the 180-day horizon), a native date picker, and an `est.` accuracy disclaimer when harmonic-sourced. The v1.0 release is preserved on the tag `v1.0`.
+**Version 2** — adds per-mooring 6-digit PIN protection, decouples iCal feed updates from calculation, restructures the calibration system to split base drying height from shallow-side wind offset, and adds standalone Langstone tide feeds (UKHO 7-day and combined UKHO+harmonic 180-day). **v2.8** adds an interactive Tidal Curve panel showing predicted heights with crosshair hover, a live "now" line, access-threshold lines and shaded access bands for the loaded mooring, sunrise/sunset markers, a Spring/Neap/Mid classification, and a date selector for panning across the UKHO window; the tab navigation has also been relocated to a static top menu bar flush with the page header. **v2.8.1** extends the curve panel with a date-based UKHO → harmonic source switch (UKHO for today+0..6, harmonic for day 7+ to the 180-day horizon), a native date picker, and an `est.` accuracy disclaimer when harmonic-sourced. **v2.9** adds a barometric (inverse-barometer) correction to predicted tide heights and access windows — a system master plus per-mooring opt-in that shifts heights for forecast pressure (low pressure raises water, high pressure lowers it), a new standalone pressure-corrected 7-day tide feed, and universal conservative 5-minute rounding of all displayed access-window edges. The v1.0 release is preserved on the tag `v1.0`.
 
 ## Overview
 
@@ -283,8 +283,11 @@ In addition to the per-mooring access-window feeds, two non-mooring feeds publis
 |------|-----|-------|--------|
 | Langstone UKHO 7d | `/feeds/Langstone_UKHO_7d.ics` | next 7 days | UKHO Admiralty data only |
 | Langstone 180d | `/feeds/Langstone_Harmonic_180d.ics` | next 180 days | UKHO for days 0–7, harmonic model for days 8–180 |
+| Langstone UKHO 7d (pressure-corrected) | `/feeds/Langstone_UKHO_7d_PressureCorrected.ics` | next 7 days | UKHO Admiralty data with the barometric correction applied to heights (v2.9) |
 
-Both feeds are publicly accessible (no PIN required) and refresh daily at 02:00 alongside the per-mooring feeds. Each calendar event is rendered as a 1-hour slot centred on the tide event time, with a title like `⚓ HW 4.2m` for measured data or `⚓ est. LW ~1.0m` for harmonic estimates. The event description records the source (`UKHO Langstone`, `UKHO Portsmouth (Langstone offset applied)`, or `Harmonic model (Langstone)`).
+All three feeds are publicly accessible (no PIN required) and refresh daily at 02:00 alongside the per-mooring feeds. Each calendar event is rendered as a 1-hour slot centred on the tide event time, with a title like `⚓ HW 4.2m` for measured data or `⚓ est. LW ~1.0m` for harmonic estimates. The event description records the source (`UKHO Langstone`, `UKHO Portsmouth (Langstone offset applied)`, or `Harmonic model (Langstone)`).
+
+The **pressure-corrected** feed is a height-only sibling of the UKHO 7-day feed: it carries the same tide events at the same times and the same UIDs, with the [barometric correction](#barometric-pressure-correction-v29) applied to the HW/LW heights using the forecast pressure at each event time. Days roughly 0–5 are corrected (where the pressure forecast reaches); days ~5–7 lie beyond the forecast horizon and are identical to the uncorrected feed. While the system master switch is off the feed is byte-equivalent to `Langstone_UKHO_7d.ics`. The two uncorrected feeds are deliberately left uncorrected so they stay in step with UKHO/EasyTide for cross-checking.
 
 The 180-day feed merges UKHO refinements as they become available: when a tide that was previously a harmonic estimate falls within the next 7 days, the next daily refresh replaces it with the UKHO version under the same UID, so calendar apps update the existing event rather than showing a delete-and-add. Harmonic estimates carry a typical accuracy of ±15–20 minutes on time and ±0.15m on height; UKHO data is to the published Admiralty resolution.
 
@@ -443,3 +446,37 @@ Trot (fore-and-aft) moorings that cannot swing, or deep-channel moorings with ne
 An aground observation only contributes to wind-offset calibration when the HW+4h wind sample of the preceding cycle shows wind pushing toward the shallow side, **and** the observed direction of lay matches that wind direction within one compass sector. Aground observations recorded when the wind was not pushing toward shallow carry no information about the magnitude of the offset — they tell you the boat grounded, but not whether the shallow side was involved — and are treated as base drying observations instead.
 
 The calibration also depends on the currently stored base drying height: the implied minimum offset is `observed_height − draught − drying_height`. If the base drying height is updated via the Apply button, the wind-offset suggestion should be re-checked, since its arithmetic baseline has shifted. The UI shows an inline note recording which base drying height was used for the current suggestion.
+
+## Barometric Pressure Correction (v2.9)
+
+UKHO predictions (and the harmonic model, which is calibrated to UKHO) assume **average** barometric pressure. Real sea level departs from that prediction with the barometer — the *inverse barometer* effect: low pressure raises observed water above the prediction, high pressure depresses it. The barometric correction adjusts predicted tide **heights** (and therefore the computed access windows) for the deviation of the forecast pressure from a reference, before the windows are computed:
+
+```
+correction_m = clamp( (P_ref − P_event) × k , ±max )
+```
+
+with `P_ref = 1013.25 hPa`, `k = 0.0100 m/hPa`, and a `±0.30 m` clamp (a synoptic pressure swing seldom moves the static level more than that; exceeding it implies bad data or a storm surge, which this correction does not model). Low pressure → positive correction → **more** water; high pressure → negative correction → **less** water. The coefficient `k` is a regional physical constant fitted offline against the Portsmouth tide gauge — see [docs/CALIBRATION_NOTES.md](docs/CALIBRATION_NOTES.md).
+
+This is distinct from, and composes with, the wind offset: the wind offset shifts the **threshold** (effective drying height under the boat); the barometric correction shifts the **water height**. The two are orthogonal and both can apply to the same window.
+
+### How it is gated
+
+Three conditions must all hold for a window to be corrected:
+
+1. **System master** — `barometric.enabled` in `model_config.json` (default `false`). A single rollout/kill switch for the whole feature.
+2. **Per-mooring opt-in** — a toggle in each mooring's config panel (`barometric_enabled`, default off), beside the wind-offset settings.
+3. **A fresh forecast** covering the event time. Pressure comes from the OpenWeatherMap 5-day / 3-hourly forecast, fetched and stored once per day by the 02:00 job. Beyond the forecast horizon (~5 days) **no** correction is applied — stale pressure is never extrapolated. An individual event whose forecast is missing or older than `forecast_staleness_hours` (default 36 h, tolerating one missed daily fetch) reverts to its uncorrected baseline; a single failed fetch never wholesale-reverts a feed.
+
+The correction **value** is system-level (one pressure series, one `k` — every opted-in mooring gets the identical shift at a given tide); only the **opt-in decision** is per-mooring. The anonymous calculate path (no mooring selected) always shows the pure, uncorrected forecast.
+
+**Two skippers can see different window times for the same tide** — one opted in, one not — exactly as wind-adjusted windows already differ between moorings. This is intended.
+
+### Feeds, churn, and rounding
+
+- A **standalone** pressure-corrected tide feed (`Langstone_UKHO_7d_PressureCorrected.ics`, above) is height-corrected with stable event times and UIDs; opting in is simply subscribing to that URL.
+- For **per-mooring** access-window feeds, a height correction moves the threshold-crossing *times*. Stored windows keep full precision; on the daily regeneration an event is only rewritten when a raw window edge moved by at least `window_deadband_minutes` (default 5 min) versus the currently-stored edge — so small day-to-day forecast jitter does not churn the feed or flicker the displayed slot, while a genuine synoptic change propagates. A calibration **Apply** or a wind grounding job carries the correction too, so those write paths stay consistent with the daily one.
+- Independently of barometric, **all** displayed access-window edges (vessel and tender, corrected or not) are rounded to the nearest 5 minutes, *conservative inward*: the start rounds up (later), the end rounds down (earlier), so a displayed window always sits inside the computed one and never overstates access. A window that collapses below one grid step is shown as negligible (no usable access) rather than as an inverted or zero-length event. The model's own timing uncertainty is ~15–20 min, so this rounding removes false precision without losing real information.
+
+### Enabling
+
+The feature ships **disabled** (`barometric.enabled = false`); per-mooring toggles do nothing until the master is on. To enable: set `barometric.enabled` to `true` in `app/model_config.json` and rebuild the image (`docker compose up -d --build`, since the config is bundled, not mounted), then opt in individual moorings from their config panels. The current barometric effect at the live measured pressure is surfaced in the Current Conditions panel while the master is on.

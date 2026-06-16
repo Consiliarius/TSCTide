@@ -694,6 +694,87 @@ selection was made with the broken sweep and is not reproducible
 without that defect. The current deployed parameters (75/94 from
 v2.5.7) ARE reproducible from the corrected sweep.
 
+## Barometric coefficient k (v2.9)
+
+The v2.9 barometric correction shifts predicted tide heights for the
+deviation of forecast pressure from a reference,
+`correction_m = clamp((P_ref − P) × k × scale, ±0.30 m)`, with
+`P_ref = 1013.25 hPa`, `k = 0.0100 m/hPa`, `scale = 1.0`. This section
+records the provenance of `k` and why `scale_factor` has no tuning
+source. The full design rationale is in
+`docs/V2.9_BAROMETRIC_DESIGN.md` (§6).
+
+### k is validated offline, not from mooring observations
+
+Mooring observations are **not** a tuning source for `k`: a single user
+records too few to accumulate a usable pressure-stratified dataset, and
+— unlike the tidal secondary-port offset, which captures genuine *local*
+astronomical-tide propagation — the inverse-barometer effect is
+**regional** (pressure systems span ~1000 km; UKHO notes water level
+responds to average pressure "over a considerable area"). So the
+Portsmouth-derived coefficient is the correct Langstone coefficient to
+better than our precision, and there are **no observation-pipeline or
+schema changes in v2.9** for this purpose.
+
+### The regression method
+
+`scripts/validate_barometric_k.py` fits
+
+```
+(measured_sea_level − harmonic_prediction) = intercept + k · (P_ref − P)
+```
+
+The **slope is the empirical `k`**. Crucially, datum offset (Portsmouth
+Chart Datum ↔ the gauge's mAOD reference) and any constant instrument
+bias fall into the **intercept**, so `k` is identifiable without precise
+datum alignment. Measured water level comes from the UK National Tide
+Gauge Network at Portsmouth (station `E71839`, mAOD), pulled
+programmatically — the Defra/EA flood-monitoring **archive**
+(`--source ea-archive`, daily all-station dumps that include the
+Portsmouth 15-minute tidal rows) gives multi-year history with no manual
+download; the BODC quality-controlled archive (`--source csv`) is an
+optional gold-standard alternative. Historical pressure and wind come
+from the Open-Meteo ERA5 archive (free, no key), interpolated to each
+reading. The fit is pure-Python OLS (no numpy).
+
+### Result and decision (15 June 2026)
+
+A 12-month fit (2025-06-01 .. 2026-05-31; 32,938 matched readings;
+pressure span 969.7–1034.2 hPa, i.e. 64.5 hPa — deep lows to strong
+highs) gave:
+
+| Sample            | k (m/hPa) | SE       | intercept | R²   |
+|-------------------|----------:|---------:|----------:|-----:|
+| All points        | +0.01047  | 0.00014  | −2.59 m   | 0.14 |
+| Wind ≤ 8 m/s      | +0.00999  | 0.00015  | −2.59 m   | 0.14 |
+
+The tight standard error over a wide pressure range is a robust fit. The
+wind filter lowering `k` is the expected surge-reduction direction
+(deep lows bring wind setup that co-varies with low pressure), and the
+filtered **k ≈ 0.0100** coincides with the textbook inverse-barometer
+1 cm/hPa — about 13% above the old UKHO-rounded prior 0.00882.
+
+**Decision: ship k = 0.0100.** A second year was judged not worth it:
+the fit is systematic-limited (the all-points-vs-wind-filtered spread
+~0.0005 exceeds the SE several-fold), `k` is a stable physical constant
+not expected to vary year to year, the pressure range is already
+near-maximal, and the 13% gap from the prior is below the 5-minute
+display rounding while the deployed error budget is dominated by
+forecast-pressure error and the harmonic/curve model (~0.2 m RMS — note
+R² was only 0.14). The chosen follow-up is the production
+**self-consistency check** (does the corrected residual still slope with
+pressure, once live?), not more offline fitting.
+
+### scale_factor stays 1.0
+
+`barometric.scale_factor` is a manual trim multiplier with **no
+empirical tuning source** — the effect is regional (Portsmouth ≈
+Langstone), so there is nothing local to fit it against. It is kept only
+as a documented override and stays `1.0`. `k` itself is physics and does
+not drift, so its validation is a one-off offline fit (this script),
+**not** an ongoing automated loop; there is no `sea_level_observations`
+table or daily gauge fetch.
+
 ## How to update the model configuration
 
 As of v2.5.5 the model configuration lives only in the bundled file

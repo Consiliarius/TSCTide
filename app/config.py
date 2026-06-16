@@ -293,6 +293,102 @@ def get_secondary_port_offset(field: str, default: float) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Barometric-correction accessors (v2.9)
+# ---------------------------------------------------------------------------
+#
+# Inverse-barometer correction of predicted tide height, resolved lenient
+# exactly like the offsets above. The module-level fallback defaults live in
+# app/barometric.py (the consuming module) and are passed in by the caller,
+# per the v2.5.6 convention. The system master (get_barometric_enabled)
+# defaults off, so a missing or malformed "barometric" section disables the
+# feature. See docs/V2.9_BAROMETRIC_DESIGN.md.
+
+def get_barometric_enabled(default: bool) -> bool:
+    """
+    System master switch for the barometric correction.
+    JSON path: barometric.enabled
+    """
+    return _resolve_scalar("barometric.enabled", default, bool)
+
+
+def get_barometric_reference_hpa(default: float) -> float:
+    """
+    Reference (average) pressure in hPa; deviations from this drive the
+    correction.
+    JSON path: barometric.reference_hpa
+    """
+    return _resolve_scalar("barometric.reference_hpa", default, float)
+
+
+def get_barometric_coefficient_m_per_hpa(default: float) -> float:
+    """
+    Inverse-barometer coefficient k, metres of water per hPa.
+    JSON path: barometric.coefficient_m_per_hpa
+    """
+    return _resolve_scalar("barometric.coefficient_m_per_hpa", default, float)
+
+
+def get_barometric_scale_factor(default: float) -> float:
+    """
+    Manual trim multiplier on the correction. No empirical tuning source
+    (regional effect, Portsmouth ~= Langstone); stays 1.0.
+    JSON path: barometric.scale_factor
+    """
+    return _resolve_scalar("barometric.scale_factor", default, float)
+
+
+def get_barometric_max_correction_m(default: float) -> float:
+    """
+    Symmetric clamp on the correction magnitude, metres.
+    JSON path: barometric.max_correction_m
+    """
+    return _resolve_scalar("barometric.max_correction_m", default, float)
+
+
+def get_barometric_forecast_staleness_hours(default: float) -> float:
+    """
+    Maximum forecast age in hours before an event reverts to uncorrected.
+    JSON path: barometric.forecast_staleness_hours
+    """
+    return _resolve_scalar("barometric.forecast_staleness_hours", default, float)
+
+
+def get_barometric_window_deadband_minutes(default: int) -> int:
+    """
+    Minimum raw window-edge movement, in minutes, before a stored feed event
+    is rewritten (feed-write churn control).
+    JSON path: barometric.window_deadband_minutes
+    """
+    return _resolve_scalar("barometric.window_deadband_minutes", default, int)
+
+
+# ---------------------------------------------------------------------------
+# Window-display rounding accessors (v2.9)
+# ---------------------------------------------------------------------------
+#
+# Display-only rounding of access-window edges. Applies to ALL windows
+# regardless of correction. Module-level fallback defaults live in the
+# consuming render helper and are passed in by the caller. See
+# docs/V2.9_BAROMETRIC_DESIGN.md.
+
+def get_window_rounding_minutes(default: int) -> int:
+    """
+    Grid size, in minutes, for rounding displayed window edges.
+    JSON path: window_display.rounding_minutes
+    """
+    return _resolve_scalar("window_display.rounding_minutes", default, int)
+
+
+def get_window_rounding_mode(default: str) -> str:
+    """
+    Window-edge rounding mode. "conservative_inward" rounds start up and end
+    down so the window always shrinks toward HW.
+    JSON path: window_display.rounding_mode
+    """
+    return _resolve_scalar("window_display.rounding_mode", default, str)
+
+
+# ---------------------------------------------------------------------------
 # Cycle-number helper (shared across access_calc.py, ical_manager.py,
 # database.py)
 # ---------------------------------------------------------------------------

@@ -105,6 +105,7 @@ async def daily_ukho_fetch():
     from app.ical_manager import (
         store_windows_as_events, generate_feed_for_mooring,
         generate_langstone_ukho_7d_feed, generate_langstone_harmonic_180d_feed,
+        generate_langstone_ukho_7d_pressure_corrected_feed,
     )
 
     logger.info("Running daily UKHO fetch...")
@@ -149,11 +150,37 @@ async def daily_ukho_fetch():
     # Recalculate access windows for all calendar-enabled moorings
     moorings = get_calendar_enabled_moorings()
 
+    # Barometric correction (v2.9): the correction value is system-level (one
+    # pressure series, one k -- every opted-in mooring gets the identical shift
+    # at a given tide), so build the corrected events ONCE and reuse them for
+    # every opted-in mooring. Only the opt-in decision is per-mooring. Gated on
+    # the system master, so while the feature is dark calc_events is used
+    # unchanged and store_windows_as_events is called exactly as pre-v2.9.
+    from app.config import (
+        get_barometric_enabled, get_barometric_window_deadband_minutes,
+        get_barometric_forecast_staleness_hours,
+    )
+    barometric_master = get_barometric_enabled(False)
+    barometric_events = None
+    barometric_deadband = None
+    barometric_diags = None
+    if barometric_master:
+        from app.barometric import apply_barometric_correction, make_pressure_provider
+        barometric_diags = []
+        barometric_events = apply_barometric_correction(
+            calc_events, make_pressure_provider(), diagnostics=barometric_diags
+        )
+        barometric_deadband = get_barometric_window_deadband_minutes(5)
+
     updated_count = 0
     for m in moorings:
         try:
+            m_barometric = barometric_master and bool(m.get("barometric_enabled"))
+            m_events = barometric_events if m_barometric else calc_events
+            m_deadband = barometric_deadband if m_barometric else None
+
             windows = compute_access_windows(
-                events=calc_events,
+                events=m_events,
                 draught_m=m["draught_m"],
                 drying_height_m=m["drying_height_m"],
                 safety_margin_m=m["safety_margin_m"],
@@ -164,7 +191,7 @@ async def daily_ukho_fetch():
             if m.get("tender_access_enabled"):
                 tender_depth = float(m.get("tender_min_depth_m") or 0.3)
                 tender_windows = compute_access_windows(
-                    events=calc_events,
+                    events=m_events,
                     draught_m=0.0,
                     drying_height_m=m["drying_height_m"],
                     safety_margin_m=tender_depth,
@@ -177,11 +204,12 @@ async def daily_ukho_fetch():
                 "safety_margin_m": m["safety_margin_m"],
                 "obs_calibrated": 1 if cal.get("confidence", "none") != "none" else 0,
             }
-            store_windows_as_events(
+            store_result = store_windows_as_events(
                 windows, m["mooring_id"], "ukho", m.get("boat_name", ""),
                 calc_params=calc_params,
                 tender_windows=tender_windows,
                 tender_min_depth_m=tender_depth,
+                deadband_minutes=m_deadband,
             )
             if cal.get("confidence") == "none":
                 cal = None
@@ -197,6 +225,9 @@ async def daily_ukho_fetch():
                     "window_count": len(windows),
                     "trigger": "daily_scheduler",
                     "boat_name": m.get("boat_name", ""),
+                    "barometric_applied": m_barometric,
+                    "windows_written": store_result.get("written"),
+                    "windows_unchanged_deadband": store_result.get("skipped"),
                 },
             )
         except Exception as e:
@@ -215,6 +246,40 @@ async def daily_ukho_fetch():
         severity="success" if updated_count == len(moorings) else "warning",
         details={"mooring_count": len(moorings), "updated": updated_count},
     )
+
+    # --- Barometric correction operational record (v2.9, Session G) ---
+    # One system-scoped entry per daily run summarising what the correction did
+    # this cycle: the correction value is system-level (identical for every
+    # opted-in mooring), so a single record is the right granularity. Logged
+    # only when the master is on; while the feature is dark nothing is written.
+    if barometric_master and barometric_diags is not None:
+        from app.barometric import summarize_diagnostics
+        summary = summarize_diagnostics(barometric_diags)
+        opted_in = sum(1 for m in moorings if m.get("barometric_enabled"))
+        staleness_h = get_barometric_forecast_staleness_hours(36)
+        if summary["events_corrected"] > 0:
+            msg = (
+                f"Barometric correction: {summary['events_corrected']}/"
+                f"{summary['events_total']} events corrected "
+                f"({summary.get('pressure_min_hpa')}-{summary.get('pressure_max_hpa')} hPa, "
+                f"max |delta| {summary.get('max_abs_correction_m')} m); "
+                f"{opted_in} mooring(s) opted in"
+            )
+            if summary["clamp_fires"]:
+                msg += f"; {summary['clamp_fires']} clamp fire(s)"
+            severity = "warning" if summary["clamp_fires"] else "info"
+        else:
+            msg = (
+                f"Barometric correction: no events corrected "
+                f"(no forecast within {staleness_h:g}h); feeds at baseline"
+            )
+            severity = "info"
+        log_activity(
+            event_type="barometric_correction",
+            message=msg,
+            severity=severity,
+            details={"opted_in_moorings": opted_in, **summary},
+        )
 
     # --- Harmonic prediction refresh + standalone Langstone feeds ---
     # The Langstone tide feeds (UKHO 7d + 180d) are not per-mooring and run
@@ -259,6 +324,66 @@ async def daily_ukho_fetch():
         log_activity(
             event_type="langstone_feed_refresh",
             message=f"Langstone feed regeneration failed: {e}",
+            severity="error",
+        )
+
+    # --- Barometric pressure forecast refresh (v2.9, store-only) ---
+    # Fetch the OWM 5-day/3-hourly pressure forecast and store it for the
+    # barometric correction. STORE ONLY: no correction is applied to any feed
+    # or window here -- the read/feed paths consume this table later, and only
+    # once the master flag is enabled. A failure must not affect tide or feed
+    # generation, so it is isolated at the bottom of the job in its own guard.
+    try:
+        from app.wind import fetch_pressure_forecast
+        from app.database import (
+            store_pressure_forecast, cleanup_old_pressure_forecast,
+        )
+        forecast_steps = await fetch_pressure_forecast()
+        if forecast_steps:
+            fetched_at = to_utc_str(datetime.now(timezone.utc))
+            stored = store_pressure_forecast(forecast_steps, fetched_at)
+            cleanup_old_pressure_forecast()
+            log_activity(
+                event_type="pressure_forecast_refresh",
+                message=f"Stored {stored} pressure-forecast steps "
+                        f"({forecast_steps[0]['timestamp']} .. {forecast_steps[-1]['timestamp']})",
+                severity="success",
+                details={
+                    "step_count": stored,
+                    "horizon_start": forecast_steps[0]["timestamp"],
+                    "horizon_end": forecast_steps[-1]["timestamp"],
+                },
+            )
+        else:
+            log_activity(
+                event_type="pressure_forecast_refresh",
+                message="Pressure-forecast fetch returned no data",
+                severity="warning",
+            )
+    except Exception as e:
+        logger.error(f"Pressure forecast refresh failed: {e}")
+        log_activity(
+            event_type="pressure_forecast_refresh",
+            message=f"Pressure forecast refresh failed: {e}",
+            severity="error",
+        )
+
+    # --- Standalone pressure-corrected tide feed (v2.9) ---
+    # Regenerate AFTER the forecast refresh above so it uses today's forecast.
+    # The correction is gated on the master flag inside the generator, so while
+    # the feature is dark this feed is byte-equivalent to Langstone_UKHO_7d.ics.
+    try:
+        generate_langstone_ukho_7d_pressure_corrected_feed()
+        log_activity(
+            event_type="langstone_feed_refresh",
+            message="Regenerated Langstone_UKHO_7d_PressureCorrected.ics",
+            severity="info",
+        )
+    except Exception as e:
+        logger.error(f"Pressure-corrected feed regeneration failed: {e}")
+        log_activity(
+            event_type="langstone_feed_refresh",
+            message=f"Pressure-corrected feed regeneration failed: {e}",
             severity="error",
         )
 
@@ -702,6 +827,18 @@ async def wind_observation_job(mooring_id: int, next_hw_timestamp: str):
     if not events:
         logger.info("No tide events around next HW for wind adjustment")
         return
+
+    # Barometric correction (v2.9) composes with the wind offset: barometric
+    # shifts event heights, wind shifts the threshold. Correct the heights for
+    # an opted-in mooring before recomputing this one window, otherwise the
+    # wind job would overwrite the daily job's pressure-corrected window with an
+    # uncorrected one. Gated on the system master AND this mooring's opt-in, so
+    # while the feature is dark this is a no-op. No deadband here: the wind job
+    # is a deliberate, reactive single-window write that should always land.
+    from app.config import get_barometric_enabled
+    if get_barometric_enabled(False) and m.get("barometric_enabled"):
+        from app.barometric import apply_barometric_correction, make_pressure_provider
+        events = apply_barometric_correction(events, make_pressure_provider())
 
     try:
         window = compute_next_window_with_wind(
