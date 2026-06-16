@@ -6,12 +6,11 @@ A Docker-containerised application for predicting when a boat on a swing mooring
 
 ## Overview
 
-The tool computes access windows — the periods around each high water when the tide height exceeds the sum of the mooring's drying height, the boat's draught, and a safety margin. It uses three data sources in priority order:
+The tool computes access windows — the periods around each high water when the tide height exceeds the sum of the mooring's drying height, the boat's draught, and a safety margin. It uses two data sources in priority order:
 
 | Source | Range | Origin | Persisted | Offset Applied |
 |--------|-------|--------|-----------|----------------|
 | **UKHO** | 7 days | Admiralty Tidal API (Langstone native) | Yes | No (native data) |
-| **KHM** | ~1 month | Manual paste from Royal Navy Portsmouth tables | Yes (flagged, overwritten by UKHO) | Yes (Portsmouth → Langstone: +9min, +0.05m HW) |
 | **Harmonic** | Unlimited | Built-in harmonic model (19 constituents, calibrated April 2026) | **No** (display only) | Yes (Portsmouth → Langstone: +9min, +0.05m HW) |
 
 ### Key Features
@@ -93,7 +92,6 @@ tidal-access/
 │   ├── config.py             # Environment + model config
 │   ├── database.py           # SQLite persistence
 │   ├── ukho.py               # UKHO API client
-│   ├── khm_parser.py         # KHM table parser (13-column format)
 │   ├── harmonic.py           # Harmonic prediction (19 constituents, Doodson args)
 │   ├── secondary_port.py     # Portsmouth → Langstone offset
 │   ├── wind.py               # OWM client + offset logic
@@ -325,7 +323,7 @@ Accuracy after the Admiralty-convention offset is applied, measured against the 
 
 The Langstone secondary port offset (Portsmouth → Langstone: +9min, +0.05m HW) was validated against UKHO half-hourly data for both ports in April 2026. The earlier figure of +0.24m HW height offset was reduced to +0.05m based on observed data; LW times and heights are effectively identical between the two ports.
 
-UKHO data remains the most accurate source (Langstone-native, 7-day range). KHM data is second-most accurate within its ~30-day range. The harmonic model provides unlimited-range estimates with the accuracy above — events from this source are prefixed "est." in calendar titles.
+UKHO data remains the most accurate source (Langstone-native, 7-day range). The harmonic model provides unlimited-range estimates with the accuracy above — events from this source are prefixed "est." in calendar titles.
 
 
 ## UKHO API Licensing

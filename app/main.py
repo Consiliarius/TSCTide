@@ -39,7 +39,6 @@ from app.pin import (
     MAX_PIN_ATTEMPTS, PIN_ATTEMPT_WINDOW_MINUTES, PIN_LOCKOUT_MINUTES,
 )
 from app.ukho import fetch_tidal_events
-from app.khm_parser import parse_khm_paste
 from app.harmonic import predict_events as harmonic_predict_events
 from app.secondary_port import apply_offset
 from app.wind import fetch_current_wind, fetch_current_weather
@@ -1193,35 +1192,6 @@ async def trigger_ukho_fetch():
     return {"fetched": len(events), "source": "ukho", "station": station_label}
 
 
-# --- KHM Data ---
-
-@app.post("/api/parse-khm")
-async def parse_khm_data(request: Request):
-    """Parse pasted KHM tide table text. Langstone correction applied within parser."""
-    data = await request.json()
-    text = data.get("text", "")
-    year = data.get("year", datetime.now().year)
-    is_bst = data.get("is_bst", True)
-
-    if not text.strip():
-        raise HTTPException(400, "No text provided")
-
-    events = parse_khm_paste(text, year, is_bst=is_bst)
-    if not events:
-        raise HTTPException(400, "Could not parse any tide events from the pasted text")
-
-    store_tide_events(events, source="khm", station="langstone")
-
-    log_activity(
-        event_type="khm_parse",
-        message=f"KHM data parsed: {len(events)} events stored",
-        severity="success",
-        details={"event_count": len(events), "year": year, "is_bst": is_bst},
-    )
-
-    return {"parsed": len(events), "source": "khm"}
-
-
 # --- Access Window Calculation ---
 
 @app.post("/api/calculate")
@@ -1234,7 +1204,7 @@ async def calculate_access_windows(request: Request):
     afterwards (PIN-gated).
 
     Body:
-        source: "ukho" | "khm" | "harmonic"
+        source: "ukho" | "harmonic"
         draught_m: float
         drying_height_m: float
         safety_margin_m: float
@@ -1295,11 +1265,6 @@ async def calculate_access_windows(request: Request):
                 # is covered and the offset is applied if Portsmouth data was stored.
                 events = get_ukho_tide_events(to_utc_str(query_start), to_utc_str(end))
         tide_source = "ukho"
-
-    elif source == "khm":
-        end = now + timedelta(days=60)
-        events = get_tide_events(to_utc_str(query_start), to_utc_str(end), source="khm")
-        tide_source = "khm"
 
     elif source == "harmonic":
         days = int(data.get("days", 30))
@@ -1451,7 +1416,7 @@ async def update_mooring_feed(mooring_id: int, request: Request):
     flag of False so the caller knows.
 
     Body (matches the shape returned by /api/calculate):
-        source: str (ukho | khm | harmonic)
+        source: str (ukho | harmonic)
         windows: [{...}, ...]
         parameters: {draught_m, drying_height_m, safety_margin_m, ...}
         wind_info: {direction, offset_m, shallow_side, applied} or null
@@ -1467,7 +1432,7 @@ async def update_mooring_feed(mooring_id: int, request: Request):
 
     if not windows:
         raise HTTPException(400, "No windows supplied to update feed")
-    if source not in ("ukho", "khm", "harmonic"):
+    if source not in ("ukho", "harmonic"):
         raise HTTPException(400, f"Invalid source: {source}")
 
     cal = calibrate_drying_height(mooring_id)
