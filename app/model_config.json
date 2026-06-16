@@ -1,7 +1,7 @@
 {
     "_comment": "Tidal Access Model Configuration. Tidal curve parameters used by access window calculator, harmonic-model parameters (mean level, constituents), Portsmouth-Langstone secondary port offsets, and cycle-numbering constants are all read at runtime as of v2.5.6. SPEEDS, DOODSON, nodal-correction coefficients, and the Admiralty convention offsets in harmonic.py remain hardcoded by design (they are physical constants of the harmonic-prediction algorithm or data-derived corrections, not tuning parameters).",
-    "_version": "2.5.7",
-    "_last_updated": "2026-05-01",
+    "_version": "2.9.0",
+    "_last_updated": "2026-06-16",
 
     "secondary_port_offset": {
         "_comment": "Portsmouth to Langstone Harbour corrections. Read at runtime by app.config.get_secondary_port_offset and consumed by secondary_port.apply_offset and khm_parser.parse_khm_paste. Module-level constants in those .py files are kept as reference defaults and as a fallback if any of these JSON keys are missing or malformed. Original validation April 2026 against UKHO half-hourly data for both ports observed HW height delta 0.0-0.1m. The 16-day calibration corpus subsequently showed that propagating a 0.05m HW height bump through curve interpolation introduced a +0.05m production-path mean bias with no offsetting RMS improvement; the height offset has been removed (set to 0). LW heights remain effectively identical between ports.",
@@ -75,7 +75,7 @@
 
     "barometric": {
         "_comment": "Barometric (inverse-barometer) correction of predicted tide height. System master plus per-mooring opt-in (moorings.barometric_enabled). k validated offline against the BODC Portsmouth gauge; scale_factor has no empirical tuning source and stays 1.0 (regional effect, Portsmouth ~= Langstone). See docs/V2.9_BAROMETRIC_DESIGN.md.",
-        "enabled": false,
+        "enabled": true,
         "reference_hpa": 1013.25,
         "coefficient_m_per_hpa": 0.0100,
         "scale_factor": 1.0,

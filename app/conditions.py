@@ -295,6 +295,7 @@ async def get_current_conditions(force_refresh: bool = False) -> dict:
     weather = await fetch_current_weather()
 
     # Store pressure reading and compute trend.
+    barometric = None
     if weather and weather.get("pressure", {}).get("hpa"):
         pressure_hpa = weather["pressure"]["hpa"]
         store_pressure_reading(to_utc_str(now_utc), pressure_hpa)
@@ -304,9 +305,20 @@ async def get_current_conditions(force_refresh: bool = False) -> dict:
         weather["pressure"]["trend_arrow"] = trend["arrow"]
         weather["pressure"]["delta_hpa_3h"] = trend["delta_hpa"]
 
+        # Current barometric (inverse-barometer) height effect at the present
+        # measured pressure (v2.9, Session G). Surfaced only when the system
+        # master is on; while the feature is dark the block is omitted so the
+        # conditions response is unchanged. This is the instantaneous effect for
+        # display; the feed correction uses forecast pressure per event time.
+        from app.config import get_barometric_enabled
+        if get_barometric_enabled(False):
+            from app.barometric import correction_for_pressure
+            barometric = correction_for_pressure(pressure_hpa)
+
     result = {
         "tide": tide,
         "weather": weather,
+        "barometric": barometric,
     }
 
     _cached_conditions = result

@@ -87,6 +87,7 @@ def _clamp(value: float, limit: float) -> float:
 def apply_barometric_correction(
     events: list[dict],
     pressure_provider: PressureProvider,
+    diagnostics: Optional[list] = None,
 ) -> list[dict]:
     """
     Return a fresh copied list of ``events`` with ``height_m`` shifted by the
@@ -103,6 +104,12 @@ def apply_barometric_correction(
     copied), so this never touches stored rows. The correction value is uniform
     across moorings (one pressure series, one k); only the decision to apply it
     is gated, at the call sites.
+
+    When a ``diagnostics`` list is passed it is appended to with one record per
+    event (pressure used, forecast age, raw/applied correction, clamp fire, and
+    the per-event outcome — corrected or the reason it reverted to baseline).
+    This is opt-in operational telemetry for the activity log (v2.9 Session G);
+    omitting it leaves behaviour and the return value unchanged.
 
     Resolves its constants via the cached config accessors once per call
     (each caches after first use, so the JSON is parsed at most once per
@@ -124,23 +131,34 @@ def apply_barometric_correction(
 
         if not sample:
             # No usable forecast covers this event time -> pass through.
+            if diagnostics is not None:
+                diagnostics.append(_diag(ev, "reverted_no_forecast"))
             result.append(new_ev)
             continue
 
         pressure, age_hours = sample
         if age_hours is None or age_hours > staleness_h:
             # Forecast too stale (or age unknown) -> revert this event to baseline.
+            if diagnostics is not None:
+                diagnostics.append(
+                    _diag(ev, "reverted_stale", pressure=pressure, age_hours=age_hours)
+                )
             result.append(new_ev)
             continue
 
         height = new_ev.get("height_m")
         if height is None:
+            if diagnostics is not None:
+                diagnostics.append(
+                    _diag(ev, "reverted_no_height", pressure=pressure, age_hours=age_hours)
+                )
             result.append(new_ev)
             continue
 
         raw = (p_ref - pressure) * k * scale
         corr = _clamp(raw, max_corr)
-        if corr != raw:
+        clamped = corr != raw
+        if clamped:
             logger.warning(
                 "Barometric correction clamped at +/-%.2f m: raw %.3f m "
                 "(pressure %.1f hPa) implies bad data or storm surge.",
@@ -148,9 +166,93 @@ def apply_barometric_correction(
             )
 
         new_ev["height_m"] = round(height + corr, 2)
+        if diagnostics is not None:
+            diagnostics.append(_diag(
+                ev, "corrected", pressure=pressure, age_hours=age_hours,
+                raw_correction_m=round(raw, 4),
+                applied_correction_m=round(corr, 4), clamped=clamped,
+            ))
         result.append(new_ev)
 
     return result
+
+
+def _diag(ev: dict, outcome: str, pressure: Optional[float] = None,
+          age_hours: Optional[float] = None, raw_correction_m: Optional[float] = None,
+          applied_correction_m: Optional[float] = None, clamped: bool = False) -> dict:
+    """Build a single per-event diagnostic record for the activity log."""
+    return {
+        "timestamp": ev.get("timestamp"),
+        "event_type": ev.get("event_type"),
+        "outcome": outcome,
+        "pressure_hpa": round(pressure, 1) if pressure is not None else None,
+        "age_hours": round(age_hours, 1) if age_hours is not None else None,
+        "raw_correction_m": raw_correction_m,
+        "applied_correction_m": applied_correction_m,
+        "clamped": clamped,
+    }
+
+
+def summarize_diagnostics(diagnostics: list) -> dict:
+    """
+    Aggregate the per-event records appended by ``apply_barometric_correction``
+    into a compact summary suitable for one activity-log entry: how many events
+    were corrected vs reverted (and why), how many clamps fired, and the
+    pressure / correction / forecast-age ranges across the corrected events.
+    """
+    corrected = [d for d in diagnostics if d.get("outcome") == "corrected"]
+    reverted = [d for d in diagnostics if str(d.get("outcome", "")).startswith("reverted")]
+
+    revert_reasons: dict = {}
+    for d in reverted:
+        revert_reasons[d["outcome"]] = revert_reasons.get(d["outcome"], 0) + 1
+
+    out: dict = {
+        "events_total": len(diagnostics),
+        "events_corrected": len(corrected),
+        "events_reverted": len(reverted),
+        "revert_reasons": revert_reasons,
+        "clamp_fires": sum(1 for d in corrected if d.get("clamped")),
+    }
+
+    pressures = [d["pressure_hpa"] for d in corrected if d.get("pressure_hpa") is not None]
+    corrs = [d["applied_correction_m"] for d in corrected if d.get("applied_correction_m") is not None]
+    ages = [d["age_hours"] for d in corrected if d.get("age_hours") is not None]
+    if pressures:
+        out["pressure_min_hpa"] = round(min(pressures), 1)
+        out["pressure_max_hpa"] = round(max(pressures), 1)
+    if corrs:
+        out["correction_min_m"] = round(min(corrs), 3)
+        out["correction_max_m"] = round(max(corrs), 3)
+        out["max_abs_correction_m"] = round(max(abs(c) for c in corrs), 3)
+    if ages:
+        out["forecast_age_min_hours"] = round(min(ages), 1)
+        out["forecast_age_max_hours"] = round(max(ages), 1)
+    return out
+
+
+def correction_for_pressure(pressure_hpa: float) -> dict:
+    """
+    Instantaneous inverse-barometer height correction for a single pressure,
+    using the live config — independent of the forecast provider. Used to
+    surface the *current* barometric effect (from the current measured
+    pressure) in the conditions panel / API. Returns the raw and clamped
+    correction and whether the clamp fired.
+    """
+    p_ref = get_barometric_reference_hpa(REFERENCE_HPA)
+    k = get_barometric_coefficient_m_per_hpa(COEFFICIENT_M_PER_HPA)
+    scale = get_barometric_scale_factor(SCALE_FACTOR)
+    max_corr = get_barometric_max_correction_m(MAX_CORRECTION_M)
+
+    raw = (p_ref - pressure_hpa) * k * scale
+    corr = _clamp(raw, max_corr)
+    return {
+        "pressure_hpa": round(pressure_hpa, 1),
+        "reference_hpa": p_ref,
+        "raw_correction_m": round(raw, 3),
+        "correction_m": round(corr, 3),
+        "clamped": corr != raw,
+    }
 
 
 def _event_time(ev: dict) -> Optional[datetime]:

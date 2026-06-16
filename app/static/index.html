@@ -2991,7 +2991,7 @@ function renderConditionsTide(tide) {
     `<div class="conditions-source">Source: <a href="https://easytide.admiralty.co.uk/?PortID=0066" target="_blank" rel="noopener noreferrer">UKHO Admiralty</a></div>`;
 }
 
-function renderConditionsWeather(weather) {
+function renderConditionsWeather(weather, barometric) {
   const el = document.getElementById('conditions-weather');
   if (!weather) {
     el.innerHTML = '<div class="conditions-col-title">Weather</div>' +
@@ -3015,6 +3015,21 @@ function renderConditionsWeather(weather) {
   const pressureLine = trendDesc && trendDesc !== 'Unknown'
     ? `${pressureVal} ${trendArrow} ${trendDesc}` : pressureVal;
 
+  // Barometric height effect (v2.9). Present only when the system master is on
+  // (the API omits the block while the feature is dark), so this row simply
+  // does not render until barometric is enabled.
+  let baroRow = '';
+  if (barometric && barometric.correction_m != null) {
+    const c = barometric.correction_m;
+    const sign = c > 0 ? '+' : '';
+    const clampNote = barometric.clamped ? ' (clamped)' : '';
+    baroRow =
+      `<div class="conditions-row">` +
+      `<span class="c-label">Pressure effect:</span> ` +
+      `<span class="c-value">${sign}${c.toFixed(2)} m on tide height${clampNote}</span>` +
+      `</div>`;
+  }
+
   el.innerHTML = '<div class="conditions-col-title">Weather</div>' +
     `<div class="conditions-row">` +
     `<span class="c-label">Wind:</span> ` +
@@ -3024,6 +3039,7 @@ function renderConditionsWeather(weather) {
     `<span class="c-label">Pressure:</span> ` +
     `<span class="c-value">${pressureLine}</span>` +
     `</div>` +
+    baroRow +
     `<div class="conditions-row">` +
     `<span class="c-label">Precipitation:</span> ` +
     `<span class="c-value">${r.description || 'Unknown'}${r.rain_mm_h > 0 ? ` (${r.rain_mm_h} mm/h)` : ''}</span>` +
@@ -3042,7 +3058,7 @@ async function loadConditions() {
     const data = await resp.json();
 
     renderConditionsTide(data.tide);
-    renderConditionsWeather(data.weather);
+    renderConditionsWeather(data.weather, data.barometric);
 
     // Update timestamp
     const updatedEl = document.getElementById('conditions-updated');

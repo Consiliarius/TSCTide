@@ -291,6 +291,18 @@ def _recompute_future_windows(mooring_id: int):
     if not tide_data:
         return
 
+    # Barometric correction (v2.9): calibration-apply rebuilds this mooring's
+    # future windows from scratch (delete_future_events above), so correct the
+    # event heights for an opted-in mooring before recomputing -- otherwise the
+    # rebuilt feed would briefly drop the pressure correction (overstating
+    # access under high pressure) until the next daily job. Gated on the system
+    # master AND opt-in, so it is a no-op while the feature is dark. No deadband:
+    # the rows were just deleted, so this is a deliberate full rebuild.
+    from app.config import get_barometric_enabled
+    if get_barometric_enabled(False) and m.get("barometric_enabled"):
+        from app.barometric import apply_barometric_correction, make_pressure_provider
+        tide_data = apply_barometric_correction(tide_data, make_pressure_provider())
+
     windows = compute_access_windows(
         events=tide_data,
         draught_m=m["draught_m"],

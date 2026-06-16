@@ -482,11 +482,82 @@ def generate_export_ics(windows: list[dict], source: str,
     return cal.to_ical()
 
 
+def _edges_within(a_iso, b_iso, minutes: float) -> bool:
+    """
+    True when two ISO-Z timestamps are within ``minutes`` of each other.
+
+    Returns False when either side is missing or unparseable, so the caller
+    treats an un-comparable edge as a material change (and rewrites). Naive
+    values are assumed UTC.
+    """
+    if not a_iso or not b_iso:
+        return False
+    try:
+        a = dtparse.parse(a_iso)
+        b = dtparse.parse(b_iso)
+    except (ValueError, OverflowError, TypeError):
+        return False
+    if a.tzinfo is None:
+        a = a.replace(tzinfo=timezone.utc)
+    if b.tzinfo is None:
+        b = b.replace(tzinfo=timezone.utc)
+    return abs((a - b).total_seconds()) < minutes * 60
+
+
+def _event_within_deadband(existing: dict, event: dict, minutes: float) -> bool:
+    """
+    True when a freshly computed ``event`` differs from the already-stored
+    ``existing`` calendar_events row only by sub-deadband movements of the
+    window edges -- so a daily barometric re-correction should leave the stored
+    (full-precision) row untouched, keeping the rendered 5-minute slot stable
+    under small day-to-day forecast jitter (design section 4.3).
+
+    Any *material* difference returns False so the upsert proceeds: a source
+    change/upgrade, a flip of the always-accessible or wind-adjusted state, the
+    tender window appearing/disappearing or changing its always-accessible
+    state, or any edge (vessel or tender) moving by >= the deadband.
+
+    The comparison is on the stored *raw* edges, not the rounded display value,
+    so an edge parked near a 5-minute boundary cannot flicker between adjacent
+    slots on sub-minute jitter.
+    """
+    if existing.get("source") != event.get("source"):
+        return False
+    if bool(existing.get("always_accessible")) != bool(event.get("always_accessible")):
+        return False
+    if bool(existing.get("wind_adjusted")) != bool(event.get("wind_adjusted")):
+        return False
+
+    if not _edges_within(existing.get("start_time"), event.get("start_time"), minutes):
+        return False
+    if not _edges_within(existing.get("end_time"), event.get("end_time"), minutes):
+        return False
+
+    # Tender: presence and always-accessible state must match; when both carry
+    # explicit times those must be within the deadband too.
+    if bool(existing.get("tender_always_accessible")) != bool(event.get("tender_always_accessible")):
+        return False
+    ex_has = bool(existing.get("tender_start_time") and existing.get("tender_end_time"))
+    nw_has = bool(event.get("tender_start_time") and event.get("tender_end_time"))
+    if ex_has != nw_has:
+        return False
+    if ex_has and nw_has:
+        if not _edges_within(existing.get("tender_start_time"),
+                             event.get("tender_start_time"), minutes):
+            return False
+        if not _edges_within(existing.get("tender_end_time"),
+                             event.get("tender_end_time"), minutes):
+            return False
+
+    return True
+
+
 def store_windows_as_events(windows: list[dict], mooring_id: int,
                             source: str, boat_name: str = "",
                             calc_params: dict = None, wind_details: dict = None,
                             tender_windows: list[dict] = None,
-                            tender_min_depth_m: Optional[float] = None):
+                            tender_min_depth_m: Optional[float] = None,
+                            deadband_minutes: Optional[float] = None) -> dict:
     """Store computed access windows as calendar events in the database.
 
     calc_params: {draught_m, drying_height_m, safety_margin_m, obs_calibrated}
@@ -497,11 +568,22 @@ def store_windows_as_events(windows: list[dict], mooring_id: int,
         calendar_events row so the per-event description can render them.
     tender_min_depth_m: the threshold value used for the tender_windows pass.
         Stored on each event for provenance.
+    deadband_minutes: barometric feed-write churn control (v2.9). When set and
+        > 0, an event whose edges moved by less than this many minutes versus
+        the currently-stored row (and is otherwise unchanged) is left untouched
+        rather than rewritten -- so a small day-to-day forecast nudge does not
+        churn the feed or flicker the displayed slot. None (the default) writes
+        every window unconditionally, which is the pre-v2.9 behaviour and the
+        path taken whenever the barometric master is off. The wind grounding
+        job and the manual feed-update path pass None: those are deliberate,
+        user/observation-driven single writes that should always take effect.
 
     Always-accessible windows are stored too, so that if the mooring is
     recalibrated later (e.g. a deeper-draught boat raises the threshold)
     the persisted events can be re-evaluated and updated on subsequent
     recalculation rather than being silently missing.
+
+    Returns {"written": n, "skipped": n} for logging/inspection.
     """
     from app.access_calc import generate_event_uid
 
@@ -512,6 +594,16 @@ def store_windows_as_events(windows: list[dict], mooring_id: int,
             if ts:
                 tender_by_hw[ts] = tw
 
+    # For the deadband comparison, load the currently-stored rows once and key
+    # them by cycle UID. Only needed when the deadband is active.
+    existing_by_uid = {}
+    use_deadband = bool(deadband_minutes and deadband_minutes > 0)
+    if use_deadband:
+        for e in get_calendar_events(mooring_id):
+            existing_by_uid[e["event_uid"]] = e
+
+    written = 0
+    skipped = 0
     for w in windows:
         if not w.get("start_time") or not w.get("end_time"):
             continue
@@ -555,11 +647,23 @@ def store_windows_as_events(windows: list[dict], mooring_id: int,
             if tender_min_depth_m is not None:
                 event["tender_min_depth_m"] = float(tender_min_depth_m)
 
+        if use_deadband:
+            existing = existing_by_uid.get(uid)
+            if existing is not None and _event_within_deadband(
+                existing, event, deadband_minutes
+            ):
+                # Sub-deadband move on an otherwise-unchanged event: keep the
+                # stored full-precision row so the displayed slot stays put.
+                skipped += 1
+                continue
+
         upsert_calendar_event(event)
+        written += 1
 
     # Clean up any lower-priority events that were superseded but got
     # different cycle-based UIDs due to timing differences across sources
     cleanup_superseded_events(mooring_id)
+    return {"written": written, "skipped": skipped}
 
 
 # --- Standalone Langstone tide feeds (not per-mooring) ---
