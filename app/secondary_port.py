@@ -9,10 +9,8 @@ Applied at three sites in the production data flow:
   - The manual /api/fetch-ukho path schedules wind jobs against corrected
     times when the API fell back to Portsmouth.
 
-KHM data has its HW timing correction applied inside parse_khm_paste at
-parse time; it is stored already-corrected with station="langstone" and is
-NOT passed through this module on read. UKHO native Langstone data needs
-no offset and bypasses this module entirely.
+UKHO native Langstone data needs no offset and bypasses this module
+entirely.
 
 Correction values (validated April 2026 against UKHO half-hourly data,
 refined April 2026 against the 16-day calibration corpus):

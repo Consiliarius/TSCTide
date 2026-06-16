@@ -265,7 +265,7 @@ def db_connection():
 # --- Tide Data ---
 
 def store_tide_events(events: list[dict], source: str, station: str):
-    """Store tide events, replacing KHM data with UKHO if source is ukho.
+    """Store tide events.
 
     The station parameter must accurately reflect which station provided the
     data. Pass "langstone" for native Langstone UKHO data, "portsmouth" for
@@ -281,17 +281,6 @@ def store_tide_events(events: list[dict], source: str, station: str):
             event_type = ev["event_type"]
             approx_time = ev.get("is_approximate_time", False)
             approx_height = ev.get("is_approximate_height", False)
-
-            if source == "ukho":
-                # Delete any KHM data for the same timestamp/station.
-                # Note: Portsmouth UKHO data (station="portsmouth") will NOT
-                # delete KHM Langstone data (station="langstone"), which is
-                # correct — KHM Langstone should only be superseded by native
-                # Langstone UKHO data.
-                conn.execute(
-                    "DELETE FROM tide_data WHERE timestamp = ? AND station = ? AND source = 'khm'",
-                    (ts, station)
-                )
 
             conn.execute("""
                 INSERT INTO tide_data (timestamp, height_m, event_type, source, station,
@@ -1091,7 +1080,7 @@ def upsert_calendar_event(event: dict):
     # works correctly provided the format is consistent (which it is, since all
     # updated_at values come through this single function).
     now = datetime.now(timezone.utc).isoformat()
-    SOURCE_PRIORITY = {"ukho": 3, "khm": 2, "harmonic": 1}
+    SOURCE_PRIORITY = {"ukho": 2, "harmonic": 1}
 
     with db_connection() as conn:
         existing = conn.execute(
@@ -1244,7 +1233,7 @@ def cleanup_old_tide_data(days: int = 365):
 # (cycle, type) per write batch' at storage time as well as query time.
 #
 # This table is intentionally separate from tide_data:
-#   - tide_data holds authoritative UKHO/KHM observations used by
+#   - tide_data holds authoritative UKHO observations used by
 #     observation calibration; harmonic predictions must NOT contaminate
 #     the calibration inputs.
 #   - get_ukho_tide_events / get_tide_events / load_classification_inputs
@@ -1629,7 +1618,7 @@ def cleanup_superseded_events(mooring_id: int):
       - Different priority: lower-priority event is removed
       - Same priority: older event is removed (newer is preferred)
     """
-    SOURCE_PRIORITY = {"ukho": 3, "khm": 2, "harmonic": 1}
+    SOURCE_PRIORITY = {"ukho": 2, "harmonic": 1}
 
     events = get_calendar_events(mooring_id)
     if len(events) < 2:

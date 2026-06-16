@@ -209,7 +209,6 @@
     font-size: 11px; font-weight: 600; color: #fff;
   }
   .source-ukho { background: var(--ok); }
-  .source-khm { background: var(--sea); }
   .source-harmonic { background: var(--est); }
 
   /* Feed URL */
@@ -694,11 +693,10 @@
     <div class="panel-body collapsed" id="help-body" style="font-size:13px;line-height:1.6;">
       <p>This tool predicts when your boat has enough water to safely leave or return to a swing mooring in Langstone Harbour.</p>
       <p style="font-weight:600;margin-top:10px;">Quick start (no account needed)</p>
-      <p>Enter your boat's draught and an estimate of your mooring's drying height below, then click <b>UKHO (7 days)</b> and then <b>Calculate Access Windows</b> to see your access windows. Alternatively you can also paste data from the Royal Navy KHM Portsmouth tide tables (linked to below) by clicking <b>KHM Paste</b> for a longer range, or use the built-in harmonic model for an approximate long-range forecast.</p>
-	  <p style="margin-top:5px;">KHM predictions are more accurate than harmonic predictions, and UKHO predictions are likely more accurate than both. The secondary port offset for Langstone Harbour is automatically applied for data pasted from the KHM tide table.</p>
+      <p>Enter your boat's draught and an estimate of your mooring's drying height below, then click <b>UKHO (7 days)</b> and then <b>Calculate Access Windows</b> to see your access windows. Alternatively you can use the built-in harmonic model for an approximate long-range forecast.</p>
       <p style="font-weight:600;margin-top:10px;">Saving your configuration</p>
       <p>Enter a Mooring ID (1–100) and click <b>Save Configuration</b> to persist your settings. When re-visiting the page in future, or if you need to revise any aspect of the configuration, enter your mooring ID and press <b>Load from Mooring ID</b> to populate the tool with your last saved configuration.</p>
-	  <p style="margin-top:5px;">This also enables the <b>iCal subscription feed</b> — a URL you can add to Apple Calendar, Google Calendar, or Outlook so calculated access windows appear automatically on your phone or desktop. The feed will start with the access windows you initially calculate, and then will update daily at 02:00 BST. During the update, UKHO data is used to predict access windows for the next 7 days. If data is needed for further into the future, either use the KHM Paste option or the Harmonic (long range) prediction. Your UKHO-calculated data for the next 7 days is never overwritten by these alternative sources.</p>
+	  <p style="margin-top:5px;">This also enables the <b>iCal subscription feed</b> — a URL you can add to Apple Calendar, Google Calendar, or Outlook so calculated access windows appear automatically on your phone or desktop. The feed will start with the access windows you initially calculate, and then will update daily at 02:00 BST. During the update, UKHO data is used to predict access windows for the next 7 days. If data is needed for further into the future, use the Harmonic (long range) prediction. Your UKHO-calculated data for the next 7 days is never overwritten by these alternative sources.</p>
       <p style="font-weight:600;margin-top:10px;">Improving accuracy</p>
       <p>If you are using a mooring ID, you can enable <b>Use Observational Data</b> to provide observational information as to whether your boat is afloat or aground at specific times. Over time, these observations narrow down the true drying height of your mooring and a confidence rating is shown. Observations can be entered manually or batch-imported from a spreadsheet that you can fill in over time.</p>
       <p style="font-weight:600;margin-top:10px;">Wind offset</p>
@@ -916,7 +914,6 @@
     <div class="panel-body" id="calc-body">
       <div class="btn-group mb-8">
         <button class="btn-primary" onclick="showUkho()">UKHO (7 days)</button>
-        <button class="btn-sea" onclick="showKhmPaste()">KHM Paste (30 days)</button>
         <button class="btn-warn" onclick="showHarmonic()">Harmonic (long range)</button>
       </div>
 
@@ -929,32 +926,6 @@
         <div class="btn-group">
           <button class="btn-primary" onclick="calculate('ukho')">Calculate Access Windows</button>
           <button class="btn-sm btn-primary" onclick="fetchUkhoNow()">Refresh UKHO Data</button>
-        </div>
-      </div>
-
-      <!-- KHM paste area -->
-      <div id="khm-section" class="hidden">
-        <p style="font-size:12px;margin-bottom:8px;">
-          Copy the table rows from
-          <a href="https://www.royalnavy.mod.uk/khm/portsmouth/port-information/tide-tables" target="_blank" style="color:var(--sea)">Royal Navy KHM Portsmouth</a>.
-          Select the table rows and paste below. Tab-separated, 13 columns.
-        </p>
-        <div class="row" style="margin-bottom:8px;">
-          <div>
-            <label>Timezone of KHM data</label>
-            <select id="khm-tz">
-              <option value="BST" selected>BST (UTC+1) — default for KHM</option>
-              <option value="GMT">GMT (UTC+0)</option>
-            </select>
-          </div>
-          <div>
-            <label>Year (if not in date column)</label>
-            <input type="number" id="khm-year" value="2026" min="2024" max="2030" style="width:100px">
-          </div>
-        </div>
-        <textarea id="khm-text" placeholder="14/04&#9;06:12&#9;10:10&#9;4&#9;03:16&#9;1.6&#9;22:38&#9;4.3&#9;15:30&#9;1.3&#9;19:58&#9;2.7&#9;40%"></textarea>
-        <div class="btn-group">
-          <button class="btn-sea" onclick="submitKhm()">Parse &amp; Calculate</button>
         </div>
       </div>
 
@@ -1062,7 +1033,6 @@
               <option value="">All</option>
               <option value="scheduler_start">Scheduler Start</option>
               <option value="ukho_fetch">UKHO Fetch</option>
-              <option value="khm_parse">KHM Parse</option>
               <option value="wind_schedule">Wind Scheduling</option>
               <option value="wind_check">Wind Check</option>
               <option value="daily_scheduler">Daily Summary</option>
@@ -1221,16 +1191,11 @@ function updateMooringOptions() {
 
 function hideAllSourceSections() {
   document.getElementById('ukho-section').classList.add('hidden');
-  document.getElementById('khm-section').classList.add('hidden');
   document.getElementById('harmonic-section').classList.add('hidden');
 }
 function showUkho() {
   hideAllSourceSections();
   document.getElementById('ukho-section').classList.remove('hidden');
-}
-function showKhmPaste() {
-  hideAllSourceSections();
-  document.getElementById('khm-section').classList.remove('hidden');
 }
 function showHarmonic() {
   hideAllSourceSections();
@@ -1792,30 +1757,6 @@ async function fetchUkhoNow() {
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || 'Fetch failed');
     showStatus('calc-status', `Fetched ${data.fetched} events from UKHO.`, 'ok');
-  } catch(e) {
-    showStatus('calc-status', e.message, 'err');
-  }
-}
-
-async function submitKhm() {
-  const text = document.getElementById('khm-text').value;
-  if (!text.trim()) {
-    showStatus('calc-status', 'Paste KHM data first.', 'err');
-    return;
-  }
-  const isBst = document.getElementById('khm-tz').value === 'BST';
-  const year = parseInt(document.getElementById('khm-year').value) || 2026;
-  showStatus('calc-status', 'Parsing KHM data...', 'info');
-  try {
-    const res = await fetch('/api/parse-khm', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({text: text, year: year, is_bst: isBst})
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || 'Parse failed');
-    showStatus('calc-status', `Parsed ${data.parsed} events (Langstone corrections applied). Calculating...`, 'ok');
-    hideAllSourceSections();
-    await calculate('khm');
   } catch(e) {
     showStatus('calc-status', e.message, 'err');
   }

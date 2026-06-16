@@ -1,10 +1,10 @@
 {
     "_comment": "Tidal Access Model Configuration. Tidal curve parameters used by access window calculator, harmonic-model parameters (mean level, constituents), Portsmouth-Langstone secondary port offsets, and cycle-numbering constants are all read at runtime as of v2.5.6. SPEEDS, DOODSON, nodal-correction coefficients, and the Admiralty convention offsets in harmonic.py remain hardcoded by design (they are physical constants of the harmonic-prediction algorithm or data-derived corrections, not tuning parameters).",
-    "_version": "2.9.0",
+    "_version": "2.9.1",
     "_last_updated": "2026-06-16",
 
     "secondary_port_offset": {
-        "_comment": "Portsmouth to Langstone Harbour corrections. Read at runtime by app.config.get_secondary_port_offset and consumed by secondary_port.apply_offset and khm_parser.parse_khm_paste. Module-level constants in those .py files are kept as reference defaults and as a fallback if any of these JSON keys are missing or malformed. Original validation April 2026 against UKHO half-hourly data for both ports observed HW height delta 0.0-0.1m. The 16-day calibration corpus subsequently showed that propagating a 0.05m HW height bump through curve interpolation introduced a +0.05m production-path mean bias with no offsetting RMS improvement; the height offset has been removed (set to 0). LW heights remain effectively identical between ports.",
+        "_comment": "Portsmouth to Langstone Harbour corrections. Read at runtime by app.config.get_secondary_port_offset and consumed by secondary_port.apply_offset. Module-level constants in that .py file are kept as reference defaults and as a fallback if any of these JSON keys are missing or malformed. Original validation April 2026 against UKHO half-hourly data for both ports observed HW height delta 0.0-0.1m. The 16-day calibration corpus subsequently showed that propagating a 0.05m HW height bump through curve interpolation introduced a +0.05m production-path mean bias with no offsetting RMS improvement; the height offset has been removed (set to 0). LW heights remain effectively identical between ports.",
         "hw_time_offset_minutes": 9,
         "hw_height_offset_m": 0.0,
         "lw_time_offset_minutes": 0,
