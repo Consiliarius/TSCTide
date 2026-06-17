@@ -1,7 +1,7 @@
 {
     "_comment": "Tidal Access Model Configuration. Tidal curve parameters used by access window calculator, harmonic-model parameters (mean level, constituents), Portsmouth-Langstone secondary port offsets, and cycle-numbering constants are all read at runtime as of v2.5.6. SPEEDS, DOODSON, nodal-correction coefficients, and the Admiralty convention offsets in harmonic.py remain hardcoded by design (they are physical constants of the harmonic-prediction algorithm or data-derived corrections, not tuning parameters).",
-    "_version": "2.9.1",
-    "_last_updated": "2026-06-16",
+    "_version": "2.9.2",
+    "_last_updated": "2026-06-17",
 
     "secondary_port_offset": {
         "_comment": "Portsmouth to Langstone Harbour corrections. Read at runtime by app.config.get_secondary_port_offset and consumed by secondary_port.apply_offset. Module-level constants in that .py file are kept as reference defaults and as a fallback if any of these JSON keys are missing or malformed. Original validation April 2026 against UKHO half-hourly data for both ports observed HW height delta 0.0-0.1m. The 16-day calibration corpus subsequently showed that propagating a 0.05m HW height bump through curve interpolation introduced a +0.05m production-path mean bias with no offsetting RMS improvement; the height offset has been removed (set to 0). LW heights remain effectively identical between ports.",
@@ -88,5 +88,11 @@
         "_comment": "Display-only rounding of access-window edges to avoid false precision. Applies to ALL windows (wind/pressure/neither). Conservative inward: start rounds up, end rounds down, window always shrinks toward HW.",
         "rounding_minutes": 5,
         "rounding_mode": "conservative_inward"
+    },
+
+    "wharf_sill": {
+        "_comment": "Kendall's Wharf sill: shoaling bar across the channel just north of TSC1/TSC2 that moored boats cross to reach open water. crest_above_cd_m is metres above Chart Datum (positive up), read at runtime by app.config.get_sill_crest_above_cd_m and consumed by app.sill for the Current Conditions depth display (v2.9.2). The module-level default in app/sill.py is the fallback if this key is missing or malformed. Value 0.5 is the charted shoal-edge crest from the Channel Surveys Ltd multibeam survey of 1 September 2023 (docs/Kendalls_Bathymetry_202309-CD-2_74m__Updated_Kendalls_Buoy_.pdf); the deeper slot alongside reads about a metre lower but lies against the wharf and the often-moored dredger AI AVOCET and may be unavailable, so the shoal edge is the conservative controlling level. The eastern edge is actively silting from dredger propwash, so the true crest is probably higher (shallower) than the 2023 value; treat as advisory. RESERVED for v2.9.3 access-window gating, not read by any v2.9.2 code: transit_clearance_m (under-keel clearance for a moving boat crossing the bar, distinct from the at-rest mooring margin) and an optional scope flag for moorings behind the sill.",
+        "crest_above_cd_m": 0.5,
+        "survey_date": "2023-09"
     }
 }
