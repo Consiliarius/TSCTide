@@ -1053,6 +1053,16 @@ async def apply_drying_height_calibration(mooring_id: int):
             "upper_bound": cal.get("upper_bound"),
             "afloat_count": cal.get("afloat_count"),
             "aground_count": cal.get("aground_count"),
+            # v2.10 sounding audit trail: enough to reconcile a
+            # sounding-driven recalibration against the bounds after the
+            # fact (validation 1 in CALIBRATION_NOTES).
+            "sounding_count": cal.get("sounding_count"),
+            "sounding_estimate": cal.get("sounding_estimate"),
+            "sounding_sd": cal.get("sounding_sd"),
+            "sounding_dryings": cal.get("sounding_dryings"),
+            "floor_applied": cal.get("floor_applied"),
+            "sounding_conflict": cal.get("sounding_conflict"),
+            "height_source": "interpolate_height_at_time (pressure-blind)",
         },
     )
 
