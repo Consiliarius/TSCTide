@@ -740,6 +740,32 @@
         </div>
       </div>
 
+      <!-- v2.10 echo-sounder geometry. Boat-level defaults for depth
+           soundings; the sounding entry form can override the datum/offset
+           per reading. Only used when soundings are recorded. -->
+      <div class="row">
+        <div>
+          <label title="Depth of the transducer below the waterline. Used when a sounding's datum is 'below transducer'. Loading and trim shift this.">Transducer Offset (m)</label>
+          <input type="number" id="transducer_offset_m" step="0.01" value="0.0">
+        </div>
+        <div>
+          <label title="What your sounder reads to by default. A sounding can override this per reading.">Sounder Datum</label>
+          <select id="sounder_datum">
+            <option value="waterline">Below waterline</option>
+            <option value="transducer" selected>Below transducer</option>
+            <option value="keel">Below keel</option>
+          </select>
+        </div>
+        <div>
+          <label title="Soft mud can make echo sounders over-read depth (the unsafe direction); soundings over a soft/unknown bed are down-weighted. The aground floor remains the hard guard.">Bed Type</label>
+          <select id="bed_type">
+            <option value="unknown" selected>Unknown</option>
+            <option value="hard">Hard</option>
+            <option value="soft">Soft (mud)</option>
+          </select>
+        </div>
+      </div>
+
       <!-- Mooring-dependent options (hidden until Mooring ID is entered) -->
       <div id="mooring-options" class="hidden">
 
@@ -861,10 +887,35 @@
           <input type="datetime-local" id="obs_timestamp">
         </div>
         <div>
+          <label>Observation Type</label>
+          <select id="obs_type" onchange="toggleObsType()">
+            <option value="binary">Afloat / Aground</option>
+            <option value="sounding">Depth sounding</option>
+          </select>
+        </div>
+      </div>
+      <div class="row" id="obs_state_row">
+        <div>
           <label>State</label>
           <select id="obs_state">
             <option value="afloat">Afloat</option>
             <option value="aground">Aground</option>
+          </select>
+        </div>
+        <div></div>
+      </div>
+      <div class="row hidden" id="obs_sounding_row">
+        <div>
+          <label>Measured Depth (m)</label>
+          <input type="number" step="0.01" min="0" id="obs_depth" placeholder="e.g. 2.4">
+        </div>
+        <div>
+          <label title="What the sounder reading is referenced to. Soft mud can make echo sounders over-read; use the aground floor as a check.">Sounder Datum</label>
+          <select id="obs_datum">
+            <option value="">Boat default</option>
+            <option value="waterline">Below waterline</option>
+            <option value="transducer">Below transducer</option>
+            <option value="keel">Below keel</option>
           </select>
         </div>
       </div>
@@ -1488,6 +1539,12 @@ function getConfig() {
     tender_access_enabled: mooringOptionsHidden ? 0 :
       (document.getElementById('tender_access_enabled').checked ? 1 : 0),
     tender_min_depth_m: mooringOptionsHidden ? 0.3 : num('tender_min_depth_m', 0.3),
+    // v2.10 echo-sounder geometry (boat-level; per-observation override on
+    // the sounding entry form). These describe the vessel, so unlike the
+    // wind/tender toggles they are not zeroed when mooring-options is hidden.
+    transducer_offset_m: num('transducer_offset_m', 0.0),
+    sounder_datum: document.getElementById('sounder_datum').value || 'transducer',
+    bed_type: document.getElementById('bed_type').value || 'unknown',
   };
 }
 
@@ -1507,6 +1564,9 @@ function setConfig(cfg) {
   document.getElementById('use_observations').checked = !!cfg.use_observations;
   document.getElementById('tender_access_enabled').checked = !!cfg.tender_access_enabled;
   document.getElementById('tender_min_depth_m').value = cfg.tender_min_depth_m ?? 0.3;
+  document.getElementById('transducer_offset_m').value = cfg.transducer_offset_m ?? 0.0;
+  document.getElementById('sounder_datum').value = cfg.sounder_datum || 'transducer';
+  document.getElementById('bed_type').value = cfg.bed_type || 'unknown';
   toggleWindConfig();
   toggleTenderConfig();
   updateTenderVisibility();
@@ -1964,6 +2024,12 @@ function toggleObsPanel() {
   }
 }
 
+function toggleObsType() {
+  const isSounding = document.getElementById('obs_type').value === 'sounding';
+  document.getElementById('obs_state_row').classList.toggle('hidden', isSounding);
+  document.getElementById('obs_sounding_row').classList.toggle('hidden', !isSounding);
+}
+
 async function submitObservation() {
   const cfg = getConfig();
   if (!cfg.mooring_id) {
@@ -1975,12 +2041,24 @@ async function submitObservation() {
     showStatus('obs-status', 'Provide a date and time.', 'err');
     return;
   }
+  const isSounding = document.getElementById('obs_type').value === 'sounding';
   const body = {
     timestamp: new Date(ts).toISOString(),
-    state: document.getElementById('obs_state').value,
     wind_direction: document.getElementById('obs_wind').value,
     direction_of_lay: document.getElementById('obs_lay').value,
   };
+  if (isSounding) {
+    const depth = parseFloat(document.getElementById('obs_depth').value);
+    if (isNaN(depth)) {
+      showStatus('obs-status', 'Enter a measured depth for the sounding.', 'err');
+      return;
+    }
+    body.obs_type = 'sounding';
+    body.measured_depth_m = depth;
+    body.sounder_datum = document.getElementById('obs_datum').value || null;
+  } else {
+    body.state = document.getElementById('obs_state').value;
+  }
   try {
     const res = await pinnedFetch(`/api/moorings/${cfg.mooring_id}/observations`, {
       method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -2048,7 +2126,8 @@ function updateCalibrationDisplay(cal) {
   const confSymbols = {
     'high': '●●●', 'medium': '●●○', 'low': '●○○',
     'partial-low': '●○○', 'partial-high': '●○○',
-    'inconsistent': '⚠', 'none': '—'
+    'inconsistent': '⚠', 'none': '—',
+    'sounding-bound-conflict': '⚠'
   };
   const confDesc = {
     'high': 'Bounds < 0.2m apart',
@@ -2057,7 +2136,8 @@ function updateCalibrationDisplay(cal) {
     'partial-low': 'Lower bound only (aground)',
     'partial-high': 'Upper bound only (afloat)',
     'inconsistent': 'Bounds conflict!',
-    'none': 'Need observations'
+    'none': 'Need observations',
+    'sounding-bound-conflict': 'Soundings conflict with a bound!'
   };
 
   // --- Base drying height card ---
@@ -2096,6 +2176,39 @@ function updateCalibrationDisplay(cal) {
       `calibration below.</div>`;
   }
 
+  // v2.10 soundings: derived point estimate with spread, plus floor/conflict
+  // notes. Soundings drive cal.best_estimate, so the Apply button above
+  // works for them automatically.
+  const sCount = cal.sounding_count || 0;
+  let soundingRow = '';
+  if (sCount > 0) {
+    let line = `${sCount}`;
+    if (cal.sounding_estimate !== null && cal.sounding_estimate !== undefined) {
+      line += `: derived ${cal.sounding_estimate.toFixed(2)}m`;
+      if (cal.sounding_sd !== null && cal.sounding_sd !== undefined) {
+        line += ` &plusmn; ${cal.sounding_sd.toFixed(2)}m`;
+      }
+    }
+    soundingRow =
+      `<div class="cal-row">` +
+        `<span class="label">Soundings:</span> ` +
+        `<span class="value">${line}</span>` +
+      `</div>`;
+    if (cal.floor_applied) {
+      const floorTxt = (cal.lower_bound !== null && cal.lower_bound !== undefined)
+        ? cal.lower_bound.toFixed(2) + 'm' : 'the aground floor';
+      soundingRow +=
+        `<div class="cal-note">Estimate raised to the aground floor ` +
+        `(${floorTxt}): a sounding read shallower water than a known grounding.</div>`;
+    }
+    if (cal.sounding_conflict) {
+      soundingRow +=
+        `<div class="cal-note" style="color:var(--danger,#b00020);">` +
+        `&#9888; Soundings conflict with a hard bound &mdash; using the ` +
+        `conservative value. Check the transducer offset, soft mud, or boat lay.</div>`;
+    }
+  }
+
   const baseCard =
     `<div class="cal-card">` +
       `<div class="cal-card-title">Base Drying Height</div>` +
@@ -2115,6 +2228,7 @@ function updateCalibrationDisplay(cal) {
           `${confDesc[cal.confidence] || ''}</span>` +
       `</div>` +
       `<div class="cal-row" style="color:var(--text-light);">${baseRange}</div>` +
+      soundingRow +
       baseSuggestion +
       excludedNote +
     `</div>`;
