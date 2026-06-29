@@ -174,6 +174,7 @@ def _build_description(ev_data: dict, tz, calibration: dict = None) -> str:
                 "partial-low": "Calibration: aground data only",
                 "partial-high": "Calibration: afloat data only",
                 "inconsistent": "Calibration: data inconsistent",
+                "sounding-bound-conflict": "Calibration: soundings conflict with bounds",
             }
             label = conf_labels.get(conf, "")
             if label:
