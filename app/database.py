@@ -42,6 +42,12 @@ CREATE TABLE IF NOT EXISTS moorings (
     pin_hash TEXT DEFAULT '',
     tender_access_enabled INTEGER DEFAULT 0,
     tender_min_depth_m REAL DEFAULT 0.3,
+    -- v2.10 echo-sounder calibration: vessel-level sounder geometry. These
+    -- describe the boat, not the mooring; a per-observation override exists
+    -- for trim. bed_type drives soft-mud sigma inflation in calibration.
+    transducer_offset_m REAL DEFAULT 0.0,
+    sounder_datum TEXT DEFAULT 'transducer',
+    bed_type TEXT DEFAULT 'unknown',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -55,6 +61,16 @@ CREATE TABLE IF NOT EXISTS observations (
     direction_of_lay TEXT DEFAULT '',
     notes TEXT DEFAULT '',
     created_at TEXT NOT NULL,
+    -- v2.10 echo-sounder calibration. obs_type discriminates the row:
+    --   'binary'   -> afloat/aground inequality (state holds afloat|aground)
+    --   'sounding' -> depth point estimate (state holds the sentinel
+    --                 'sounding'; the depth fields below are populated).
+    -- Existing rows predate this column and default to 'binary'. Soundings
+    -- store only the RAW reading; drying height is derived at query time.
+    obs_type TEXT DEFAULT 'binary',
+    measured_depth_m REAL,          -- raw sounder reading at observation time
+    sounder_datum TEXT,             -- waterline | transducer | keel
+    transducer_offset_m REAL,       -- per-obs trim override; null -> use boat config
     FOREIGN KEY (mooring_id) REFERENCES moorings(mooring_id)
 );
 
@@ -209,6 +225,34 @@ def init_db():
         conn.execute(
             "ALTER TABLE moorings ADD COLUMN barometric_enabled INTEGER DEFAULT 0"
         )
+    # v2.10 echo-sounder calibration: vessel sounder geometry.
+    if "transducer_offset_m" not in mooring_cols:
+        conn.execute(
+            "ALTER TABLE moorings ADD COLUMN transducer_offset_m REAL DEFAULT 0.0"
+        )
+    if "sounder_datum" not in mooring_cols:
+        conn.execute(
+            "ALTER TABLE moorings ADD COLUMN sounder_datum TEXT DEFAULT 'transducer'"
+        )
+    if "bed_type" not in mooring_cols:
+        conn.execute(
+            "ALTER TABLE moorings ADD COLUMN bed_type TEXT DEFAULT 'unknown'"
+        )
+
+    # Migrate observations table: add v2.10 echo-sounder columns. New columns
+    # are nullable and obs_type defaults to 'binary', so existing afloat/
+    # aground rows are untouched and continue through the bound-only path.
+    cursor_obs = conn.execute("PRAGMA table_info(observations)")
+    obs_cols = {row[1] for row in cursor_obs.fetchall()}
+    obs_migrations = {
+        "obs_type": "ALTER TABLE observations ADD COLUMN obs_type TEXT DEFAULT 'binary'",
+        "measured_depth_m": "ALTER TABLE observations ADD COLUMN measured_depth_m REAL",
+        "sounder_datum": "ALTER TABLE observations ADD COLUMN sounder_datum TEXT",
+        "transducer_offset_m": "ALTER TABLE observations ADD COLUMN transducer_offset_m REAL",
+    }
+    for col, sql in obs_migrations.items():
+        if col not in obs_cols:
+            conn.execute(sql)
 
     # Migrate harmonic_predictions: add cycle_number column for cycle-based
     # deduplication of latest_only queries. Existing rows are backfilled in
@@ -467,23 +511,47 @@ def add_observation(data: dict) -> dict:
         # Surface unparseable input rather than silently corrupting the row.
         raise ValueError(f"Could not parse observation timestamp {raw_ts!r}: {e}")
 
+    # v2.10: a sounding stores the RAW measured depth and a sentinel state
+    # so the bound-only path (state in afloat|aground) skips it untouched.
+    # Binary rows are unchanged: obs_type defaults to 'binary' and state
+    # carries afloat|aground exactly as before.
+    obs_type = (data.get("obs_type") or "binary").strip().lower()
+    if obs_type == "sounding":
+        state = "sounding"
+        measured_depth_m = data.get("measured_depth_m")
+        sounder_datum = data.get("sounder_datum")
+        transducer_offset_m = data.get("transducer_offset_m")
+    else:
+        obs_type = "binary"
+        state = data["state"]
+        measured_depth_m = None
+        sounder_datum = None
+        transducer_offset_m = None
+
     with db_connection() as conn:
         cursor = conn.execute("""
             INSERT INTO observations (mooring_id, timestamp, state, wind_direction,
-                                      direction_of_lay, notes, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                                      direction_of_lay, notes, created_at,
+                                      obs_type, measured_depth_m, sounder_datum,
+                                      transducer_offset_m)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             data["mooring_id"],
             normalized_ts,
-            data["state"],
+            state,
             data.get("wind_direction", ""),
             data.get("direction_of_lay", ""),
             data.get("notes", ""),
-            now
+            now,
+            obs_type,
+            measured_depth_m,
+            sounder_datum,
+            transducer_offset_m,
         ))
         # Return the stored (normalised) timestamp so callers see what the
         # DB actually holds, not what they sent.
-        return {"id": cursor.lastrowid, **data, "timestamp": normalized_ts}
+        return {"id": cursor.lastrowid, **data, "timestamp": normalized_ts,
+                "state": state, "obs_type": obs_type}
 
 
 def get_observations(mooring_id: int) -> list[dict]:
@@ -849,7 +917,8 @@ def calibrate_drying_height(mooring_id: int, _preloaded=None) -> dict:
         lower_bound: float or None (from aground observations)
         upper_bound: float or None (from afloat observations)
         confidence: str ('high', 'medium', 'low', 'partial-low',
-                         'partial-high', 'inconsistent', 'none')
+                         'partial-high', 'inconsistent', 'none',
+                         'sounding-bound-conflict')
         matched: int (observations matched to tidal data)
         unmatched: int (observations outside tidal data range)
         afloat_count: int (base-classified afloat observations used)
@@ -867,6 +936,15 @@ def calibrate_drying_height(mooring_id: int, _preloaded=None) -> dict:
         "confidence": "none", "matched": 0, "unmatched": 0,
         "afloat_count": 0, "aground_count": 0,
         "excluded_wind_offset_count": 0,
+        # v2.10 echo-sounder calibration. Always present so callers and the
+        # UI can rely on the keys; zero/empty when no soundings exist, in
+        # which case the bound-only result below is bit-for-bit unchanged.
+        "sounding_count": 0,
+        "sounding_estimate": None,   # weighted mean of derived drying heights
+        "sounding_sd": None,         # standard error of that mean
+        "sounding_dryings": [],      # per-sounding derived drying_CD (for logging)
+        "floor_applied": False,      # aground floor clamped the estimate up
+        "sounding_conflict": False,  # soundings disagreed with a hard bound
     }
 
     if _preloaded is not None:
@@ -878,7 +956,9 @@ def calibrate_drying_height(mooring_id: int, _preloaded=None) -> dict:
     if not mooring or not observations or not tide_events:
         return result
 
-    from app.access_calc import interpolate_height_at_time
+    from app.access_calc import (
+        interpolate_height_at_time, sounder_water_depth, sounding_sigma,
+    )
     draught = mooring["draught_m"]
     try:
         current_drying = float(mooring.get("drying_height_m") or 0.0)
@@ -928,7 +1008,36 @@ def calibrate_drying_height(mooring_id: int, _preloaded=None) -> dict:
         lower_bounds.append(implied_drying)
         result["aground_count"] += 1
 
-    if not upper_bounds and not lower_bounds:
+    # --- v2.10 soundings: two-sided point estimates of drying height. ---
+    # Each stores only a raw reading; drying_CD is derived here through the
+    # same (pressure-blind) height model the bounds use. A per-observation
+    # offset/datum overrides the boat-level default for that reading only.
+    sounding_dryings = []  # list of (drying_CD, sigma)
+    for obs in observations:
+        if (obs.get("obs_type") or "binary") != "sounding":
+            continue
+        height = interpolate_height_at_time(obs["timestamp"], tide_events)
+        if height is None:
+            result["unmatched"] += 1
+            continue
+        t_off = obs.get("transducer_offset_m")
+        if t_off is None:
+            t_off = mooring.get("transducer_offset_m") or 0.0
+        datum = obs.get("sounder_datum") or mooring.get("sounder_datum") or "transducer"
+        water_depth = sounder_water_depth(
+            obs.get("measured_depth_m"), datum, t_off, draught
+        )
+        if water_depth is None:
+            result["unmatched"] += 1
+            continue
+        drying_cd = height - water_depth
+        sigma = sounding_sigma(mooring.get("bed_type"))
+        sounding_dryings.append((drying_cd, sigma))
+
+    result["sounding_count"] = len(sounding_dryings)
+    result["sounding_dryings"] = [round(d, 3) for (d, _s) in sounding_dryings]
+
+    if not upper_bounds and not lower_bounds and not sounding_dryings:
         return result
 
     upper = min(upper_bounds) if upper_bounds else None
@@ -936,6 +1045,54 @@ def calibrate_drying_height(mooring_id: int, _preloaded=None) -> dict:
 
     result["upper_bound"] = round(upper, 2) if upper is not None else None
     result["lower_bound"] = round(lower, 2) if lower is not None else None
+
+    # --- Sounding-driven estimate, reconciled against the hard bounds. ---
+    # When soundings exist they provide the central estimate (inverse-variance
+    # weighted mean). The aground lower bound is a hard physical floor: a keel
+    # touched, so the bed is at least that high. The estimate is never allowed
+    # below it, and a sounding cluster that sits meaningfully below it is
+    # flagged (sounding-bound-conflict) rather than silently averaged in --
+    # this is the guard against the soft-mud over-read, which biases derived
+    # drying LOW (the unsafe direction). When no soundings exist, control
+    # falls through to the original bound-only logic, unchanged.
+    if sounding_dryings:
+        weights = [1.0 / (s * s) for (_d, s) in sounding_dryings]
+        wsum = sum(weights)
+        estimate = sum(d * w for (d, _s), w in zip(sounding_dryings, weights)) / wsum
+        sd = wsum ** -0.5  # standard error of the weighted mean
+        result["sounding_estimate"] = round(estimate, 2)
+        result["sounding_sd"] = round(sd, 2)
+
+        # Tolerance for declaring a bound conflict: a couple of standard
+        # errors, with a 0.10 m floor so a tight cluster cannot trip the
+        # flag on rounding noise alone.
+        tol = max(0.10, 2.0 * sd)
+
+        conflict = False
+        # Aground floor (hard, non-negotiable). Below it by more than tol is
+        # a conflict; any amount below it is still clamped up to the floor.
+        if lower is not None and estimate < lower:
+            if estimate < lower - tol:
+                conflict = True
+            estimate = lower
+            result["floor_applied"] = True
+        # Afloat ceiling: a float proved drying <= upper. Soundings claiming
+        # materially more drying conflict; the conservative (higher-drying)
+        # value is already the estimate, so flag but do not lower it.
+        if upper is not None and estimate > upper + tol:
+            conflict = True
+
+        result["sounding_conflict"] = conflict
+        result["best_estimate"] = round(estimate, 2)
+        if conflict:
+            result["confidence"] = "sounding-bound-conflict"
+        elif sd < 0.08:
+            result["confidence"] = "high"
+        elif sd < 0.15:
+            result["confidence"] = "medium"
+        else:
+            result["confidence"] = "low"
+        return result
 
     if lower is not None and upper is not None:
         if lower < upper:
