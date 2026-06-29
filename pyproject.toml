@@ -1,0 +1,8 @@
+[tool.pytest.ini_options]
+# Put the repo root on sys.path so the bare `pytest` console script resolves
+# `import app...` the same way `python -m pytest` already does (the latter adds
+# the CWD automatically; the console script does not). See the run note in the
+# test module docstrings.
+pythonpath = ["."]
+# Default discovery root, so `pytest` with no args runs the suite.
+testpaths = ["tests"]
