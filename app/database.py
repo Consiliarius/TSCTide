@@ -405,6 +405,7 @@ def save_mooring(data: dict) -> dict:
                     barometric_enabled=?,
                     shallow_direction=?, shallow_extra_depth_m=?, calendar_enabled=?,
                     use_observations=?, tender_access_enabled=?, tender_min_depth_m=?,
+                    transducer_offset_m=?, sounder_datum=?, bed_type=?,
                     updated_at=?
                 WHERE mooring_id=?
             """, (
@@ -421,6 +422,9 @@ def save_mooring(data: dict) -> dict:
                 data.get("use_observations", 0),
                 1 if data.get("tender_access_enabled") else 0,
                 float(data.get("tender_min_depth_m", 0.3)),
+                float(data.get("transducer_offset_m", 0.0) or 0.0),
+                data.get("sounder_datum") or "transducer",
+                data.get("bed_type") or "unknown",
                 now,
                 data["mooring_id"]
             ))
@@ -431,8 +435,9 @@ def save_mooring(data: dict) -> dict:
                     shallow_direction,
                     shallow_extra_depth_m, calendar_enabled, use_observations,
                     tender_access_enabled, tender_min_depth_m,
+                    transducer_offset_m, sounder_datum, bed_type,
                     created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 data["mooring_id"],
                 data.get("boat_name", ""),
@@ -448,6 +453,9 @@ def save_mooring(data: dict) -> dict:
                 data.get("use_observations", 0),
                 1 if data.get("tender_access_enabled") else 0,
                 float(data.get("tender_min_depth_m", 0.3)),
+                float(data.get("transducer_offset_m", 0.0) or 0.0),
+                data.get("sounder_datum") or "transducer",
+                data.get("bed_type") or "unknown",
                 now, now
             ))
     return get_mooring(data["mooring_id"])
