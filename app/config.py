@@ -389,6 +389,17 @@ def get_window_rounding_mode(default: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Kendall's Wharf sill accessor (v2.9.2)
+# ---------------------------------------------------------------------------
+def get_sill_crest_above_cd_m(default: float) -> float:
+    """
+    Kendall's Wharf sill crest level, metres above Chart Datum (positive up).
+    JSON path: wharf_sill.crest_above_cd_m
+    """
+    return _resolve_scalar("wharf_sill.crest_above_cd_m", default, float)
+
+
+# ---------------------------------------------------------------------------
 # Cycle-number helper (shared across access_calc.py, ical_manager.py,
 # database.py)
 # ---------------------------------------------------------------------------

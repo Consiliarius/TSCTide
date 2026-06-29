@@ -172,6 +172,16 @@ def _compute_tide_state(now_utc: datetime) -> dict:
     if height is not None:
         result["height_m"] = round(height, 1)
 
+    # Kendall's Wharf sill depth (v2.9.2). Boat-agnostic advisory using the
+    # same rounded height shown as the headline, so the two figures agree.
+    # The barometric pressure effect is surfaced separately, not folded in.
+    if result["height_m"] is not None:
+        from app.sill import depth_over_sill, crest_above_cd_m
+        result["wharf_sill"] = {
+            "depth_m": depth_over_sill(result["height_m"]),
+            "crest_above_cd_m": round(crest_above_cd_m(), 1),
+        }
+
     # Determine tide state from the bracketing events.
     before_ev = None
     after_ev = None

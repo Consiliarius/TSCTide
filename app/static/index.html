@@ -2921,12 +2921,27 @@ function renderConditionsTide(tide) {
     const label = tide.spring_neap.charAt(0).toUpperCase() + tide.spring_neap.slice(1);
     springNeapHtml = ` <span class="tide-cycle-chip tide-cycle-${tide.spring_neap}" title="Spring/neap classification based on a rolling 90-day window of HW heights">${label} tide</span>`;
   }
+  // Kendall's Wharf sill depth (v2.9.2). Boat-agnostic advisory; the
+  // provenance caveat sits in the title tooltip so the visible line is
+  // just the depth.
+  let sillHtml = '';
+  if (tide.wharf_sill && tide.wharf_sill.depth_m != null) {
+    const d = tide.wharf_sill.depth_m;
+    const crest = tide.wharf_sill.crest_above_cd_m;
+    const tip = `Crest +${crest}m CD, 2023 survey; eastern edge actively silting, likely shallower. Advisory, not surveyed.`;
+    sillHtml =
+      `<div class="conditions-row" title="${tip}">` +
+      `<span class="c-label">Est. water over Kendall's Wharf sill:</span> ` +
+      `<span class="c-value">${d.toFixed(1)}m</span>` +
+      `</div>`;
+  }
 
   el.innerHTML = '<div class="conditions-col-title">Tide</div>' +
     `<div class="conditions-row">` +
     `<span class="c-label">Current height of tide:</span> ` +
     `<span class="c-value">${tide.height_m}m above CD</span>` +
     `</div>` +
+    sillHtml +
     `<div class="conditions-state">${tide.state_description || ''} ${icon}${springNeapHtml}</div>` +
     upcomingHtml +
     `<div class="conditions-source">Source: <a href="https://easytide.admiralty.co.uk/?PortID=0066" target="_blank" rel="noopener noreferrer">UKHO Admiralty</a></div>`;
