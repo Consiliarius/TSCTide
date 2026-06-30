@@ -822,10 +822,10 @@ async def upload_observations_xlsx(mooring_id: int, request: Request):
         notes = str(row[5]).strip() if len(row) > 5 and row[5] else ""
         # v2.10 optional columns. Absent in pre-v2.10 templates, so a missing
         # or blank Obs Type is treated as a binary afloat/aground row exactly
-        # as before.
+        # as before. Soundings derive against the mooring's configured sounder
+        # datum, so there is no per-row datum column.
         obs_type = str(row[6]).strip().lower() if len(row) > 6 and row[6] else "binary"
         depth_val = row[7] if len(row) > 7 else None
-        datum_val = str(row[8]).strip().lower() if len(row) > 8 and row[8] else ""
 
         try:
             if isinstance(date_val, datetime):
@@ -862,7 +862,6 @@ async def upload_observations_xlsx(mooring_id: int, request: Request):
                 "timestamp": ts,
                 "obs_type": "sounding",
                 "measured_depth_m": depth,
-                "sounder_datum": datum_val or None,
                 "wind_direction": wind_dir,
                 "direction_of_lay": lay_dir,
                 "notes": notes,
@@ -918,7 +917,7 @@ async def download_observation_template():
     ws.title = "Observations"
 
     headers = ["Date", "Time", "State", "Wind Direction", "Direction of Lay", "Notes",
-               "Obs Type", "Measured Depth (m)", "Sounder Datum"]
+               "Obs Type", "Measured Depth (m)"]
     header_font = Font(bold=True, color="FFFFFF")
     header_fill = PatternFill(start_color="1B2A4A", end_color="1B2A4A", fill_type="solid")
 
@@ -936,17 +935,17 @@ async def download_observation_template():
     ws.cell(row=2, column=5, value="NE")
     ws.cell(row=2, column=6, value="Spring tide, good visibility")
 
-    # Example sounding row — State is left blank; Obs Type drives it.
+    # Example sounding row — State is left blank; Obs Type drives it. The
+    # reading is interpreted against the mooring's configured sounder datum.
     ws.cell(row=3, column=1, value="15/04/2026")
     ws.cell(row=3, column=2, value="11:15")
     ws.cell(row=3, column=6, value="Depth sounding at mooring")
     ws.cell(row=3, column=7, value="sounding")
     ws.cell(row=3, column=8, value=2.4)
-    ws.cell(row=3, column=9, value="transducer")
 
     for col_letter, width in (
         ("A", 14), ("B", 8), ("C", 10), ("D", 16), ("E", 18), ("F", 30),
-        ("G", 12), ("H", 18), ("I", 14),
+        ("G", 12), ("H", 18),
     ):
         ws.column_dimensions[col_letter].width = width
 
@@ -959,8 +958,7 @@ async def download_observation_template():
     ws2.cell(row=6, column=1, value="Times are assumed to be local time (BST during sailing season)")
     ws2.cell(row=7, column=1, value="Obs Type: leave blank (or 'binary') for afloat/aground; 'sounding' for a depth reading")
     ws2.cell(row=8, column=1, value="Measured Depth (m): raw echo-sounder reading; required for sounding rows")
-    ws2.cell(row=9, column=1, value="Sounder Datum: waterline, transducer or keel (blank = boat default)")
-    ws2.cell(row=10, column=1, value="Soundings: State is ignored; the raw depth is converted to drying height at calibration time")
+    ws2.cell(row=9, column=1, value="Soundings: State is ignored; the raw depth is converted to drying height using the mooring's sounder datum at calibration time")
 
     buf = io.BytesIO()
     wb.save(buf)
