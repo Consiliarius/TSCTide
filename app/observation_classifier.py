@@ -7,8 +7,9 @@ observations, classifies each observation as either:
   - "base":        contributes to base drying height calibration
   - "wind_offset": contributes to shallow-side wind offset calibration
 
-Afloat observations are always "base". Aground observations are
-classified "wind_offset" only when ALL of the following hold:
+Afloat observations are always "base". Aground observations — and v2.10
+depth soundings, which sample the bed under the boat at its current lay —
+are classified "wind_offset" only when ALL of the following hold:
 
   1. Mooring has wind_offset_enabled and a shallow_direction set.
      Note: shallow_extra_depth_m is NOT required to be > 0 - this
@@ -156,9 +157,15 @@ def classify_observation(obs, mooring, sorted_hw_events, wind_observations):
     }
 
     state = obs.get("state")
+    obs_type = obs.get("obs_type") or "binary"
 
-    # Afloat observations always calibrate base drying directly.
-    if state != "aground":
+    # A v2.10 depth sounding samples the bed under the boat at its current
+    # lay, so it routes to the wind offset on exactly the same lay+wind test
+    # as an aground observation (a sounding taken while lying to the shallow
+    # side measures the shallow-side bed, not the baseline). Afloat
+    # observations always calibrate base drying directly; everything that is
+    # neither aground nor a sounding short-circuits to base here.
+    if obs_type != "sounding" and state != "aground":
         result["reason"] = "afloat observation routes to base drying"
         return result
 
@@ -240,7 +247,7 @@ def classify_observation(obs, mooring, sorted_hw_events, wind_observations):
     # All conditions met.
     result["classification"] = "wind_offset"
     result["reason"] = (
-        f"aground, wind {wind_compass} toward shallow {shallow_dir}, "
+        f"lay to shallow: wind {wind_compass} toward {shallow_dir}, "
         f"bow {lay_dir}"
     )
     return result
