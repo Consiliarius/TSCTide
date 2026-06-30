@@ -748,8 +748,8 @@
           <label title="What your sounder reads to by default. A sounding can override this per reading.">Sounder Datum</label>
           <select id="sounder_datum" onchange="toggleTransducerOffset()">
             <option value="waterline">Below waterline</option>
-            <option value="transducer" selected>Below transducer</option>
-            <option value="keel">Below keel</option>
+            <option value="transducer">Below transducer</option>
+            <option value="keel" selected>Below keel</option>
           </select>
         </div>
         <div>
@@ -764,7 +764,7 @@
       <!-- Offset is only meaningful for a raw 'below transducer' reading;
            waterline/keel datums derive it from 0 / draught, so this row is
            revealed only when the datum is 'transducer'. -->
-      <div class="row" id="transducer_offset_row">
+      <div class="row hidden" id="transducer_offset_row">
         <div>
           <label title="Depth of the transducer below the waterline. Only used when the datum is 'below transducer'. Loading and trim shift this.">Transducer Offset (m)</label>
           <input type="number" id="transducer_offset_m" step="0.01" value="0.0">
@@ -1571,7 +1571,7 @@ function setConfig(cfg) {
   document.getElementById('tender_access_enabled').checked = !!cfg.tender_access_enabled;
   document.getElementById('tender_min_depth_m').value = cfg.tender_min_depth_m ?? 0.3;
   document.getElementById('transducer_offset_m').value = cfg.transducer_offset_m ?? 0.0;
-  document.getElementById('sounder_datum').value = cfg.sounder_datum || 'transducer';
+  document.getElementById('sounder_datum').value = cfg.sounder_datum || 'keel';
   document.getElementById('bed_type').value = cfg.bed_type || 'unknown';
   toggleTransducerOffset();
   toggleWindConfig();

@@ -140,7 +140,7 @@ def sounder_water_depth(measured_depth_m, sounder_datum,
     except (TypeError, ValueError):
         return None
 
-    datum = (sounder_datum or "transducer").strip().lower()
+    datum = (sounder_datum or "keel").strip().lower()
     if datum == "waterline":
         return m
     if datum == "keel":
@@ -148,7 +148,7 @@ def sounder_water_depth(measured_depth_m, sounder_datum,
             return m + float(draught_m)
         except (TypeError, ValueError):
             return None
-    # default / "transducer"
+    # "transducer": raw reading from the hull-mounted sensor.
     try:
         return m + float(transducer_offset_m or 0.0)
     except (TypeError, ValueError):

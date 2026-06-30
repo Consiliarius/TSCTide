@@ -46,7 +46,7 @@ CREATE TABLE IF NOT EXISTS moorings (
     -- describe the boat, not the mooring; a per-observation override exists
     -- for trim. bed_type drives soft-mud sigma inflation in calibration.
     transducer_offset_m REAL DEFAULT 0.0,
-    sounder_datum TEXT DEFAULT 'transducer',
+    sounder_datum TEXT DEFAULT 'keel',
     bed_type TEXT DEFAULT 'unknown',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -232,7 +232,7 @@ def init_db():
         )
     if "sounder_datum" not in mooring_cols:
         conn.execute(
-            "ALTER TABLE moorings ADD COLUMN sounder_datum TEXT DEFAULT 'transducer'"
+            "ALTER TABLE moorings ADD COLUMN sounder_datum TEXT DEFAULT 'keel'"
         )
     if "bed_type" not in mooring_cols:
         conn.execute(
@@ -423,7 +423,7 @@ def save_mooring(data: dict) -> dict:
                 1 if data.get("tender_access_enabled") else 0,
                 float(data.get("tender_min_depth_m", 0.3)),
                 float(data.get("transducer_offset_m", 0.0) or 0.0),
-                data.get("sounder_datum") or "transducer",
+                data.get("sounder_datum") or "keel",
                 data.get("bed_type") or "unknown",
                 now,
                 data["mooring_id"]
@@ -454,7 +454,7 @@ def save_mooring(data: dict) -> dict:
                 1 if data.get("tender_access_enabled") else 0,
                 float(data.get("tender_min_depth_m", 0.3)),
                 float(data.get("transducer_offset_m", 0.0) or 0.0),
-                data.get("sounder_datum") or "transducer",
+                data.get("sounder_datum") or "keel",
                 data.get("bed_type") or "unknown",
                 now, now
             ))
@@ -1031,7 +1031,7 @@ def calibrate_drying_height(mooring_id: int, _preloaded=None) -> dict:
         t_off = obs.get("transducer_offset_m")
         if t_off is None:
             t_off = mooring.get("transducer_offset_m") or 0.0
-        datum = obs.get("sounder_datum") or mooring.get("sounder_datum") or "transducer"
+        datum = obs.get("sounder_datum") or mooring.get("sounder_datum") or "keel"
         water_depth = sounder_water_depth(
             obs.get("measured_depth_m"), datum, t_off, draught
         )
