@@ -863,16 +863,29 @@ drying **low**, which is the unsafe direction. Handling:
   - The aground floor above is the hard guard; σ inflation is only a
     soft down-weight.
 
-### Spatial variance on a swing mooring
+### Spatial variance on a swing mooring — soundings feed the wind offset
 
 A sounding samples the bed under the transducer at the boat's current lay,
 within the swing circle, on a bed the wind-offset feature already treats as
-sloping. The controlling keel grounding point may be elsewhere.
-`direction_of_lay` is captured with every sounding. Lay-correlated scatter is
-the same across-channel slope the wind offset models; v2.10 surfaces it as
-low confidence / wide spread rather than averaging it away. Using
-sounding-vs-lay data to populate the wind-offset shallow-side parameter
-empirically is noted as a future linkage, **not built** in v2.10.
+sloping. The controlling keel grounding point may be elsewhere, and
+`direction_of_lay` is captured with every sounding.
+
+A sounding taken while the boat lay to the shallow side measures the
+shallow-side bed, not the baseline. As of v2.10 such a sounding is **routed
+to the wind-offset calibration**, on exactly the same lay+wind test that
+`app/observation_classifier.py` already applies to aground observations: it
+must have a recorded lay, a same-cycle wind sample pushing the boat toward
+the configured shallow side, and a bow within one sector of that wind. A
+qualifying sounding then contributes an implied offset (`drying_CD −
+base_drying`) to `calibrate_wind_offset` instead of the baseline pool — the
+sounding analogue of the aground lower bound, with `drying_CD = height −
+water_depth` in place of `height − draught`. Soundings whose implied offset
+is non-positive (consistent with base drying alone) fall through to the
+baseline estimate, mirroring the aground gate. A sounding with no qualifying
+lay/wind always feeds the baseline. This keeps shallow-side readings from
+contaminating the baseline drying height while letting them empirically
+inform the shallow-side offset — the linkage earlier flagged as future work,
+now built.
 
 ### Validation strategy (empirical, before relying on sounding-only data)
 
