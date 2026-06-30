@@ -935,9 +935,9 @@ def calibrate_drying_height(mooring_id: int, _preloaded=None) -> dict:
             whose implied offset was non-positive and therefore fell
             through to base drying)
         excluded_wind_offset_count: int (wind-offset-classified aground
-            observations whose implied offset was strictly positive and
-            therefore went to calibrate_wind_offset instead of feeding
-            the base-drying lower bound)
+            observations or soundings whose implied offset was strictly
+            positive and therefore went to calibrate_wind_offset instead
+            of feeding the base-drying estimate)
     """
     result = {
         "best_estimate": None, "lower_bound": None, "upper_bound": None,
@@ -1018,10 +1018,15 @@ def calibrate_drying_height(mooring_id: int, _preloaded=None) -> dict:
 
     # --- v2.10 soundings: two-sided point estimates of drying height. ---
     # Each stores only a raw reading; drying_CD is derived here through the
-    # same (pressure-blind) height model the bounds use. A per-observation
-    # offset/datum overrides the boat-level default for that reading only.
+    # same (pressure-blind) height model the bounds use, against the boat's
+    # configured sounder datum. A sounding classified "wind_offset" (taken
+    # while the boat lay to the shallow side) routes to calibrate_wind_offset
+    # exactly like an aground observation, so it constrains the shallow-side
+    # offset rather than contaminating the baseline drying estimate.
+    sounder_datum = mooring.get("sounder_datum") or "keel"
     sounding_dryings = []  # list of (drying_CD, sigma)
-    for obs in observations:
+    for cls in classifications:
+        obs = cls["observation"]
         if (obs.get("obs_type") or "binary") != "sounding":
             continue
         height = interpolate_height_at_time(obs["timestamp"], tide_events)
@@ -1031,14 +1036,25 @@ def calibrate_drying_height(mooring_id: int, _preloaded=None) -> dict:
         t_off = obs.get("transducer_offset_m")
         if t_off is None:
             t_off = mooring.get("transducer_offset_m") or 0.0
-        datum = obs.get("sounder_datum") or mooring.get("sounder_datum") or "keel"
         water_depth = sounder_water_depth(
-            obs.get("measured_depth_m"), datum, t_off, draught
+            obs.get("measured_depth_m"), sounder_datum, t_off, draught
         )
         if water_depth is None:
             result["unmatched"] += 1
             continue
         drying_cd = height - water_depth
+
+        # Mirror the aground gate: a shallow-side sounding only constrains the
+        # offset when its implied offset above the current base drying is
+        # strictly positive. Otherwise it is consistent with base drying alone
+        # and falls through to the baseline pool. Kept in sync with
+        # calibrate_wind_offset, which applies the same test.
+        if cls["classification"] == "wind_offset":
+            if (drying_cd - current_drying) > 0:
+                result["excluded_wind_offset_count"] += 1
+                continue
+            # else: fall through to the baseline pool
+
         sigma = sounding_sigma(mooring.get("bed_type"))
         sounding_dryings.append((drying_cd, sigma))
 
@@ -1149,10 +1165,10 @@ def calibrate_wind_offset(mooring_id: int, _preloaded=None) -> dict:
     calibrate_drying_height and calibrate_wind_offset are needed in the same
     request.
 
-    Only aground observations are used in v1. Each such observation
-    implies: h(obs_time) <= draught + base_drying + wind_offset, i.e.
-    wind_offset >= h(obs_time) - draught - base_drying. The returned
-    suggestion is the tightest (largest) of these lower bounds.
+    Aground observations and v2.10 depth soundings are used. Each implies a
+    shallow-side drying height (aground: h - draught; sounding: h -
+    water_depth) and hence wind_offset >= implied_drying - base_drying. The
+    returned suggestion is the tightest (largest) of these lower bounds.
 
     The mooring's currently-stored drying_height_m is used as the
     baseline. If the base drying height is updated, this calibration
@@ -1201,7 +1217,9 @@ def calibrate_wind_offset(mooring_id: int, _preloaded=None) -> dict:
     if not observations or not tide_events:
         return result
 
-    from app.access_calc import interpolate_height_at_time
+    from app.access_calc import interpolate_height_at_time, sounder_water_depth
+
+    sounder_datum = mooring.get("sounder_datum") or "keel"
 
     implied_lower_bounds = []
     for cls in classifications:
@@ -1211,11 +1229,24 @@ def calibrate_wind_offset(mooring_id: int, _preloaded=None) -> dict:
         height = interpolate_height_at_time(obs["timestamp"], tide_events)
         if height is None:
             continue
-        # Aground at height h implies: offset >= h - draught - base_drying.
-        # Negative implied offset values mean the observation is already
-        # consistent with the base drying alone (no offset needed); those
-        # do not constrain the offset and are skipped.
-        implied = height - draught - current_drying
+        # Implied shallow-side drying at this observation, then the offset it
+        # requires above the current base drying:
+        #   aground  -> implied_drying = height - draught (the keel touched)
+        #   sounding -> implied_drying = height - water_depth (bed measured)
+        # offset >= implied_drying - base_drying. Non-positive implied offsets
+        # are consistent with base drying alone and do not constrain it.
+        if (obs.get("obs_type") or "binary") == "sounding":
+            t_off = obs.get("transducer_offset_m")
+            if t_off is None:
+                t_off = mooring.get("transducer_offset_m") or 0.0
+            water_depth = sounder_water_depth(
+                obs.get("measured_depth_m"), sounder_datum, t_off, draught
+            )
+            if water_depth is None:
+                continue
+            implied = (height - water_depth) - current_drying
+        else:
+            implied = height - draught - current_drying
         if implied > 0:
             implied_lower_bounds.append(implied)
 
