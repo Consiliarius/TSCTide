@@ -745,12 +745,8 @@
            per reading. Only used when soundings are recorded. -->
       <div class="row">
         <div>
-          <label title="Depth of the transducer below the waterline. Used when a sounding's datum is 'below transducer'. Loading and trim shift this.">Transducer Offset (m)</label>
-          <input type="number" id="transducer_offset_m" step="0.01" value="0.0">
-        </div>
-        <div>
           <label title="What your sounder reads to by default. A sounding can override this per reading.">Sounder Datum</label>
-          <select id="sounder_datum">
+          <select id="sounder_datum" onchange="toggleTransducerOffset()">
             <option value="waterline">Below waterline</option>
             <option value="transducer" selected>Below transducer</option>
             <option value="keel">Below keel</option>
@@ -764,6 +760,16 @@
             <option value="soft">Soft (mud)</option>
           </select>
         </div>
+      </div>
+      <!-- Offset is only meaningful for a raw 'below transducer' reading;
+           waterline/keel datums derive it from 0 / draught, so this row is
+           revealed only when the datum is 'transducer'. -->
+      <div class="row" id="transducer_offset_row">
+        <div>
+          <label title="Depth of the transducer below the waterline. Only used when the datum is 'below transducer'. Loading and trim shift this.">Transducer Offset (m)</label>
+          <input type="number" id="transducer_offset_m" step="0.01" value="0.0">
+        </div>
+        <div></div>
       </div>
 
       <!-- Mooring-dependent options (hidden until Mooring ID is entered) -->
@@ -1567,6 +1573,7 @@ function setConfig(cfg) {
   document.getElementById('transducer_offset_m').value = cfg.transducer_offset_m ?? 0.0;
   document.getElementById('sounder_datum').value = cfg.sounder_datum || 'transducer';
   document.getElementById('bed_type').value = cfg.bed_type || 'unknown';
+  toggleTransducerOffset();
   toggleWindConfig();
   toggleTenderConfig();
   updateTenderVisibility();
@@ -2028,6 +2035,13 @@ function toggleObsType() {
   const isSounding = document.getElementById('obs_type').value === 'sounding';
   document.getElementById('obs_state_row').classList.toggle('hidden', isSounding);
   document.getElementById('obs_sounding_row').classList.toggle('hidden', !isSounding);
+}
+
+function toggleTransducerOffset() {
+  // The transducer offset is only consumed for a raw 'below transducer'
+  // reading; waterline/keel datums derive water depth from 0 / draught.
+  const isTransducer = document.getElementById('sounder_datum').value === 'transducer';
+  document.getElementById('transducer_offset_row').classList.toggle('hidden', !isTransducer);
 }
 
 async function submitObservation() {
