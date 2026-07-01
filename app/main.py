@@ -729,18 +729,46 @@ async def add_mooring_observation(mooring_id: int, request: Request):
     data = await request.json()
     data["mooring_id"] = mooring_id
 
+    # v2.10: a sounding records a raw measured depth rather than an
+    # afloat/aground state. Validate the depth and datum up front so a
+    # malformed reading is rejected rather than silently dropped at
+    # derivation time. Binary observations are unaffected.
+    if (data.get("obs_type") or "binary") == "sounding":
+        from app.access_calc import SOUNDER_DATUMS
+        try:
+            depth = float(data.get("measured_depth_m"))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "Sounding requires a numeric measured_depth_m")
+        if depth < 0:
+            raise HTTPException(400, "measured_depth_m must be non-negative")
+        datum = (data.get("sounder_datum") or "").strip().lower()
+        if datum and datum not in SOUNDER_DATUMS:
+            raise HTTPException(
+                400, f"sounder_datum must be one of {', '.join(SOUNDER_DATUMS)}"
+            )
+
     # Existence check is handled by the require_mooring_pin dependency,
     # which returns 404 before this handler runs.
     obs = add_observation(data)
 
+    is_sounding = obs.get("obs_type") == "sounding"
+    if is_sounding:
+        msg = (f"Sounding added: {data.get('measured_depth_m')}m "
+               f"({data.get('sounder_datum') or 'boat default'}) at "
+               f"{obs.get('timestamp', '')[:16]}")
+    else:
+        msg = f"Observation added: {obs.get('state')} at {obs.get('timestamp', '')[:16]}"
     log_activity(
         event_type="observation_added",
-        message=f"Observation added: {obs.get('state')} at {obs.get('timestamp', '')[:16]}",
+        message=msg,
         severity="info",
         scope="mooring",
         mooring_id=mooring_id,
         details={
+            "obs_type": obs.get("obs_type", "binary"),
             "state": obs.get("state"),
+            "measured_depth_m": data.get("measured_depth_m"),
+            "sounder_datum": data.get("sounder_datum"),
             "timestamp": obs.get("timestamp"),
             "wind_direction": obs.get("wind_direction", ""),
             "direction_of_lay": obs.get("direction_of_lay", ""),
@@ -792,6 +820,12 @@ async def upload_observations_xlsx(mooring_id: int, request: Request):
         wind_dir = str(row[3]).strip() if len(row) > 3 and row[3] else ""
         lay_dir = str(row[4]).strip() if len(row) > 4 and row[4] else ""
         notes = str(row[5]).strip() if len(row) > 5 and row[5] else ""
+        # v2.10 optional columns. Absent in pre-v2.10 templates, so a missing
+        # or blank Obs Type is treated as a binary afloat/aground row exactly
+        # as before. Soundings derive against the mooring's configured sounder
+        # datum, so there is no per-row datum column.
+        obs_type = str(row[6]).strip().lower() if len(row) > 6 and row[6] else "binary"
+        depth_val = row[7] if len(row) > 7 else None
 
         try:
             if isinstance(date_val, datetime):
@@ -811,6 +845,30 @@ async def upload_observations_xlsx(mooring_id: int, request: Request):
             errors += 1
             continue
 
+        if dt.tzinfo is None:
+            import pytz
+            local_tz = pytz.timezone(DEFAULT_TIMEZONE)
+            dt = local_tz.localize(dt)
+        ts = to_utc_str(dt)
+
+        if obs_type == "sounding":
+            try:
+                depth = float(depth_val)
+            except (TypeError, ValueError):
+                errors += 1
+                continue
+            add_observation({
+                "mooring_id": mooring_id,
+                "timestamp": ts,
+                "obs_type": "sounding",
+                "measured_depth_m": depth,
+                "wind_direction": wind_dir,
+                "direction_of_lay": lay_dir,
+                "notes": notes,
+            })
+            imported += 1
+            continue
+
         state_str = str(state_val).strip().lower()
         if state_str in ("afloat", "yes", "y", "true"):
             state = "afloat"
@@ -820,11 +878,6 @@ async def upload_observations_xlsx(mooring_id: int, request: Request):
             errors += 1
             continue
 
-        if dt.tzinfo is None:
-            import pytz
-            local_tz = pytz.timezone(DEFAULT_TIMEZONE)
-            dt = local_tz.localize(dt)
-        ts = to_utc_str(dt)
         add_observation({
             "mooring_id": mooring_id,
             "timestamp": ts,
@@ -863,7 +916,8 @@ async def download_observation_template():
     ws = wb.active
     ws.title = "Observations"
 
-    headers = ["Date", "Time", "State", "Wind Direction", "Direction of Lay", "Notes"]
+    headers = ["Date", "Time", "State", "Wind Direction", "Direction of Lay", "Notes",
+               "Obs Type", "Measured Depth (m)"]
     header_font = Font(bold=True, color="FFFFFF")
     header_fill = PatternFill(start_color="1B2A4A", end_color="1B2A4A", fill_type="solid")
 
@@ -873,6 +927,7 @@ async def download_observation_template():
         cell.fill = header_fill
         cell.alignment = Alignment(horizontal="center")
 
+    # Example binary (afloat/aground) row — leave the v2.10 columns blank.
     ws.cell(row=2, column=1, value="15/04/2026")
     ws.cell(row=2, column=2, value="10:30")
     ws.cell(row=2, column=3, value="afloat")
@@ -880,20 +935,30 @@ async def download_observation_template():
     ws.cell(row=2, column=5, value="NE")
     ws.cell(row=2, column=6, value="Spring tide, good visibility")
 
-    ws.column_dimensions["A"].width = 14
-    ws.column_dimensions["B"].width = 8
-    ws.column_dimensions["C"].width = 10
-    ws.column_dimensions["D"].width = 16
-    ws.column_dimensions["E"].width = 18
-    ws.column_dimensions["F"].width = 30
+    # Example sounding row — State is left blank; Obs Type drives it. The
+    # reading is interpreted against the mooring's configured sounder datum.
+    ws.cell(row=3, column=1, value="15/04/2026")
+    ws.cell(row=3, column=2, value="11:15")
+    ws.cell(row=3, column=6, value="Depth sounding at mooring")
+    ws.cell(row=3, column=7, value="sounding")
+    ws.cell(row=3, column=8, value=2.4)
+
+    for col_letter, width in (
+        ("A", 14), ("B", 8), ("C", 10), ("D", 16), ("E", 18), ("F", 30),
+        ("G", 12), ("H", 18),
+    ):
+        ws.column_dimensions[col_letter].width = width
 
     ws2 = wb.create_sheet("Notes")
-    ws2.cell(row=1, column=1, value="State: 'afloat' or 'aground'")
+    ws2.cell(row=1, column=1, value="State: 'afloat' or 'aground' (binary rows only)")
     ws2.cell(row=2, column=1, value="Wind Direction: N, NE, E, SE, S, SW, W, NW (optional)")
     ws2.cell(row=3, column=1, value="Direction of Lay: bow heading N, NE, E, SE, S, SW, W, NW (optional)")
     ws2.cell(row=4, column=1, value="Date format: DD/MM/YYYY")
     ws2.cell(row=5, column=1, value="Time format: HH:MM (local time)")
     ws2.cell(row=6, column=1, value="Times are assumed to be local time (BST during sailing season)")
+    ws2.cell(row=7, column=1, value="Obs Type: leave blank (or 'binary') for afloat/aground; 'sounding' for a depth reading")
+    ws2.cell(row=8, column=1, value="Measured Depth (m): raw echo-sounder reading; required for sounding rows")
+    ws2.cell(row=9, column=1, value="Soundings: State is ignored; the raw depth is converted to drying height using the mooring's sounder datum at calibration time")
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -986,6 +1051,16 @@ async def apply_drying_height_calibration(mooring_id: int):
             "upper_bound": cal.get("upper_bound"),
             "afloat_count": cal.get("afloat_count"),
             "aground_count": cal.get("aground_count"),
+            # v2.10 sounding audit trail: enough to reconcile a
+            # sounding-driven recalibration against the bounds after the
+            # fact (validation 1 in CALIBRATION_NOTES).
+            "sounding_count": cal.get("sounding_count"),
+            "sounding_estimate": cal.get("sounding_estimate"),
+            "sounding_sd": cal.get("sounding_sd"),
+            "sounding_dryings": cal.get("sounding_dryings"),
+            "floor_applied": cal.get("floor_applied"),
+            "sounding_conflict": cal.get("sounding_conflict"),
+            "height_source": "interpolate_height_at_time (pressure-blind)",
         },
     )
 

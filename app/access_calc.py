@@ -83,6 +83,93 @@ def interpolate_height_at_time(target_iso: str, events: list[dict]) -> Optional[
     return _interpolate_from_parsed(target, parsed)
 
 
+# --- Echo-sounder (depth sounding) calibration support (v2.10) ---
+#
+# A sounding is a two-sided point estimate of drying height, in contrast to
+# the one-sided afloat/aground inequality. Only the raw measured depth is
+# stored; the drying height is derived here, at query time, through the same
+# height model (interpolate_height_at_time) the bound logic uses. Soundings
+# therefore re-derive automatically if the harmonic model is recalibrated,
+# with no stored value going stale.
+#
+# Pressure (v2.10.0): derivation is deliberately pressure-blind, matching the
+# afloat/aground calibration path — app/barometric.py keeps the calibration
+# corpus pressure-blind, and interpolate_height_at_time applies no barometric
+# correction. A sounding taken under an extreme inverse-barometer anomaly
+# therefore carries that anomaly into its derived drying height. Correcting
+# the sounding instant for pressure is a documented follow-up; see
+# docs/CALIBRATION_NOTES.md. The offset and soft-mud uncertainties below
+# dominate at typical anomaly magnitudes, so this is acceptable for the
+# initial release.
+
+SOUNDER_DATUMS = ("waterline", "transducer", "keel")
+
+# Coarse 1-sigma components (metres) for a sounding-derived drying height.
+# These are engineering estimates, not measured constants; their job is to
+# weight soundings relative to one another and to set interval width, not to
+# assert an absolute accuracy. They are combined in quadrature.
+_SOUNDING_SIGMA_INSTRUMENT = 0.10    # echo sounder + readout resolution
+_SOUNDING_SIGMA_OFFSET = 0.10        # transducer offset / trim uncertainty
+_SOUNDING_SIGMA_PREDICTION = 0.15    # inherited interpolate_height_at_time error
+# Multiplier over soft / unknown bed, where the sounder may return off the
+# fluid-mud surface and over-read depth (biasing derived drying LOW — the
+# unsafe direction). Down-weights such soundings; the aground floor in
+# calibrate_drying_height remains the hard guard, not this factor.
+_SOUNDING_SIGMA_SOFT_BED_FACTOR = 2.0
+
+
+def sounder_water_depth(measured_depth_m, sounder_datum,
+                        transducer_offset_m, draught_m) -> Optional[float]:
+    """
+    Total water depth over the seabed at the sounding point, derived from the
+    raw sounder reading and the datum it is referenced to:
+
+      waterline  -> reading is already to the waterline; depth = measured
+      transducer -> reading is below the transducer;     depth = measured + offset
+      keel       -> reading is below the keel;           depth = measured + draught
+                    (the keel sits ``draught`` below the waterline)
+
+    The "keel" form uses the mooring's draught rather than a separate
+    keel-to-transducer geometry, which the tool does not store. Returns None
+    if the inputs are unusable.
+    """
+    if measured_depth_m is None:
+        return None
+    try:
+        m = float(measured_depth_m)
+    except (TypeError, ValueError):
+        return None
+
+    datum = (sounder_datum or "keel").strip().lower()
+    if datum == "waterline":
+        return m
+    if datum == "keel":
+        try:
+            return m + float(draught_m)
+        except (TypeError, ValueError):
+            return None
+    # "transducer": raw reading from the hull-mounted sensor.
+    try:
+        return m + float(transducer_offset_m or 0.0)
+    except (TypeError, ValueError):
+        return m
+
+
+def sounding_sigma(bed_type: Optional[str] = None) -> float:
+    """
+    Combined 1-sigma uncertainty (metres) of a single sounding-derived drying
+    height. Inflated over soft / unknown bed to down-weight likely over-reads.
+    """
+    base = math.sqrt(
+        _SOUNDING_SIGMA_INSTRUMENT ** 2
+        + _SOUNDING_SIGMA_OFFSET ** 2
+        + _SOUNDING_SIGMA_PREDICTION ** 2
+    )
+    if (bed_type or "unknown").strip().lower() != "hard":
+        base *= _SOUNDING_SIGMA_SOFT_BED_FACTOR
+    return base
+
+
 def _curve_interpolate(target: datetime, before: tuple, after: tuple) -> float:
     """
     Interpolate height using the Langstone asymmetric tidal curve.

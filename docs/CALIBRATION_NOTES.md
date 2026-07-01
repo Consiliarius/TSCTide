@@ -775,6 +775,141 @@ not drift, so its validation is a one-off offline fit (this script),
 **not** an ongoing automated loop; there is no `sea_level_observations`
 table or daily gauge fetch.
 
+## Echo-sounder depth-sounding calibration (v2.10)
+
+v2.10 adds a second calibration input alongside the existing afloat/aground
+observations: a **depth sounding**. An afloat/aground observation is a
+one-sided inequality on drying height and is only tight near the grounding
+transition; a sounding is a two-sided point estimate that can be taken at
+any state of tide. Both inputs coexist and cross-check each other. Removing
+all soundings reverts `calibrate_drying_height` to its pre-v2.10 result
+bit-for-bit — soundings are purely additive.
+
+### Raw storage, query-time derivation
+
+A sounding stores only the **raw measured depth**, the datum it was read to,
+and (optionally) a per-reading transducer-offset override. It never stores a
+pre-computed drying height. Derivation happens at calibration time:
+
+```
+water_depth = measured_depth + offset_to_waterline(datum, transducer_offset, draught)
+drying_CD   = interpolate_height_at_time(t) − water_depth
+```
+
+`offset_to_waterline` is: `0` for a waterline datum; the transducer offset
+for a transducer datum; the boat's draught for a keel datum (the keel sits
+`draught` below the waterline — this avoids needing a separate
+keel-to-transducer geometry the tool does not hold). The helpers live in
+`app/access_calc.py` (`sounder_water_depth`, `sounding_sigma`); the estimator
+extension is in `app/database.py::calibrate_drying_height`.
+
+This mirrors the Portsmouth→Langstone query-time offset (Option B): soundings
+re-derive automatically if the harmonic model is recalibrated, with no stored
+value going stale. Stored soundings **must stay raw** — a later height-model
+change would otherwise leave historical soundings inconsistent with new ones.
+
+### Pressure (deliberately blind for v2.10.0) — follow-up flagged
+
+`interpolate_height_at_time` is **pressure-blind**: it applies no barometric
+(v2.9) correction. The v2.9 correction is applied to event heights in the
+feed write-path and the conditions display, not in the interpolation the
+calibration uses, and `app/barometric.py` deliberately keeps the calibration
+corpus pressure-blind. v2.10.0 follows that convention — soundings derive
+through the pressure-blind path, matching afloat/aground.
+
+The consequence: a sounding taken under an extreme inverse-barometer anomaly
+carries that anomaly into its derived drying height. Unlike a one-sided
+bound, a sounding measures real water depth at a real pressure, so there is a
+defensible argument for correcting the sounding instant for pressure when
+deriving `drying_CD`. **This is a documented follow-up, not yet built.** It
+was deferred because the offset and soft-mud uncertainties (below) dominate
+at typical anomaly magnitudes, and because shipping it pressure-blind keeps
+v2.10.0 consistent with the rest of the calibration. If revisited, apply the
+v2.9 `correction_for_pressure` at the sounding timestamp inside the
+derivation, and re-derive historical soundings (they are raw, so this is
+safe).
+
+### Estimator and the aground-floor safety interlock
+
+When soundings exist, the central estimate is the inverse-variance weighted
+mean of the per-sounding `drying_CD`, with a standard error reported as the
+spread. It is then reconciled against the hard bounds:
+
+  - **Aground floor (non-negotiable).** An aground observation is a hard
+    physical fact: the keel touched, so the bed is at least `height −
+    draught` there. The sounding estimate is never allowed below the aground
+    lower bound. This is the primary guard against the soft-mud failure mode
+    (next), where an over-read makes the bed appear deeper than it is and
+    would bias the estimate toward more access than is safe — the unsafe
+    direction.
+  - **Conflict, not silent averaging.** If the sounding cluster sits more
+    than ~2 standard errors below the aground floor (or materially above an
+    afloat ceiling), the result is flagged `sounding-bound-conflict` and the
+    conservative (higher-drying / shallower-water) interpretation is taken,
+    rather than averaging the sounding and the bound. The new confidence
+    state renders in both the UI (`confDesc`/`confSymbols`) and the feed
+    (`ical_manager.conf_labels`), distinct from the existing `inconsistent`
+    (which means the afloat/aground bounds themselves cross).
+
+### Soft mud (Langstone-specific)
+
+Echo sounders over fluid mud can return from the mud surface or penetrate it,
+reading to a layer the keel does not rest on. The over-read biases derived
+drying **low**, which is the unsafe direction. Handling:
+
+  - A per-mooring `bed_type` (`hard` / `soft` / `unknown`) inflates the
+    sounding σ over soft or unknown bed (×2 in `sounding_sigma`), so those
+    soundings carry less weight.
+  - The aground floor above is the hard guard; σ inflation is only a
+    soft down-weight.
+
+### Spatial variance on a swing mooring — soundings feed the wind offset
+
+A sounding samples the bed under the transducer at the boat's current lay,
+within the swing circle, on a bed the wind-offset feature already treats as
+sloping. The controlling keel grounding point may be elsewhere, and
+`direction_of_lay` is captured with every sounding.
+
+A sounding taken while the boat lay to the shallow side measures the
+shallow-side bed, not the baseline. As of v2.10 such a sounding is **routed
+to the wind-offset calibration**, on exactly the same lay+wind test that
+`app/observation_classifier.py` already applies to aground observations: it
+must have a recorded lay, a same-cycle wind sample pushing the boat toward
+the configured shallow side, and a bow within one sector of that wind. A
+qualifying sounding then contributes an implied offset (`drying_CD −
+base_drying`) to `calibrate_wind_offset` instead of the baseline pool — the
+sounding analogue of the aground lower bound, with `drying_CD = height −
+water_depth` in place of `height − draught`. Soundings whose implied offset
+is non-positive (consistent with base drying alone) fall through to the
+baseline estimate, mirroring the aground gate. A sounding with no qualifying
+lay/wind always feeds the baseline. This keeps shallow-side readings from
+contaminating the baseline drying height while letting them empirically
+inform the shallow-side offset — the linkage earlier flagged as future work,
+now built.
+
+### Validation strategy (empirical, before relying on sounding-only data)
+
+Ordered by effort-to-value:
+
+  1. **Bound cross-check (free, primary).** Every sounding-derived estimate
+     is checked against the afloat upper bounds and aground lower bounds
+     already collected on the mooring. Soundings that respect the bounds
+     corroborate the method; persistent conflicts indicate offset error,
+     mud, or spatial mismatch. The `calibration_update` activity-log detail
+     records the sounding count, the per-sounding derived `drying_CD`, and
+     whether the floor or conflict flag fired, so the method can be audited
+     against the bounds after the fact.
+  2. **Multi-state self-consistency (free).** Soundings taken at different
+     states of tide should derive the same drying height; scatter beyond σ
+     flags an offset or height-model problem, not the bed.
+  3. **Transition-timestamp correlation (deferred).** The grounding/float
+     transition timestamp — the most direct anchor — is **not** in the v2.10
+     schema; it is a later branch. Until then, validation is against the
+     afloat/aground bounds only.
+
+A sounding-only calibration should not be relied on until the estimator has
+been checked against collected bound data on a real mooring (validation 1).
+
 ## How to update the model configuration
 
 As of v2.5.5 the model configuration lives only in the bundled file
