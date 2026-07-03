@@ -441,7 +441,7 @@ Trot (fore-and-aft) moorings that cannot swing, or deep-channel moorings with ne
 
 ### Calibrating the wind offset from observations
 
-An aground observation only contributes to wind-offset calibration when the HW+4h wind sample of the preceding cycle shows wind pushing toward the shallow side, **and** the observed direction of lay matches that wind direction within one compass sector. Aground observations recorded when the wind was not pushing toward shallow carry no information about the magnitude of the offset — they tell you the boat grounded, but not whether the shallow side was involved — and are treated as base drying observations instead.
+An aground observation (or a v2.10 depth sounding) only contributes to wind-offset calibration when the nearest wind sample within the same tidal cycle shows wind pushing toward the shallow side, **and** the observed direction of lay matches that wind direction within one compass sector. Aground observations recorded when the wind was not pushing toward shallow carry no information about the magnitude of the offset — they tell you the boat grounded, but not whether the shallow side was involved — and are treated as base drying observations instead.
 
 The calibration also depends on the currently stored base drying height: the implied minimum offset is `observed_height − draught − drying_height`. If the base drying height is updated via the Apply button, the wind-offset suggestion should be re-checked, since its arithmetic baseline has shifted. The UI shows an inline note recording which base drying height was used for the current suggestion.
 
@@ -461,7 +461,7 @@ This is distinct from, and composes with, the wind offset: the wind offset shift
 
 Three conditions must all hold for a window to be corrected:
 
-1. **System master** — `barometric.enabled` in `model_config.json` (default `false`). A single rollout/kill switch for the whole feature.
+1. **System master** — `barometric.enabled` in `model_config.json` (**currently enabled**; the code falls back to `false` only if the key is absent or malformed). A single rollout/kill switch for the whole feature.
 2. **Per-mooring opt-in** — a toggle in each mooring's config panel (`barometric_enabled`, default off), beside the wind-offset settings.
 3. **A fresh forecast** covering the event time. Pressure comes from the OpenWeatherMap 5-day / 3-hourly forecast, fetched and stored once per day by the 02:00 job. Beyond the forecast horizon (~5 days) **no** correction is applied — stale pressure is never extrapolated. An individual event whose forecast is missing or older than `forecast_staleness_hours` (default 36 h, tolerating one missed daily fetch) reverts to its uncorrected baseline; a single failed fetch never wholesale-reverts a feed.
 
@@ -477,4 +477,4 @@ The correction **value** is system-level (one pressure series, one `k` — every
 
 ### Enabling
 
-The feature ships **disabled** (`barometric.enabled = false`); per-mooring toggles do nothing until the master is on. To enable: set `barometric.enabled` to `true` in `app/model_config.json` and rebuild the image (`docker compose up -d --build`, since the config is bundled, not mounted), then opt in individual moorings from their config panels. The current barometric effect at the live measured pressure is surfaced in the Current Conditions panel while the master is on.
+The system master ships **enabled** (`barometric.enabled = true`), so the standalone pressure-corrected tide feed is live and the current barometric effect at the live measured pressure is surfaced in the Current Conditions panel. Per-mooring access-window correction is still **opt-in and off by default**: it activates for a mooring only once that mooring's `barometric_enabled` toggle is set from its config panel. To turn the whole feature off, set `barometric.enabled` to `false` in `app/model_config.json` and rebuild the image (`docker compose up -d --build`, since the config is bundled, not mounted).

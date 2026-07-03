@@ -5,6 +5,7 @@ Single-page web app with API routes for configuration, calculation,
 data management, and iCal feed serving.
 """
 
+import asyncio
 import logging
 import json
 from datetime import datetime, timedelta, timezone
@@ -43,7 +44,7 @@ from app.harmonic import predict_events as harmonic_predict_events
 from app.secondary_port import apply_offset
 from app.wind import fetch_current_wind, fetch_current_weather
 from app.conditions import get_current_conditions
-from app.access_calc import compute_access_windows, generate_event_uid, _interpolate_from_parsed
+from app.access_calc import compute_access_windows, _interpolate_from_parsed
 from app.ical_manager import (
     generate_export_ics, store_windows_as_events,
     generate_feed_for_mooring,
@@ -347,7 +348,11 @@ async def lifespan(app: FastAPI):
     ensure_dirs()
     init_db()
     load_model_config()  # Loads bundled config and warms the cache via _get_curve_params on first calc
-    _warm_up_harmonic_predictions()
+    # Harmonic warm-up synthesises 180 days of predictions (~43k trig
+    # evaluations) plus DB writes. Run it on a worker thread so it does not
+    # block the event loop during startup. db_connection() opens a fresh
+    # connection per call, so the writes are thread-safe.
+    await asyncio.to_thread(_warm_up_harmonic_predictions)
     start_scheduler()
     # Rebuild per-mooring wind-sample jobs immediately on boot. The in-memory
     # APScheduler store is empty after a restart, so without this the jobs would
@@ -376,7 +381,6 @@ def _warm_up_harmonic_predictions():
     """
     try:
         from app.database import db_connection, store_harmonic_predictions
-        from app.harmonic import predict_events as harmonic_predict_events
         with db_connection() as conn:
             count = conn.execute("SELECT COUNT(*) FROM harmonic_predictions").fetchone()[0]
         if count > 0:
@@ -746,6 +750,20 @@ async def add_mooring_observation(mooring_id: int, request: Request):
             raise HTTPException(
                 400, f"sounder_datum must be one of {', '.join(SOUNDER_DATUMS)}"
             )
+    else:
+        # Binary (afloat/aground) observation: require a valid state up front,
+        # mirroring the sounding validation above. Without this a direct API
+        # call omitting `state` reaches add_observation's `data["state"]` and
+        # raises a KeyError -> 500; here it becomes a 400. The value is
+        # canonicalised to lower case so a mis-cased state (e.g. "Afloat")
+        # is stored in the form calibration expects rather than silently
+        # skipped. The UI and XLSX importer already send a valid state.
+        state = str(data.get("state") or "").strip().lower()
+        if state not in ("afloat", "aground"):
+            raise HTTPException(
+                400, "Binary observation requires state 'afloat' or 'aground'"
+            )
+        data["state"] = state
 
     # Existence check is handled by the require_mooring_pin dependency,
     # which returns 404 before this handler runs.
@@ -1344,7 +1362,11 @@ async def calculate_access_windows(request: Request):
     elif source == "harmonic":
         days = int(data.get("days", 30))
         end = now + timedelta(days=days)
-        events = harmonic_predict_events(now, end)
+        # Start from query_start (now - 13h), matching the UKHO branch, so the
+        # first HW after `now` has a bracketing LW for interpolation; the
+        # `hw_timestamp >= now_str` filter below drops the past windows. Heavy
+        # synthesis is offloaded so it does not block the event loop.
+        events = await asyncio.to_thread(harmonic_predict_events, query_start, end)
         events = apply_offset(events)
         tide_source = "harmonic"
 

@@ -1435,20 +1435,14 @@ def cleanup_old_tide_data(days: int = 365):
 #   - get_ukho_tide_events / get_tide_events / load_classification_inputs
 #     all query tide_data only and never see harmonic_predictions.
 
-# Reference defaults. The values actually used at runtime come from
-# model_config.json (loaded via app.config.compute_cycle_number). These
-# constants are kept here as readable documentation and as a fallback
-# if the JSON is missing or malformed. To change the model behaviour,
-# edit the JSON; do not edit these.
-#
-# Constants for cycle-based deduplication. Match the values used by
-# access_calc.generate_event_uid and ical_manager._tide_event_uid.
-# Critically, these values are the dedup key for stored rows in
-# harmonic_predictions.cycle_number; changing them invalidates every
-# existing row's cycle assignment and must not be done without a
-# database migration.
-_HARM_CYCLE_EPOCH = datetime(2026, 1, 1, tzinfo=timezone.utc)
-_HARM_CYCLE_HOURS = 12.4167
+# Cycle-based deduplication for harmonic_predictions uses the shared helper
+# app.config.compute_cycle_number, which reads the epoch and average cycle
+# length from model_config.json (falling back to app.config.DEFAULT_CYCLE_EPOCH
+# / DEFAULT_AVG_CYCLE_HOURS if the JSON is missing or malformed). The same
+# constants back access_calc.generate_event_uid and ical_manager._tide_event_uid.
+# Critically, these values ARE the dedup key for stored rows in
+# harmonic_predictions.cycle_number; changing them invalidates every existing
+# row's cycle assignment and must not be done without a database migration.
 
 
 def _compute_cycle_number(timestamp_iso: str) -> int:
