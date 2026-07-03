@@ -291,7 +291,12 @@ async def daily_ukho_fetch():
         harmonic_end = harmonic_start + timedelta(days=180)
         # predict_events returns Portsmouth values; apply Langstone offset
         # before storing so consumers (feed + UI) work with corrected values.
-        raw_harmonic = harmonic_predict_events(harmonic_start, harmonic_end)
+        # 180 days of synthesis is ~43k trig evaluations; offload it to a
+        # worker thread so the 02:00 job does not block the event loop (and
+        # any HTTP request handled on it) for the duration of the computation.
+        raw_harmonic = await asyncio.to_thread(
+            harmonic_predict_events, harmonic_start, harmonic_end
+        )
         langstone_harmonic = apply_offset(raw_harmonic) if raw_harmonic else []
         inserted = store_harmonic_predictions(langstone_harmonic)
         log_activity(

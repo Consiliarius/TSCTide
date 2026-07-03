@@ -684,17 +684,12 @@ def store_windows_as_events(windows: list[dict], mooring_id: int,
 #      transitions from harmonic to UKHO at the day-7 boundary, calendar
 #      apps see an updated event rather than a delete-and-add.
 
-# Reference defaults. The values actually used at runtime come from
-# model_config.json (loaded via app.config.compute_cycle_number). These
-# constants are kept here as readable documentation and as a fallback
-# if the JSON is missing or malformed. To change the model behaviour,
-# edit the JSON; do not edit these.
-#
-# Epoch for cycle numbering. Must match access_calc.generate_event_uid
-# and the harmonic_predictions cycle_number column in database.py so
-# that any cross-feed UID work is consistent.
-_TIDE_UID_EPOCH = datetime(2026, 1, 1, tzinfo=timezone.utc)
-_AVG_CYCLE_HOURS = 12.4167
+# Tide-event UIDs use the shared helper app.config.compute_cycle_number (see
+# _tide_event_uid below), which reads the epoch and average cycle length from
+# model_config.json (falling back to app.config.DEFAULT_CYCLE_EPOCH /
+# DEFAULT_AVG_CYCLE_HOURS if the JSON is missing or malformed). The same cycle
+# constants back access_calc.generate_event_uid and the harmonic_predictions
+# cycle_number column, so cross-feed UIDs stay consistent.
 
 
 def _tide_event_uid(timestamp_iso: str, event_type: str) -> str:
@@ -844,9 +839,10 @@ def generate_langstone_ukho_7d_pressure_corrected_feed() -> Path:
     the same tide events at the same times, with pressure-adjusted heights.
 
     Opt-in is by subscribing to this URL; there is no per-mooring toggle. The
-    correction is gated on the system master (barometric.enabled): while the
-    master is off the feed is byte-equivalent to the uncorrected 7d feed, so
-    the whole feature stays dark until it is enabled. Heights render at 0.1 m,
+    correction is gated on the system master (barometric.enabled), which is
+    currently enabled, so this feed's heights are pressure-corrected where the
+    forecast reaches. If the master is turned off the feed falls back to being
+    byte-equivalent to the uncorrected 7d feed. Heights render at 0.1 m,
     which is the implicit deadband -- a day-to-day forecast change alters the
     feed only when it crosses a 0.1 m boundary, on a same-time, same-UID event.
 
