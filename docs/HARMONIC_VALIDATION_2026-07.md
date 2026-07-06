@@ -139,13 +139,33 @@ offset (the model reports HW/LW 34/28 min earlier than its mathematical peak) pl
 ambiguity — not drift. Winter is worst (Jan RMS 0.42, Feb 0.41 — surge season); spring
 best (Apr 0.25).
 
-## Suggested next step (not done here)
+## Follow-up: seasonal `Sa`/`Ssa` recalibration (done 2026-07-06)
 
 The seasonal MSL offset (Finding 1) is the largest systematic (up to ~0.29 m in January),
 is *not* addressed by the v2.9 barometric feature (different physics), and is currently
-absorbed as a conservative low bias. Closing it would mean re-fitting the `Sa`/`Ssa`
-amplitude+phase or adding a small monthly MSL climatology — ties to `CALIBRATION_NOTES.md`
-items 3/4. The full-year cached corpus produced by this run is suitable to fit against.
+absorbed as a conservative low bias. It was traced to a **mis-phased `Sa`/`Ssa`**: the
+prior constituents peaked in September, whereas the real Portsmouth seasonal cycle peaks
+in November.
+
+`scripts/fit_seasonal_constituents.py` re-fits the annual/semiannual harmonics against the
+full PSMSL Portsmouth station 350 monthly-mean record (1961–2025, 715 months, 64.6 yr) in
+the model's own phase convention, removing the secular trend (+2.21 mm/yr) and the 18.6-yr
+nodal term. The refitted values now match the observed 64-year climatology to ~1 cm in
+every month:
+
+| Constituent | Was | Now |
+|---|---|---|
+| `SA` | 0.074 m @ 186.7° | 0.0615 m @ 221.8° |
+| `SSA` | 0.045 m @ 5.3° | 0.0155 m @ 129.3° |
+
+Applied to `model_config.json`. Effect on the cached 2025–26 corpus: the month-to-month
+bias spread drops ~38% (std 0.087 → 0.054 m); the constant mean bias is unchanged (−0.139 →
+−0.135 m), correctly, since `Sa`/`Ssa` are zero-mean over a year. The model remains
+conservative (net low) in every month.
+
+**Still open:** the ~0.14 m constant low bias is a *separate* issue (mean/HW under-read,
+the M2-amplitude candidate in `CALIBRATION_NOTES.md` item 4), not a seasonal one. It is in
+the conservative direction, so it is left in place deliberately rather than tuned out.
 
 ## Reproducing
 
