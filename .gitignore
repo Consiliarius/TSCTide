@@ -27,3 +27,8 @@ Thumbs.db
 Claude.md
 .claude/*
 docs/SESSION_RESUME.md
+
+# Harmonic validation run outputs (scripts/stress_test_harmonic.py default --out-dir .)
+/cache/
+/stress_report.txt
+/stress_report.json
