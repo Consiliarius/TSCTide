@@ -249,6 +249,12 @@ def init_db():
         "measured_depth_m": "ALTER TABLE observations ADD COLUMN measured_depth_m REAL",
         "sounder_datum": "ALTER TABLE observations ADD COLUMN sounder_datum TEXT",
         "transducer_offset_m": "ALTER TABLE observations ADD COLUMN transducer_offset_m REAL",
+        # v2.11: measured sea-level pressure (hPa) frozen at entry from the
+        # pressure_history archive. NULL when no archive reading was within
+        # tolerance of the observation time; calibration then leaves that
+        # observation's height uncorrected (pressure-blind), so legacy rows and
+        # retrospective imports without a nearby reading behave exactly as before.
+        "pressure_hpa": "ALTER TABLE observations ADD COLUMN pressure_hpa REAL",
     }
     for col, sql in obs_migrations.items():
         if col not in obs_cols:
@@ -536,13 +542,29 @@ def add_observation(data: dict) -> dict:
         sounder_datum = None
         transducer_offset_m = None
 
+    # v2.11: freeze the measured pressure at the observation time so calibration
+    # can correct the tide height to the ACTUAL barometric conditions when
+    # backing out the mooring's static drying height. An explicit pressure_hpa
+    # in `data` (a backfill or an importer that carries pressure) wins; otherwise
+    # it is looked up from the durable pressure_history archive at the
+    # observation time, and stays NULL when no reading is within tolerance — in
+    # which case calibration leaves that row's height uncorrected (pressure-blind).
+    pressure_hpa = data.get("pressure_hpa")
+    if pressure_hpa is None:
+        pressure_hpa = get_pressure_at(normalized_ts)
+    else:
+        try:
+            pressure_hpa = float(pressure_hpa)
+        except (TypeError, ValueError):
+            pressure_hpa = None
+
     with db_connection() as conn:
         cursor = conn.execute("""
             INSERT INTO observations (mooring_id, timestamp, state, wind_direction,
                                       direction_of_lay, notes, created_at,
                                       obs_type, measured_depth_m, sounder_datum,
-                                      transducer_offset_m)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                      transducer_offset_m, pressure_hpa)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             data["mooring_id"],
             normalized_ts,
@@ -555,11 +577,12 @@ def add_observation(data: dict) -> dict:
             measured_depth_m,
             sounder_datum,
             transducer_offset_m,
+            pressure_hpa,
         ))
-        # Return the stored (normalised) timestamp so callers see what the
-        # DB actually holds, not what they sent.
+        # Return the stored (normalised) timestamp and resolved pressure so
+        # callers see what the DB actually holds, not what they sent.
         return {"id": cursor.lastrowid, **data, "timestamp": normalized_ts,
-                "state": state, "obs_type": obs_type}
+                "state": state, "obs_type": obs_type, "pressure_hpa": pressure_hpa}
 
 
 def get_observations(mooring_id: int) -> list[dict]:
@@ -903,6 +926,45 @@ def load_classification_inputs(mooring_id: int):
     return mooring, observations, tide_events, wind_observations, classifications
 
 
+def _pressure_corrected_height(height, obs, baro_enabled: bool):
+    """
+    Adjust an interpolated tide height for the measured barometric pressure
+    frozen on an observation (v2.11), returning ``(corrected_height, applied_m)``.
+
+    The mooring's drying height is a STATIC seabed level; the water level at the
+    moment of an observation was moved by that day's actual barometric pressure.
+    Correcting the interpolated (average-pressure) height to the pressure that
+    actually applied removes that anomaly from the inferred seabed. Low pressure
+    at the observation raised the real water above the prediction, so the
+    correction is positive -> a higher corrected height -> a higher inferred bed;
+    high pressure is the reverse. This is the historic-actual analogue of the
+    forecast-time feed correction and composes on the same axis
+    (correction_for_pressure, which self-clamps to +/-max).
+
+    ``applied_m`` is 0.0 (height returned unchanged) whenever the height is None,
+    the system master (barometric.enabled) is off, or the observation has no
+    frozen pressure — preserving the pre-v2.11 pressure-blind behaviour for
+    those rows. interpolate_height_at_time itself is never modified, so the
+    harmonic-residual monitor and sweep scripts stay pressure-blind.
+    """
+    if height is None or not baro_enabled:
+        return height, 0.0
+    pressure = obs.get("pressure_hpa")
+    if pressure is None:
+        return height, 0.0
+    from app.barometric import correction_for_pressure
+    corr = correction_for_pressure(pressure)["correction_m"]
+    return height + corr, corr
+
+
+def _summarize_corrections(result: dict, corrections: list) -> None:
+    """Record the barometric-correction telemetry on a calibration result dict."""
+    if corrections:
+        result["pressure_corrected_count"] = len(corrections)
+        result["pressure_correction_min_m"] = round(min(corrections), 3)
+        result["pressure_correction_max_m"] = round(max(corrections), 3)
+
+
 def calibrate_drying_height(mooring_id: int, _preloaded=None) -> dict:
     """
     Estimate base drying height from observations tied to this mooring.
@@ -953,6 +1015,12 @@ def calibrate_drying_height(mooring_id: int, _preloaded=None) -> dict:
         "sounding_dryings": [],      # per-sounding derived drying_CD (for logging)
         "floor_applied": False,      # aground floor clamped the estimate up
         "sounding_conflict": False,  # soundings disagreed with a hard bound
+        # v2.11 barometric correction of the calibration input. Zero/None when
+        # the master is off or no observation carried a frozen pressure, in
+        # which case every height below is bit-for-bit the pressure-blind value.
+        "pressure_corrected_count": 0,
+        "pressure_correction_min_m": None,
+        "pressure_correction_max_m": None,
     }
 
     if _preloaded is not None:
@@ -967,6 +1035,9 @@ def calibrate_drying_height(mooring_id: int, _preloaded=None) -> dict:
     from app.access_calc import (
         interpolate_height_at_time, sounder_water_depth, sounding_sigma,
     )
+    from app.config import get_barometric_enabled
+    baro_enabled = get_barometric_enabled(False)
+    corrections = []  # metres applied per observation (base + sounding loops)
     draught = mooring["draught_m"]
     try:
         current_drying = float(mooring.get("drying_height_m") or 0.0)
@@ -985,6 +1056,10 @@ def calibrate_drying_height(mooring_id: int, _preloaded=None) -> dict:
         if height is None:
             result["unmatched"] += 1
             continue
+
+        height, corr = _pressure_corrected_height(height, obs, baro_enabled)
+        if corr != 0.0:
+            corrections.append(corr)
 
         result["matched"] += 1
         implied_drying = height - draught
@@ -1018,11 +1093,15 @@ def calibrate_drying_height(mooring_id: int, _preloaded=None) -> dict:
 
     # --- v2.10 soundings: two-sided point estimates of drying height. ---
     # Each stores only a raw reading; drying_CD is derived here through the
-    # same (pressure-blind) height model the bounds use, against the boat's
-    # configured sounder datum. A sounding classified "wind_offset" (taken
-    # while the boat lay to the shallow side) routes to calibrate_wind_offset
-    # exactly like an aground observation, so it constrains the shallow-side
-    # offset rather than contaminating the baseline drying estimate.
+    # same height model the bounds use, against the boat's configured sounder
+    # datum. v2.11: the interpolated surface height is corrected to the measured
+    # pressure at the sounding time (like the bounds); the sounder's water-depth
+    # reading is a direct measurement and is NOT pressure-dependent, so only the
+    # surface term moves — drying_CD = corrected_surface - measured_water_depth.
+    # A sounding classified "wind_offset" (taken while the boat lay to the
+    # shallow side) routes to calibrate_wind_offset exactly like an aground
+    # observation, so it constrains the shallow-side offset rather than
+    # contaminating the baseline drying estimate.
     sounder_datum = mooring.get("sounder_datum") or "keel"
     sounding_dryings = []  # list of (drying_CD, sigma)
     for cls in classifications:
@@ -1033,6 +1112,9 @@ def calibrate_drying_height(mooring_id: int, _preloaded=None) -> dict:
         if height is None:
             result["unmatched"] += 1
             continue
+        height, corr = _pressure_corrected_height(height, obs, baro_enabled)
+        if corr != 0.0:
+            corrections.append(corr)
         t_off = obs.get("transducer_offset_m")
         if t_off is None:
             t_off = mooring.get("transducer_offset_m") or 0.0
@@ -1060,6 +1142,10 @@ def calibrate_drying_height(mooring_id: int, _preloaded=None) -> dict:
 
     result["sounding_count"] = len(sounding_dryings)
     result["sounding_dryings"] = [round(d, 3) for (d, _s) in sounding_dryings]
+
+    # Barometric-correction telemetry: both loops are done, so this covers
+    # every return path below (all heights are already correction-adjusted).
+    _summarize_corrections(result, corrections)
 
     if not upper_bounds and not lower_bounds and not sounding_dryings:
         return result
@@ -1190,6 +1276,12 @@ def calibrate_wind_offset(mooring_id: int, _preloaded=None) -> dict:
         "observation_count": 0,
         "current_drying_height_m": None,
         "current_shallow_extra_depth_m": None,
+        # v2.11 barometric correction of the calibration input (see
+        # calibrate_drying_height). Uses the identical corrected height so base
+        # drying and the offset stay consistent for a given observation.
+        "pressure_corrected_count": 0,
+        "pressure_correction_min_m": None,
+        "pressure_correction_max_m": None,
     }
 
     if _preloaded is not None:
@@ -1218,6 +1310,9 @@ def calibrate_wind_offset(mooring_id: int, _preloaded=None) -> dict:
         return result
 
     from app.access_calc import interpolate_height_at_time, sounder_water_depth
+    from app.config import get_barometric_enabled
+    baro_enabled = get_barometric_enabled(False)
+    corrections = []
 
     sounder_datum = mooring.get("sounder_datum") or "keel"
 
@@ -1229,6 +1324,9 @@ def calibrate_wind_offset(mooring_id: int, _preloaded=None) -> dict:
         height = interpolate_height_at_time(obs["timestamp"], tide_events)
         if height is None:
             continue
+        height, corr = _pressure_corrected_height(height, obs, baro_enabled)
+        if corr != 0.0:
+            corrections.append(corr)
         # Implied shallow-side drying at this observation, then the offset it
         # requires above the current base drying:
         #   aground  -> implied_drying = height - draught (the keel touched)
@@ -1251,6 +1349,7 @@ def calibrate_wind_offset(mooring_id: int, _preloaded=None) -> dict:
             implied_lower_bounds.append(implied)
 
     result["observation_count"] = len(implied_lower_bounds)
+    _summarize_corrections(result, corrections)
 
     if not implied_lower_bounds:
         return result
@@ -1912,13 +2011,26 @@ def get_wind_observations_in_range(start: str, end: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-# --- Pressure History ---
+# --- Pressure History (durable measured-pressure archive) ---
 #
-# Stores atmospheric pressure readings at ~15-min intervals to support
-# pressure-trend calculation for the Current Conditions panel. Each row
-# is one OWM observation. Rows older than 24 hours are pruned by the
-# conditions refresh job; only the most recent ~3 hours are needed for
-# trend calculation but 24 hours is retained for debugging.
+# Stores measured atmospheric (sea-level) pressure readings at ~15-min
+# intervals. Each row is one OWM observation written by the conditions
+# refresh job. Two consumers with different retention needs share it:
+#
+#   1. The Current Conditions pressure-trend panel, which only ever queries
+#      the last few hours (get_pressure_history).
+#   2. Observation calibration (v2.11), which reads the measured pressure at
+#      an arbitrary past observation time (get_pressure_at) so the tide height
+#      used to back out the mooring's static drying height can be corrected to
+#      the ACTUAL barometric conditions at that moment, not average pressure.
+#
+# Consumer (2) makes this a durable archive rather than a rolling 24-h buffer:
+# an observation logged (or backfilled) days after the fact must still find the
+# pressure that applied when it was made. Rows are tiny (~35k/year) so the
+# retention horizon is generous (PRESSURE_ARCHIVE_RETENTION_DAYS in
+# app/conditions.py); pruning exists only to bound unbounded growth. The
+# instantaneous forecast-based correction used by the feeds lives elsewhere
+# (pressure_forecast); this table is measured history, used for calibration.
 
 def store_pressure_reading(timestamp: str, pressure_hpa: float) -> None:
     """Store a single pressure reading. Duplicate timestamps are ignored."""
@@ -1946,12 +2058,135 @@ def get_pressure_history(hours: int = 4) -> list[dict]:
 
 
 def cleanup_old_pressure_history(hours: int = 24) -> None:
-    """Remove pressure readings older than the given number of hours."""
+    """
+    Remove pressure readings older than the given number of hours.
+
+    Since v2.11 the caller (the conditions refresh) passes a multi-year horizon
+    so this table serves as the durable measured-pressure archive read by
+    observation calibration; the default here stays small only for callers that
+    explicitly want a short prune. See the module comment above and
+    PRESSURE_ARCHIVE_RETENTION_DAYS in app/conditions.py.
+    """
     cutoff = to_utc_str(datetime.now(timezone.utc) - timedelta(hours=hours))
     with db_connection() as conn:
         conn.execute(
             "DELETE FROM pressure_history WHERE timestamp < ?", (cutoff,)
         )
+
+
+def get_pressure_at(timestamp, max_gap_minutes: float = 90.0) -> Optional[float]:
+    """
+    Return the measured sea-level pressure (hPa) at an arbitrary past time,
+    read from the pressure_history archive.
+
+    The value is linearly interpolated between the two bracketing readings when
+    both lie within ``max_gap_minutes`` of the target; when only one side is
+    within tolerance (target at the edge of coverage, or a one-sided gap) that
+    nearest reading is used; when neither side has a reading within tolerance
+    (target outside coverage, or inside a gap wider than the tolerance) None is
+    returned. Callers treat None as "pressure unknown" and fall back to the
+    uncorrected (pressure-blind) height, never extrapolating.
+
+    ``timestamp`` may be an ISO-Z string or a datetime; it is normalised to the
+    stored 'YYYY-MM-DDTHH:MM:SSZ' form so string comparison against the stored
+    column orders chronologically.
+    """
+    try:
+        target_dt = timestamp if isinstance(timestamp, datetime) else dtparse_iso(timestamp)
+    except (ValueError, TypeError):
+        return None
+    if target_dt.tzinfo is None:
+        target_dt = target_dt.replace(tzinfo=timezone.utc)
+    target_str = to_utc_str(target_dt)
+    max_gap_s = max_gap_minutes * 60.0
+
+    with db_connection() as conn:
+        lo = conn.execute(
+            "SELECT timestamp, pressure_hpa FROM pressure_history "
+            "WHERE timestamp <= ? ORDER BY timestamp DESC LIMIT 1",
+            (target_str,),
+        ).fetchone()
+        hi = conn.execute(
+            "SELECT timestamp, pressure_hpa FROM pressure_history "
+            "WHERE timestamp >= ? ORDER BY timestamp ASC LIMIT 1",
+            (target_str,),
+        ).fetchone()
+
+    def _within(row):
+        """(row, gap_seconds) if the row is within tolerance, else None."""
+        if row is None:
+            return None
+        try:
+            row_dt = dtparse_iso(row["timestamp"])
+        except (ValueError, TypeError):
+            return None
+        gap = abs((row_dt - target_dt).total_seconds())
+        return (row, gap) if gap <= max_gap_s else None
+
+    lo_ok = _within(lo)
+    hi_ok = _within(hi)
+
+    # Exact hit or both endpoints coincide -> that reading.
+    if lo is not None and hi is not None and lo["timestamp"] == hi["timestamp"]:
+        return float(lo["pressure_hpa"])
+
+    if lo_ok and hi_ok:
+        lo_dt = dtparse_iso(lo["timestamp"])
+        hi_dt = dtparse_iso(hi["timestamp"])
+        span = (hi_dt - lo_dt).total_seconds()
+        if span <= 0:
+            return float(lo["pressure_hpa"])
+        frac = (target_dt - lo_dt).total_seconds() / span
+        return float(lo["pressure_hpa"]) + (
+            float(hi["pressure_hpa"]) - float(lo["pressure_hpa"])
+        ) * frac
+
+    # Only one side within tolerance -> nearest-neighbour.
+    if lo_ok:
+        return float(lo["pressure_hpa"])
+    if hi_ok:
+        return float(hi["pressure_hpa"])
+    return None
+
+
+def backfill_observation_pressure(max_gap_minutes: float = 90.0) -> dict:
+    """
+    Populate observations.pressure_hpa for rows that lack it, reading each
+    observation's measured pressure from the durable pressure_history archive
+    (get_pressure_at). Only NULL rows are touched, so this is idempotent and
+    never overwrites a value frozen at entry time.
+
+    An observation only gets a pressure if the archive covered its time; rows
+    whose time predates the archive (or falls in a gap wider than the tolerance)
+    stay NULL and remain pressure-blind in calibration. Returns a summary:
+    {"scanned", "updated", "still_missing"}.
+
+    The archive reads happen outside any write transaction (targets are
+    collected first) so no connection is nested inside another.
+    """
+    with db_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, timestamp FROM observations WHERE pressure_hpa IS NULL"
+        ).fetchall()
+        targets = [(r["id"], r["timestamp"]) for r in rows]
+
+    updates = []
+    for obs_id, ts in targets:
+        p = get_pressure_at(ts, max_gap_minutes=max_gap_minutes)
+        if p is not None:
+            updates.append((p, obs_id))
+
+    if updates:
+        with db_connection() as conn:
+            conn.executemany(
+                "UPDATE observations SET pressure_hpa = ? WHERE id = ?", updates
+            )
+
+    return {
+        "scanned": len(targets),
+        "updated": len(updates),
+        "still_missing": len(targets) - len(updates),
+    }
 
 
 # --- Pressure Forecast (v2.9) ---

@@ -92,15 +92,16 @@ def interpolate_height_at_time(target_iso: str, events: list[dict]) -> Optional[
 # therefore re-derive automatically if the harmonic model is recalibrated,
 # with no stored value going stale.
 #
-# Pressure (v2.10.0): derivation is deliberately pressure-blind, matching the
-# afloat/aground calibration path — app/barometric.py keeps the calibration
-# corpus pressure-blind, and interpolate_height_at_time applies no barometric
-# correction. A sounding taken under an extreme inverse-barometer anomaly
-# therefore carries that anomaly into its derived drying height. Correcting
-# the sounding instant for pressure is a documented follow-up; see
-# docs/CALIBRATION_NOTES.md. The offset and soft-mud uncertainties below
-# dominate at typical anomaly magnitudes, so this is acceptable for the
-# initial release.
+# Pressure: interpolate_height_at_time itself stays pressure-blind (applies no
+# barometric correction), so the harmonic-residual monitor and sweep scripts
+# are unaffected. As of v2.11, the *caller* corrects the height it returns to
+# the measured pressure frozen on each observation before deriving drying_CD
+# (app/database.py::calibrate_drying_height, via _pressure_corrected_height).
+# The mooring's drying height is a static seabed level, so reconciling the
+# sounding against the ACTUAL water level at its time — not the average-pressure
+# prediction — removes that day's inverse-barometer anomaly from the estimate.
+# The sounder's water-depth reading is a direct measurement and is NOT pressure-
+# corrected; only the surface term moves. See docs/CALIBRATION_NOTES.md.
 
 SOUNDER_DATUMS = ("waterline", "transducer", "keel")
 

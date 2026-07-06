@@ -808,26 +808,63 @@ re-derive automatically if the harmonic model is recalibrated, with no stored
 value going stale. Stored soundings **must stay raw** — a later height-model
 change would otherwise leave historical soundings inconsistent with new ones.
 
-### Pressure (deliberately blind for v2.10.0) — follow-up flagged
+### Pressure (blind for v2.10.0; corrected calibration input in v2.11)
 
-`interpolate_height_at_time` is **pressure-blind**: it applies no barometric
-(v2.9) correction. The v2.9 correction is applied to event heights in the
-feed write-path and the conditions display, not in the interpolation the
-calibration uses, and `app/barometric.py` deliberately keeps the calibration
-corpus pressure-blind. v2.10.0 follows that convention — soundings derive
-through the pressure-blind path, matching afloat/aground.
+`interpolate_height_at_time` is, and remains, **pressure-blind**: it applies no
+barometric (v2.9) correction. Keeping the interpolator itself blind is
+deliberate — the harmonic-residual monitor and the `scripts/` sweep tools read
+it and must see raw model heights.
 
-The consequence: a sounding taken under an extreme inverse-barometer anomaly
-carries that anomaly into its derived drying height. Unlike a one-sided
-bound, a sounding measures real water depth at a real pressure, so there is a
-defensible argument for correcting the sounding instant for pressure when
-deriving `drying_CD`. **This is a documented follow-up, not yet built.** It
-was deferred because the offset and soft-mud uncertainties (below) dominate
-at typical anomaly magnitudes, and because shipping it pressure-blind keeps
-v2.10.0 consistent with the rest of the calibration. If revisited, apply the
-v2.9 `correction_for_pressure` at the sounding timestamp inside the
-derivation, and re-derive historical soundings (they are raw, so this is
-safe).
+**v2.10.0 shipped the whole calibration corpus pressure-blind.** The
+consequence was that an observation (afloat/aground bound *or* sounding) taken
+under an inverse-barometer anomaly carried that anomaly into the inferred
+drying height: at low pressure the real water was higher than the
+average-pressure prediction, so the seabed was read too low, and that error
+then propagated into every predicted event through the stored
+`drying_height_m`.
+
+**v2.11 corrects the calibration input.** The mooring's drying height is a
+*static* seabed level, so the right fix is to reconcile each observation
+against the water level that *actually* applied at its moment, not the
+average-pressure prediction. The pieces:
+
+- **Durable measured-pressure archive.** `pressure_history` (measured sea-level
+  pressure, ~15-min cadence, written by the conditions refresh) is retained for
+  years rather than pruned to 24 h, so an observation's pressure can be found
+  after the fact. `get_pressure_at()` interpolates it at an arbitrary time and
+  returns `None` outside coverage rather than extrapolating.
+- **Frozen at entry.** `add_observation` stamps `observations.pressure_hpa` from
+  the archive at the observation time. Freezing (rather than looking up live at
+  calibration) keeps calibration deterministic and a pure function of stored
+  rows, and records the pressure attributed to each fix for audit. A one-off
+  `scripts/backfill_observation_pressure.py` fills historical rows the archive
+  now covers; rows it can't cover stay `NULL`.
+- **Correction, caller-side.** `calibrate_drying_height` and
+  `calibrate_wind_offset` add `correction_for_pressure(pressure_hpa)` (the v2.9
+  inverse-barometer term, self-clamped to ±0.30 m) to the interpolated height
+  before deriving bounds / `drying_CD` — via the shared
+  `_pressure_corrected_height` helper, so base drying and the wind offset use
+  the identical corrected height. For soundings only the surface term moves; the
+  sounder's water-depth reading is a direct measurement and is not corrected.
+
+This is **not** double-counting against the v2.9 feed correction: that shifts
+future *predictions* by *forecast* pressure; this reconciles a past
+*observation* against its *measured* pressure. They act on different times and
+different quantities.
+
+**Gating and fallback.** The correction applies only when the system master
+`barometric.enabled` is on **and** the observation carries a frozen pressure.
+Any `NULL`-pressure row — legacy data, an XLSX import without pressure, or an
+entry made when the archive had no nearby reading — is left uncorrected, so it
+behaves bit-for-bit as it did pre-v2.11. The number of corrected observations
+and the correction range are recorded in the `calibration_apply` activity-log
+entry.
+
+**Residual caveat.** The ±0.30 m clamp means a single observation logged during
+an extreme anomaly is still bounded, but the correction is only as good as the
+archive's coverage of that observation's time; a fix made before archiving
+began cannot be corrected. Consider weighting down or reviewing observations
+whose stored `pressure_hpa` is a large anomaly.
 
 ### Estimator and the aground-floor safety interlock
 
