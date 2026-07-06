@@ -1078,7 +1078,13 @@ async def apply_drying_height_calibration(mooring_id: int):
             "sounding_dryings": cal.get("sounding_dryings"),
             "floor_applied": cal.get("floor_applied"),
             "sounding_conflict": cal.get("sounding_conflict"),
-            "height_source": "interpolate_height_at_time (pressure-blind)",
+            # v2.11: heights are corrected to the measured pressure frozen on
+            # each observation when the barometric master is on and a pressure
+            # is present; rows without one stay pressure-blind.
+            "height_source": "interpolate_height_at_time (+ v2.11 barometric)",
+            "pressure_corrected_count": cal.get("pressure_corrected_count"),
+            "pressure_correction_min_m": cal.get("pressure_correction_min_m"),
+            "pressure_correction_max_m": cal.get("pressure_correction_max_m"),
         },
     )
 
@@ -1148,6 +1154,10 @@ async def apply_wind_offset_calibration(mooring_id: int):
             "confidence": cal.get("confidence"),
             "observation_count": cal.get("observation_count"),
             "baseline_drying_height_m": cal.get("current_drying_height_m"),
+            # v2.11 barometric-correction audit (see the drying-height apply).
+            "pressure_corrected_count": cal.get("pressure_corrected_count"),
+            "pressure_correction_min_m": cal.get("pressure_correction_min_m"),
+            "pressure_correction_max_m": cal.get("pressure_correction_max_m"),
         },
     )
 

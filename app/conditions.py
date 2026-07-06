@@ -50,6 +50,12 @@ PRESSURE_SLOW_THRESHOLD = 1.35      # hPa / 3h
 PRESSURE_RAPID_THRESHOLD = 6.10     # hPa / 3h
 PRESSURE_TREND_WINDOW_HOURS = 3
 
+# Retention for the durable measured-pressure archive (pressure_history).
+# The trend panel needs only hours, but observation calibration (v2.11) reads
+# the measured pressure at arbitrary past observation times, so the archive is
+# kept for years. Rows are tiny (~35k/year); pruning only bounds growth.
+PRESSURE_ARCHIVE_RETENTION_DAYS = 1825  # ~5 years
+
 # --- Cache ---
 _cached_conditions: Optional[dict] = None
 _cache_timestamp: Optional[datetime] = None
@@ -309,7 +315,7 @@ async def get_current_conditions(force_refresh: bool = False) -> dict:
     if weather and weather.get("pressure", {}).get("hpa"):
         pressure_hpa = weather["pressure"]["hpa"]
         store_pressure_reading(to_utc_str(now_utc), pressure_hpa)
-        cleanup_old_pressure_history(hours=24)
+        cleanup_old_pressure_history(hours=PRESSURE_ARCHIVE_RETENTION_DAYS * 24)
         trend = _compute_pressure_trend(pressure_hpa)
         weather["pressure"]["trend"] = trend["trend"]
         weather["pressure"]["trend_arrow"] = trend["arrow"]
