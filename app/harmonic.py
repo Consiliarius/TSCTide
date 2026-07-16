@@ -154,15 +154,57 @@ def predict_height_at_time(dt: datetime) -> float:
     return height
 
 
-def _refine(times, heights, i):
-    """Refine a turning point using quadratic interpolation."""
-    dt_s = (times[i] - times[i - 1]).total_seconds()
-    y0, y1, y2 = heights[i - 1], heights[i], heights[i + 1]
-    denom = 2 * (2 * y1 - y0 - y2)
-    if abs(denom) < 1e-10:
-        return times[i], heights[i]
-    off = (y0 - y2) / denom
-    return times[i] + timedelta(seconds=off * dt_s), y1 + 0.25 * (y0 - y2) * off
+# Reciprocal of the golden ratio, for the turning-point search below. The
+# identity 1 - _INV_PHI == _INV_PHI ** 2 is what lets each iteration re-use one
+# of the two interior probes, costing one curve evaluation per iteration.
+_INV_PHI = (5 ** 0.5 - 1) / 2
+
+# Bracket width at which the search stops. Sits comfortably inside the
+# whole-second precision events are emitted at, so convergence is never the
+# limiting factor: a peak falling near a second boundary may still round either
+# way, but nothing coarser than that survives. Reached in ~19 evaluations from
+# a 12-minute bracket (each iteration shrinks it to 61.8% of its width).
+_REFINE_TOLERANCE_SECONDS = 0.25
+
+
+def _refine(times, i, maximise):
+    """Locate the turning point bracketed by times[i - 1] .. times[i + 1].
+
+    The caller has established that the sample at i is a strict extremum among
+    its two neighbours, so a genuine turning point lies strictly inside that
+    bracket. Golden-section search converges on it by evaluating the curve
+    directly, which makes the result independent of where the sampling grid
+    happened to fall.
+
+    Quadratic interpolation over the three samples was used here previously. It
+    assumes the curve is locally parabolic; through the Solent HW stand the
+    curve is flat-topped, so the fit is ill-conditioned and its refined peak
+    aliased against the sampling grid — at the default 6-minute step the same
+    physical tide moved ~2 min for every 1 min the grid shifted, reporting
+    times spanning 10 min. The aliasing was zero-mean (verified over 348 HW and
+    348 LW across 180 days), so it never biased the Admiralty offsets below,
+    but it did make identical inputs give non-identical output. Refining
+    against the curve rather than the samples fixes that at the source, so
+    `step_min` stays a detection-grid knob and no longer sets timing accuracy.
+    """
+    lo, hi = times[i - 1], times[i + 1]
+    sign = 1.0 if maximise else -1.0
+    span = (hi - lo).total_seconds()
+    a = lo + timedelta(seconds=span * (1 - _INV_PHI))
+    b = lo + timedelta(seconds=span * _INV_PHI)
+    fa = sign * predict_height_at_time(a)
+    fb = sign * predict_height_at_time(b)
+    while (hi - lo).total_seconds() > _REFINE_TOLERANCE_SECONDS:
+        if fa > fb:
+            hi, b, fb = b, a, fa
+            a = lo + timedelta(seconds=(hi - lo).total_seconds() * (1 - _INV_PHI))
+            fa = sign * predict_height_at_time(a)
+        else:
+            lo, a, fa = a, b, fb
+            b = lo + timedelta(seconds=(hi - lo).total_seconds() * _INV_PHI)
+            fb = sign * predict_height_at_time(b)
+    t = lo + (hi - lo) / 2
+    return t, predict_height_at_time(t)
 
 
 # Admiralty convention offsets (applied in predict_events).
@@ -191,6 +233,12 @@ def predict_events(start: datetime, end: datetime, step_min: int = 6) -> list[di
     search window so that events close to `start`/`end` are still captured
     after shifting, the internal computation extends past each end by the
     larger of the HW/LW offset.
+
+    `step_min` is the coarse grid used only to bracket turning points, not to
+    time them — `_refine` converges on each one against the curve itself, so
+    reported times are stable to ~1s regardless of step or of where the range
+    is anchored. Steps up to 6 min bracket every event in the Langstone tidal
+    signal; there is no accuracy reason to lower it.
     """
     if start.tzinfo is None:
         start = start.replace(tzinfo=timezone.utc)
@@ -219,10 +267,10 @@ def predict_events(start: datetime, end: datetime, step_min: int = 6) -> list[di
     raw = []
     for i in range(1, len(heights) - 1):
         if heights[i] > heights[i - 1] and heights[i] > heights[i + 1]:
-            t, h = _refine(times, heights, i)
+            t, h = _refine(times, i, True)
             raw.append(("HighWater", t, round(h, 2)))
         elif heights[i] < heights[i - 1] and heights[i] < heights[i + 1]:
-            t, h = _refine(times, heights, i)
+            t, h = _refine(times, i, False)
             raw.append(("LowWater", t, round(h, 2)))
 
     # Filter spurious events from double-HW / stand effects

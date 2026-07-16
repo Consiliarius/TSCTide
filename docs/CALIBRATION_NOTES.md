@@ -194,6 +194,14 @@ produces slightly different `_refine`-output timestamps for the
 same physical tide. After N days, each future tide had up to N
 rows in `harmonic_predictions`.
 
+**Update (16 July 2026)**: that drift is now removed at source —
+`_refine` no longer aliases against the sampling grid, so
+consecutive daily runs agree on the same physical tide to ~1s
+rather than drifting by minutes. See "Turning-point refinement"
+below. The `cycle_number` dedup remains correct and is still
+required: it is what makes `latest_only` collapse a tide to one
+row across runs, and it is unaffected by the refinement change.
+
 **Resolution**: added a `cycle_number INTEGER` column to
 `harmonic_predictions` (derived as `round(hours_since_2026-01-01
 / 12.4167)`, matching the existing pattern in
@@ -946,6 +954,111 @@ Ordered by effort-to-value:
 
 A sounding-only calibration should not be relied on until the estimator has
 been checked against collected bound data on a real mooring (validation 1).
+
+## Turning-point refinement — grid aliasing removed (16 July 2026)
+
+`predict_events` samples the harmonic curve on a coarse grid anchored at
+its `start` argument (`compute_start = start - max_offset`) and then
+refines each turning point. Refinement used to fit a quadratic through
+the three samples around the extremum. Through the Solent HW stand the
+curve is flat-topped, not parabolic, so that fit was ill-conditioned and
+the refined peak tracked the **grid** rather than the tide.
+
+### The symptom
+
+Varying only the range anchor across a 12-minute sweep, for the HW near
+2026-07-17T01:02Z at the default `step_min=6`:
+
+| step | distinct times reported | spread |
+|-----:|------------------------:|-------:|
+| 6    | 6                       | 10 min |
+| 3    | 3                       | ~4 min |
+| 2    | 2                       | ~2 min |
+| 1    | 1                       | stable |
+
+The refined peak moved ~2 min for every 1 min the grid shifted — the
+quadratic was amplifying the grid offset, not converging on the peak.
+Against a 1-second brute-force scan of the curve, the old refinement
+placed that HW 275 s (4.6 min) away from the actual maximum.
+
+Both production callers anchor at `now` (`main.py`'s
+`query_start = now - 13h`; `scheduler.py`'s `harmonic_start = now`), so
+they re-aliased on every call. Impact was low — the jitter sits inside
+the model's own ~15 min HW timing stdev, 5-minute display rounding hides
+most of it, and cycle-based UIDs are stable to ±3h so events never
+duplicated — but identical inputs gave non-identical outputs, which made
+the calibration and residual-monitoring scripts noisier than necessary.
+
+### The fix
+
+`_refine` now runs a golden-section search over the bracket
+`times[i-1] .. times[i+1]`. The caller has already established that the
+middle sample is a strict extremum, so a genuine turning point lies
+strictly inside that bracket, and the search converges on it by
+evaluating `predict_height_at_time` directly. The answer therefore does
+not depend on where the grid fell.
+
+This was preferred over the two alternatives considered:
+
+  - **Defaulting `step_min` to 1.** Fixes the aliasing (this is why
+    `moorwatch/state.py` sets `EVENT_STEP_MINUTES = 1`), but costs 6× the
+    synthesis and is still only *approximately* right — at step=1 the
+    reported peak sits ~38 s from the true one. Golden section is both
+    more accurate and cheaper.
+  - **Snapping `compute_start` to a fixed grid.** Makes results
+    reproducible but bakes in whichever ±5 min error that grid happens to
+    produce. Reproducibly wrong.
+
+`step_min` is now purely a *detection* knob — it decides which turning
+points get bracketed, not how accurately they are timed. 6 minutes
+brackets every event in the Langstone signal; there is no accuracy reason
+to lower it, and `moorwatch`'s step=1 is now redundant rather than wrong.
+
+### Cost
+
+Refinement adds ~19 curve evaluations per event, against a bracket that
+starts 12 minutes wide and shrinks to 0.25 s.
+
+| Path                     | before | after | step=1 (rejected) |
+|--------------------------|-------:|------:|------------------:|
+| 180-day scheduler job    | 0.83 s | 1.11 s | 4.98 s           |
+| 44-hour `/api/calculate` | 8.6 ms | ~12 ms | 52 ms            |
+
+### The fit does not move
+
+This is the load-bearing check, since the constituents and the Admiralty
+offsets were calibrated through this code path.
+
+  - **Heights are bit-identical.** Over 1411 events across a year,
+    `max|Δheight| = 0.000 m`. Refinement moves *when* a turning point is
+    reported, not the curve, and the curve is flat there.
+  - **The aliasing was zero-mean**, so it never biased the calibrated
+    offsets — it only added noise around them. Old-minus-new event time
+    over a year: HW mean **+0.006 min** (sd 3.47), LW mean **+0.188 min**
+    (sd 3.46). Both are far below the 1-minute granularity of
+    `HW_ADMIRALTY_OFFSET_MINUTES = 34` and `LW_ADMIRALTY_OFFSET_MINUTES =
+    28`, which stand unchanged. The sd is the removed jitter.
+  - **`calibrate_from_ukho_week` barely moves**, and improves where it
+    does: production-path RMS 0.198 m → 0.197 m, mean unchanged at
+    −0.045 m. Raw-harmonic and uniform-offset paths are bit-identical (they
+    do not go through events). Every height bin agrees within 0.002 m,
+    three orders of magnitude below the 0.10 m / 0.25 m monitoring
+    thresholds in `scheduler.py`.
+
+Regression cover is in `tests/test_harmonic_refine.py`: anchor
+independence, step independence, and agreement with a 1-second brute-force
+scan of the curve. All three fail against the old quadratic.
+
+### Not changed
+
+`scripts/validate_harmonic_vs_measured.py` keeps its own `_quad_refine`.
+It refines peaks in **measured gauge data**, where there is no function to
+evaluate and quadratic interpolation over samples is the only option; its
+model-side use is on a 2-minute grid where the residual aliasing (~±1 min)
+is immaterial against the ~15 min stdev being measured. Re-running it under
+the new refinement would shift the numbers in
+`docs/HARMONIC_VALIDATION_2026-07.md` slightly; that report stands as
+published.
 
 ## How to update the model configuration
 
