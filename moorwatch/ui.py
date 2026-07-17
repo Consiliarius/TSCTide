@@ -111,7 +111,10 @@ class MoorwatchApp:
         family = theme.apply_fonts(self.root)
         self.f_value = tkfont.Font(family=family, size=theme.SIZE_BASE, weight="bold")
         self.f_label = tkfont.Font(family=family, size=theme.SIZE_BASE)
-        self.f_line = tkfont.Font(family=family, size=theme.SIZE_SMALL)
+        # The window line is a reading, not a footnote: same size as the rows
+        # above it, unbolded because it is context for them rather than one of
+        # them. SIZE_SMALL is for the chrome — clock, warnings, status bar.
+        self.f_line = tkfont.Font(family=family, size=theme.SIZE_BASE)
         self.f_small = tkfont.Font(family=family, size=theme.SIZE_SMALL)
 
     ROWS = ("height", "keel", "float", "access")

@@ -167,14 +167,24 @@ def _countdown(at: Optional[datetime], now: datetime) -> str:
 
 def window_line(state: MooringState, tz) -> str:
     """The governing access window, on the same 5-minute display grid the ICS
-    feed uses, so the two agree to the minute."""
+    feed uses, so the two agree to the minute.
+
+    "Current" or "Next" — because a bare pair of times does not say whether the
+    boat is in that window or waiting on it, and those are opposite situations.
+    The distinction is the same one the row above draws: a window that will
+    CLOSE is one the boat is inside; one that will OPEN is one it is waiting on.
+    Read from the transition rather than re-derived, so the two lines cannot
+    contradict each other.
+    """
     if state.negligible_access:
         return "Access window too short to show."
     if state.display_window is None:
         return ""
     start, end = state.display_window
     span = format_duration((end - start).total_seconds())
-    return f"Window {format_time(start, tz)} - {format_time(end, tz)}  ({span})"
+    inside = state.transition is not None and state.transition.kind == "closes"
+    prefix = "Current window" if inside else "Next window"
+    return f"{prefix} {format_time(start, tz)} - {format_time(end, tz)}  ({span})"
 
 
 def config_age_line(cfg, now: Optional[datetime] = None) -> str:
