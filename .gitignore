@@ -19,6 +19,14 @@ data/*
 # Operational backups
 *.bak
 
+# Moorwatch (netbook companion) local vessel config: machine-specific, seeded
+# from config.example.json on first run and refreshed with --sync. It names a
+# real boat and its mooring, so it must never be committed to a public repo.
+# The glob is deliberately wide -- a bare `moorwatch/config.json` rule let a
+# `config.json.saved` copy through once -- with the shipped example negated.
+moorwatch/config*.json*
+!moorwatch/config.example.json
+
 # OS
 .DS_Store
 Thumbs.db

@@ -1,0 +1,14 @@
+{
+  "_comment": "Copied to config.json on first run. draught_m and drying_height_m are null on purpose: moorwatch refuses to compute until it is told the truth about the boat and the berth. Fill them in, or run: python3 -m moorwatch --sync --url https://tsctide.uk --mooring <id>",
+  "mooring_id": null,
+  "boat_name": "",
+  "draught_m": null,
+  "drying_height_m": null,
+  "safety_margin_m": 0.3,
+  "timezone": "Europe/London",
+  "shallow_direction": "",
+  "shallow_extra_depth_m": 0.0,
+  "source_url": "https://tsctide.uk",
+  "fetched_at": null,
+  "tsctide_commit": null
+}
