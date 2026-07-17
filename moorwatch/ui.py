@@ -2,11 +2,28 @@
 
 Sits next to SYLog and OpenCPN on the netbook, so it borrows SYLog's visual
 conventions rather than inventing its own: the same palettes, a light default,
-F2 to switch to the night scheme, F11 for fullscreen, an 800x480 design floor.
+F2 to switch to the night scheme, F11 for fullscreen.
 
     Light default is deliberate. SYLog's scope chose dark, then reversed it --
     logbook/ui/theme.py records that dark "proved too dark" on this netbook in
     daylight. Same screen, same sun; no reason to relearn it.
+
+Layout
+------
+Four readings of equal standing, label and value, values in a column so the eye
+drops straight down them. Nothing above 19pt.
+
+The first cut was louder: a 26pt status banner, a 64pt depth figure, and a
+detail line under both. It said the same fact three times in three sizes --
+"DRIED OUT", "the mooring is dry", "dried out" -- and the 64pt figure was not
+carrying 64pt of information. It also put the access line in the body, where a
+number that is identical at every glance sits in the reader's way. That number
+is in the title bar now, with the boat: both are chrome, and chrome belongs in
+the frame.
+
+What survives from the loud version is the colour, on the clearance figure
+alone. It is the one number that says what the boat is doing; colouring the rest
+would make the window a traffic light with nothing to point at.
 
 Refresh
 -------
@@ -59,7 +76,18 @@ DARK = {
 PALETTES = {"light": LIGHT, "dark": DARK}
 
 TICK_MS = 30_000
-MIN_WIDTH, MIN_HEIGHT = 800, 480
+
+# Sized to its content (695 x 314 measured), not to SYLog's 800x480 design
+# floor. That floor is right for SYLog, which is the app you are working in;
+# this is a sidecar that sits beside it and OpenCPN on a 1024x600 screen, and a
+# sidecar demanding 78% of the width is one that gets closed. The window still
+# opens at a comfortable size and resizes up; the floor just stops it being
+# dragged smaller than its own text.
+MIN_WIDTH, MIN_HEIGHT = 700, 320
+DEFAULT_WIDTH, DEFAULT_HEIGHT = 760, 360
+
+# Wrap width for the long-form messages, independent of the window floor.
+WRAP_WIDTH = 660
 
 
 class MoorwatchApp:
@@ -72,8 +100,9 @@ class MoorwatchApp:
         self.tz = render.tzinfo_for(cfg.timezone)
         self._after_id = None
 
-        root.title(f"Moorwatch - {cfg.boat_name or cfg.mooring_id}")
+        root.title(render.title_text(cfg))
         root.minsize(MIN_WIDTH, MIN_HEIGHT)
+        root.geometry(f"{DEFAULT_WIDTH}x{DEFAULT_HEIGHT}")
         root.bind("<F2>", self.toggle_theme)
         root.bind("<F11>", self.toggle_fullscreen)
         root.bind("<Escape>", lambda _e: root.destroy())
@@ -87,71 +116,64 @@ class MoorwatchApp:
     # -- chrome ---------------------------------------------------------
 
     def _build_fonts(self):
-        # Large enough to read standing up, at arm's length, on a 1024x600
-        # screen in a cockpit. Tk's defaults are far too small for that.
-        self.f_depth = tkfont.Font(family="DejaVu Sans", size=64, weight="bold")
-        self.f_status = tkfont.Font(family="DejaVu Sans", size=26, weight="bold")
+        # 19pt is the ceiling: every reading is one of four rows of equal
+        # standing, so none of them shouts. The 64pt depth figure this replaced
+        # was not carrying 64pt worth of information — it repeated in three
+        # sizes what one line says once.
+        self.f_value = tkfont.Font(family="DejaVu Sans", size=19, weight="bold")
+        self.f_label = tkfont.Font(family="DejaVu Sans", size=15)
         self.f_line = tkfont.Font(family="DejaVu Sans", size=15)
-        self.f_big_line = tkfont.Font(family="DejaVu Sans", size=19, weight="bold")
         self.f_small = tkfont.Font(family="DejaVu Sans", size=11)
+
+    ROWS = ("height", "keel", "float", "access")
 
     def _build_widgets(self):
         p = PALETTES[self.mode]
         self.root.configure(bg=p["BG"])
 
-        self.header = tk.Label(self.root, font=self.f_small, anchor="w")
-        self.header.pack(fill="x", padx=16, pady=(10, 0))
+        self.clock = tk.Label(self.root, font=self.f_small, anchor="w")
+        self.clock.pack(fill="x", padx=16, pady=(10, 6))
 
-        # Label and detail are separate widgets, not one string: at the 800px
-        # design floor "IN MARGIN - afloat, but inside the safety margin" on one
-        # 26pt line runs off the edge, and the part that clips is the meaning.
-        self.status = tk.Label(self.root, font=self.f_status, anchor="w")
-        self.status.pack(fill="x", padx=16, pady=(6, 0))
+        # Four readings, one grid, values in a column so the eye drops straight
+        # down them. The boat name and the access line are in the title bar:
+        # neither changes between ticks, and a number that is the same at every
+        # glance is chrome, not a reading.
+        body = tk.Frame(self.root, bg=p["BG"])
+        body.pack(fill="x", padx=16)
+        body.columnconfigure(1, weight=1)
+        self._body = body
 
-        self.status_detail = tk.Label(self.root, font=self.f_line, anchor="w")
-        self.status_detail.pack(fill="x", padx=16)
-
-        self.depth = tk.Label(self.root, font=self.f_depth, anchor="w")
-        self.depth.pack(fill="x", padx=16)
-
-        # wraplength as insurance: this line carries three numbers whose widths
-        # vary with the tide, so it must wrap rather than clip a figure off the
-        # right edge at the 800px floor.
-        self.keel = tk.Label(self.root, font=self.f_line, anchor="w",
-                             justify="left", wraplength=MIN_WIDTH - 40)
-        self.keel.pack(fill="x", padx=16, pady=(0, 8))
-
-        self.float_line = tk.Label(self.root, font=self.f_line, anchor="w")
-        self.float_line.pack(fill="x", padx=16)
-
-        self.access_line = tk.Label(self.root, font=self.f_big_line, anchor="w")
-        self.access_line.pack(fill="x", padx=16)
+        self._row_label = {}
+        self._row_value = {}
+        for index, key in enumerate(self.ROWS):
+            label = tk.Label(body, font=self.f_label, anchor="w")
+            label.grid(row=index, column=0, sticky="w", pady=3)
+            value = tk.Label(body, font=self.f_value, anchor="w")
+            value.grid(row=index, column=1, sticky="w", padx=(14, 0), pady=3)
+            self._row_label[key] = label
+            self._row_value[key] = value
 
         self.window_line = tk.Label(self.root, font=self.f_line, anchor="w")
-        self.window_line.pack(fill="x", padx=16, pady=(0, 6))
+        self.window_line.pack(fill="x", padx=16, pady=(8, 0))
 
         self.warning = tk.Label(self.root, font=self.f_small, anchor="w",
-                                justify="left", wraplength=MIN_WIDTH - 40)
-        self.warning.pack(fill="x", padx=16)
+                                justify="left", wraplength=WRAP_WIDTH)
+        self.warning.pack(fill="x", padx=16, pady=(8, 0))
 
         self.footer = tk.Label(self.root, font=self.f_small, anchor="w",
                                justify="left")
         self.footer.pack(side="bottom", fill="x", padx=16, pady=8)
 
-        self._labels = [
-            self.header, self.status, self.status_detail, self.depth, self.keel,
-            self.float_line, self.access_line, self.window_line, self.warning,
-            self.footer,
-        ]
+        self._labels = [self.clock, self.window_line, self.warning, self.footer]
+        self._labels += list(self._row_label.values())
+        self._labels += list(self._row_value.values())
         # Keep the warning wrapping to the real window width rather than the
         # design floor, so a maximised window does not waste the line.
         self.root.bind("<Configure>", self._on_resize)
 
     def _on_resize(self, event):
         if event.widget is self.root:
-            width = max(MIN_WIDTH - 40, event.width - 40)
-            self.warning.configure(wraplength=width)
-            self.keel.configure(wraplength=width)
+            self.warning.configure(wraplength=max(WRAP_WIDTH, event.width - 40))
 
     def toggle_theme(self, _event=None):
         self.mode = "dark" if self.mode == "light" else "light"
@@ -175,9 +197,12 @@ class MoorwatchApp:
     def _show_error(self, exc: Exception):
         p = PALETTES[self.mode]
         self.root.configure(bg=p["BG"])
+        self._body.configure(bg=p["BG"])
         for label in self._labels:
             label.configure(bg=p["BG"], text="")
-        self.status.configure(fg=p["BAD"], text="NO READING")
+        # Blank every reading rather than leaving the last good one on screen:
+        # a stale depth that looks live is worse than an empty window.
+        self._row_label["height"].configure(fg=p["BAD"], text="No reading")
         self.warning.configure(
             fg=p["FG"],
             text=f"{type(exc).__name__}: {exc}\n\nRetrying every {TICK_MS // 1000}s.",
@@ -196,31 +221,37 @@ class MoorwatchApp:
         p = PALETTES[self.mode]
         accent = self._accent_for(state)
         self.root.configure(bg=p["BG"])
+        self._body.configure(bg=p["BG"])
         for label in self._labels:
             label.configure(bg=p["BG"])
 
-        name = self.cfg.boat_name or f"Mooring {self.cfg.mooring_id}"
-        self.header.configure(
-            fg=p["FG_MUTED"],
-            text=f"{name}   {render.format_datetime(state.now, self.tz)}",
-        )
-        self.status.configure(fg=accent, text=render.status_label(state))
-        self.status_detail.configure(
-            fg=p["FG_MUTED"], text=render.status_detail(state)
-        )
-        self.depth.configure(fg=accent, text=render.depth_text(state))
-        self.keel.configure(
-            fg=p["FG_MUTED"],
-            text=f"under the keel {render.clearance_value(state)}"
-                 f"    |    height {state.height_cd_m:.2f} m above CD"
-                 f"    |    access line {state.threshold_m:.2f} m",
-        )
+        self.clock.configure(
+            fg=p["FG_MUTED"], text=render.format_datetime(state.now, self.tz))
 
-        float_text = render.float_line(state, self.tz)
-        self.float_line.configure(fg=p["FG_MUTED"], text=float_text)
-        self.access_line.configure(
-            fg=p["FG"], text=render.transition_line(state, self.tz)
-        )
+        rows = {
+            "height": render.height_row(state),
+            "keel": render.keel_row(state),
+            "float": render.float_row(state, self.tz),
+            "access": render.access_row(state, self.tz),
+        }
+        # Only the clearance is coloured. It is the one figure that says what
+        # the boat is doing, and colouring the others would make the window a
+        # traffic light with nothing to point at.
+        colours = {"keel": accent}
+
+        for key in self.ROWS:
+            row = rows[key]
+            if row is None:
+                # An always-afloat mooring has no lift-off to report. Blank the
+                # row rather than dropping it, so the others do not jump up the
+                # window on the tick where it disappears.
+                self._row_label[key].configure(text="")
+                self._row_value[key].configure(text="")
+                continue
+            label, value = row
+            self._row_label[key].configure(fg=p["FG_MUTED"], text=label)
+            self._row_value[key].configure(fg=colours.get(key, p["FG"]), text=value)
+
         self.window_line.configure(
             fg=p["FG_MUTED"], text=render.window_line(state, self.tz)
         )

@@ -215,7 +215,7 @@ def test_dried_out_mooring_reports_negative_depth_and_a_float_time():
     assert state.float_transition.kind == "opens"
 
 
-def test_float_line_leads_the_access_line():
+def test_float_threshold_leads_the_access_threshold():
     """The boat lifts before it has access -- never the other way round."""
     state = compute_state(cfg(drying_height_m=2.0), dt(17, 11))
     assert state.float_threshold_m < state.threshold_m
