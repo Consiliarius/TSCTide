@@ -138,6 +138,44 @@ def access_row(state: MooringState, tz) -> tuple[str, str]:
     return (label, f"{format_time(at, tz)} - in {_countdown(at, state.now)}")
 
 
+# How close to the "Moor by" time counts as urgent. Half an hour is about the
+# time it takes to get back onto a mooring and settle, so inside it the line
+# stops being information and starts being a deadline.
+MOOR_BY_URGENT_SECONDS = 30 * 60
+
+
+def keel_has_water(state: MooringState) -> bool:
+    """True when there is water under the keel — the boat is off the bottom.
+
+    Deliberately the physical question, not the access one. A boat inside its
+    safety margin is floating, and saying otherwise on the depth reading would
+    be false; whether it should *move* is what the depart/moor row is for.
+    """
+    return state.clearance_m > 0
+
+
+def access_urgency(state: MooringState) -> str:
+    """How the depart/moor row should read: "normal", "warn" or "urgent".
+
+    A semantic token rather than a colour, so this module stays free of Tk and
+    of the palette — the window maps these onto theme colours, and the CLI could
+    map them onto nothing at all.
+
+    Only a closing window carries urgency. "Depart after" is an invitation and
+    can wait; "Moor by" is a deadline, and one that arrives whether or not the
+    boat is ready for it.
+    """
+    t = state.transition
+    if t is None or t.kind != "closes":
+        return "normal"
+    at = transition_at(state)
+    if at is None:
+        return "warn"
+    if (at - state.now).total_seconds() <= MOOR_BY_URGENT_SECONDS:
+        return "urgent"
+    return "warn"
+
+
 def _shown_at(transition, display_window) -> Optional[datetime]:
     """The transition instant as it should be *shown*.
 

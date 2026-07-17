@@ -57,7 +57,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 
 from moorwatch import render, theme
-from moorwatch.state import AFLOAT, AGROUND, DRIED_OUT, MARGIN, compute_state
+from moorwatch.state import compute_state
 
 TICK_MS = 30_000
 
@@ -199,16 +199,29 @@ class MoorwatchApp:
             text=f"{type(exc).__name__}: {exc}\n\nRetrying every {TICK_MS // 1000}s.",
         )
 
-    def _accent_for(self, state) -> str:
+    def _keel_colour(self, state) -> str:
+        """Green when there is water under the keel, plain when there is not.
+
+        Green on the physical fact, not on the access one: a boat inside its
+        safety margin IS floating, and the depth reading should say so. Whether
+        it may move is the row below's job, and colouring this one by access
+        would be two rows answering the same question in different words.
+        """
+        return theme.OK if render.keel_has_water(state) else theme.FG
+
+    def _access_colour(self, state) -> str:
+        """Plain to depart, amber to moor, red inside the last half hour.
+
+        Read at call time, never cached: theme.use() rebinds these names, so a
+        colour captured at build time would be the old palette's.
+        """
         return {
-            AFLOAT: theme.OK,
-            MARGIN: theme.WARN,
-            AGROUND: theme.FG,
-            DRIED_OUT: theme.FG_MUTED,
-        }.get(state.status, theme.FG)
+            "urgent": theme.BAD,
+            "warn": theme.WARN,
+            "normal": theme.FG,
+        }[render.access_urgency(state)]
 
     def render(self, state):
-        accent = self._accent_for(state)
         self.root.configure(bg=theme.BG)
         self._body.configure(bg=theme.BG)
         for label in self._labels:
@@ -223,10 +236,15 @@ class MoorwatchApp:
             "float": render.float_row(state, self.tz),
             "access": render.access_row(state, self.tz),
         }
-        # Only the clearance is coloured. It is the one figure that says what
-        # the boat is doing, and colouring the others would make the window a
-        # traffic light with nothing to point at.
-        colours = {"keel": accent}
+        # Two rows carry colour, and they answer different questions: the keel
+        # says whether the boat is floating, the depart/moor row says whether it
+        # should be moving. The height of tide and the lift/touch time are plain
+        # — colouring everything would make the window a traffic light with
+        # nothing to point at.
+        colours = {
+            "keel": self._keel_colour(state),
+            "access": self._access_colour(state),
+        }
 
         for key in self.ROWS:
             row = rows[key]
