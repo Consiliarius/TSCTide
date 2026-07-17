@@ -800,32 +800,81 @@ async def add_mooring_observation(mooring_id: int, request: Request):
     }
 
 
-@app.post("/api/moorings/{mooring_id}/observations/upload",
-          dependencies=[Depends(require_mooring_pin)])
-async def upload_observations_xlsx(mooring_id: int, request: Request):
-    """
-    Import observations from an XLSX file. Observations are tied to this
-    mooring only. Expected columns: Date, Time, State, Wind Direction,
-    Direction of Lay, Notes.
-
-    Does NOT auto-apply calibration - the returned calibration payload
-    is a suggestion.
-    """
+def _observation_rows_from_xlsx(body: bytes) -> list[tuple]:
+    """Data rows (header skipped) from an uploaded XLSX workbook."""
     import io
     from openpyxl import load_workbook
-
-    # Existence check is handled by the require_mooring_pin dependency.
-    body = await request.body()
-    if not body:
-        raise HTTPException(400, "No file uploaded")
 
     try:
         wb = load_workbook(io.BytesIO(body), read_only=True, data_only=True)
         ws = wb.active
     except Exception as e:
         raise HTTPException(400, f"Could not read XLSX file: {e}")
+    return list(ws.iter_rows(min_row=2, values_only=True))
 
-    rows = list(ws.iter_rows(min_row=2, values_only=True))  # skip header
+
+def _observation_rows_from_csv(body: bytes) -> list[tuple]:
+    """Data rows (header skipped) from an uploaded CSV file.
+
+    Exists so SYLog can post its sounding export directly. SYLog's runtime is
+    stdlib-only by invariant, so it cannot write .xlsx at all; without this the
+    only route would be a manual convert-in-a-spreadsheet step between
+    observing a depth and calibrating against it.
+
+    Values arrive as strings rather than the typed values openpyxl yields. The
+    row handler already copes: it parses string dates via dtparse and floats
+    the depth, so both sources share one code path.
+    """
+    import csv
+    import io
+
+    try:
+        text = body.decode("utf-8-sig")   # tolerate a BOM from a spreadsheet
+    except UnicodeDecodeError as e:
+        raise HTTPException(400, f"Could not read CSV file: {e}")
+
+    rows = list(csv.reader(io.StringIO(text)))
+    if not rows:
+        return []
+    # Skip the header, and drop blank trailing lines so they are not counted as
+    # malformed rows in the error tally.
+    return [tuple(r) for r in rows[1:] if any(str(c).strip() for c in r)]
+
+
+def _looks_like_xlsx(body: bytes) -> bool:
+    """XLSX is a ZIP container, so it always opens with the local-file header.
+
+    Sniffing the bytes rather than trusting a filename or content-type: the
+    upload is a raw body, and a mislabelled file should still be read for what
+    it actually is.
+    """
+    return body[:4] == b"PK\x03\x04"
+
+
+@app.post("/api/moorings/{mooring_id}/observations/upload",
+          dependencies=[Depends(require_mooring_pin)])
+async def upload_observations_xlsx(mooring_id: int, request: Request):
+    """
+    Import observations from an XLSX or CSV file. Observations are tied to this
+    mooring only. Expected columns: Date, Time, State, Wind Direction,
+    Direction of Lay, Notes, and optionally Obs Type + Depth (v2.10 soundings).
+
+    The format is detected from the body's leading bytes, so either may be
+    posted to this one endpoint. CSV is what SYLog's sounding export emits.
+
+    Does NOT auto-apply calibration - the returned calibration payload
+    is a suggestion.
+    """
+    # Existence check is handled by the require_mooring_pin dependency.
+    body = await request.body()
+    if not body:
+        raise HTTPException(400, "No file uploaded")
+
+    if _looks_like_xlsx(body):
+        rows = _observation_rows_from_xlsx(body)
+    else:
+        rows = _observation_rows_from_csv(body)
+
     imported = 0
     errors = 0
 
@@ -907,9 +956,11 @@ async def upload_observations_xlsx(mooring_id: int, request: Request):
         imported += 1
 
     if imported > 0:
+        source_format = "XLSX" if _looks_like_xlsx(body) else "CSV"
         log_activity(
             event_type="observations_uploaded",
-            message=f"Imported {imported} observations from XLSX ({errors} rows skipped)",
+            message=f"Imported {imported} observations from {source_format} "
+                    f"({errors} rows skipped)",
             severity="info",
             scope="mooring",
             mooring_id=mooring_id,
