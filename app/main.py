@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, Request, HTTPException, Depends
-from fastapi.responses import HTMLResponse, Response, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from dateutil import parser as dtparse
 
@@ -417,6 +417,25 @@ async def index():
     """Serve the single-page web UI."""
     html_path = STATIC_DIR / "index.html"
     return HTMLResponse(html_path.read_text())
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    """Serve the icon at the path clients ask for without being told.
+
+    index.html declares <link rel="icon" href="/static/favicon.svg">, which
+    covers browsers rendering the page. But /favicon.ico is requested by
+    convention, unprompted, by anything that never parses the HTML — link
+    unfurlers, feed readers, bookmark handlers, a desktop shortcut fetching an
+    icon — and it was returning 404 to all of them.
+
+    The bytes are the SVG, served as image/svg+xml: the extension is a
+    convention about WHERE the icon lives, not a promise about its format, and
+    every client that renders an icon at all renders SVG. Redirecting to the
+    canonical URL instead would be tidier in principle but adds a round trip for
+    a 834-byte file, and a cached permanent redirect is unpleasant to undo.
+    """
+    return FileResponse(STATIC_DIR / "favicon.svg", media_type="image/svg+xml")
 
 
 # --- Mooring Configuration ---
