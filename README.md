@@ -130,8 +130,8 @@ Calendar events use unicode fraction durations and vary by configuration:
 |---------------|---------------|
 | No mooring (stateless) | ⚓ Tidal Access (3½h) |
 | Mooring number only | ⚓ Access to #27 (3½h) |
-| Boat name provided | ⚓ Kerry Dancer Afloat (3½h) |
-| Harmonic source | ⚓ est. Kerry Dancer Afloat (3½h) |
+| Boat name provided | ⚓ Moonshadow Afloat (3½h) |
+| Harmonic source | ⚓ est. Moonshadow Afloat (3½h) |
 
 Durations are rounded down to the nearest quarter-hour.
 

@@ -8,7 +8,7 @@ including source upgrades and wind-adjusted recalculations.
 Event title formats:
   - No mooring: "Tidal Access (3.5h)"
   - Mooring number only: "Access to #27 (3.5h)"
-  - Name present: "Kerry Dancer Afloat (3.5h)"
+  - Name present: "Moonshadow Afloat (3.5h)"
   - Harmonic source prefixed with "est. "
   - Always-accessible cycles: "Always afloat" (no duration)
 """
