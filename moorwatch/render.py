@@ -116,14 +116,25 @@ def float_row(state: MooringState, tz) -> Optional[tuple[str, str]]:
 
 
 def access_row(state: MooringState, tz) -> tuple[str, str]:
-    """When access next changes — the line the calendar feed publishes."""
+    """When the boat may leave, or must be back — the line the feed publishes.
+
+    Says "Depart" and "Moor", never "Access". This threshold is about the boat
+    having water to move off the mooring and back onto it. "Access" reads just
+    as naturally as getting *to* the boat, which is the tender's problem and a
+    different depth entirely — TSCTide models that separately as
+    tender_min_depth_m, and this tool does not compute it at all. A word that
+    could mean either is the wrong word for the one line a skipper acts on.
+
+    They are also actions rather than states, which is what the reader wants:
+    not "the window opens at 11:55" but "you may go after 11:55".
+    """
     t = state.transition
     if t is None:
-        return ("Access:", "none found")
+        return ("Depart after:", "no window in the next 7 days")
     if t.kind == "none":
-        return ("Access:", "all cycle - tide never drops below the line")
+        return ("Depart or moor:", "any time - tide never drops below the line")
     at = transition_at(state)
-    label = "Access starts at:" if t.kind == "opens" else "Access ends at:"
+    label = "Depart after:" if t.kind == "opens" else "Moor by:"
     return (label, f"{format_time(at, tz)} - in {_countdown(at, state.now)}")
 
 

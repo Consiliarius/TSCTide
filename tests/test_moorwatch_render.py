@@ -50,8 +50,8 @@ def test_inside_the_window_says_current_window():
 
 
 def test_the_two_lines_never_contradict_each_other():
-    """The window line and the access row read the same transition, so "Current
-    window" can only appear beside "Access ends at", never "Access starts at"."""
+    """The window line and the depart/moor row read the same transition, so
+    "Current window" can only appear beside "Moor by", never "Depart after"."""
     c = cfg()
     tz = render.tzinfo_for(c.timezone)
     for hour in range(0, 24, 2):
@@ -61,9 +61,33 @@ def test_the_two_lines_never_contradict_each_other():
             continue
         label, _ = render.access_row(state, tz)
         if line.startswith("Current window"):
-            assert label == "Access ends at:", (hour, line, label)
+            assert label == "Moor by:", (hour, line, label)
         else:
-            assert label == "Access starts at:", (hour, line, label)
+            assert label == "Depart after:", (hour, line, label)
+
+
+def test_the_action_row_never_says_access():
+    """"Access" reads as getting TO the boat — the tender's problem, a different
+    depth, and one this tool does not compute. It must not appear on the line
+    the skipper acts on, in any state."""
+    c = cfg()
+    tz = render.tzinfo_for(c.timezone)
+    for hour in range(0, 24, 2):
+        label, value = render.access_row(compute_state(c, at(hour)), tz)
+        assert "access" not in label.lower(), (hour, label)
+        assert "access" not in value.lower(), (hour, value)
+
+
+def test_waiting_says_depart_after_and_afloat_says_moor_by():
+    c = cfg()
+    tz = render.tzinfo_for(c.timezone)
+    waiting = compute_state(c, at(6))
+    assert waiting.transition.kind == "opens"
+    assert render.access_row(waiting, tz)[0] == "Depart after:"
+
+    inside = compute_state(c, at(12, 30))
+    assert inside.transition.kind == "closes"
+    assert render.access_row(inside, tz)[0] == "Moor by:"
 
 
 def test_window_line_still_carries_both_edges_and_a_duration():
