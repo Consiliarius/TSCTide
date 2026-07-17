@@ -10,12 +10,22 @@ F2 to switch to the night scheme, F11 for fullscreen, an 800x480 design floor.
 
 Refresh
 -------
-compute_state is called on the tick, synchronously. Measured at 59 ms on a
-modern machine, so an estimated 235-350 ms on the C-50 -- about 1% of one core
-at a 30-second tick. That does not warrant the event cache the plan sketched,
-and a cache would have to be invalidated correctly for no measurable gain. If
-the netbook ever feels the hitch, the fix is SYLog's gps.py pattern: compute on
-a daemon thread and hand the result to the main thread through a queue.
+compute_state is called on the tick, synchronously. **Measured at 109 ms on the
+netbook itself** (Acer Aspire One 522, AMD C-50) -- about 0.36% of one core at a
+30-second tick, and a pause roughly the length of a blink on a display nobody
+interacts with. No event cache: it would be invalidation logic to get wrong in
+exchange for saving 109 ms every 30 seconds.
+
+If a future change makes that materially worse, the fix is SYLog's gps.py
+pattern -- compute on a daemon thread and hand the result to the main thread
+through a queue -- not a cache.
+
+To re-measure on the target:
+
+    python3 -c "
+    import time; from moorwatch import config, state
+    c = config.load(); state.compute_state(c)
+    t=time.perf_counter(); state.compute_state(c); print('%.0f ms' % ((time.perf_counter()-t)*1000))"
 
 Colour
 ------
