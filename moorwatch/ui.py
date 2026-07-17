@@ -46,9 +46,15 @@ To re-measure on the target:
 
 Colour
 ------
-Coloured by ACCESS, not by whether the boat is aground. A drying mooring is
-aground for half of every cycle by design; painting that red would cry wolf
-twice a day and teach the skipper to ignore the colour.
+Two rows carry it, and they answer different questions. The keel goes green
+whenever there is water under the boat — the physical fact, margin or no. The
+depart/moor row carries urgency instead: plain to depart, amber to moor, red
+inside the last half hour.
+
+Nothing goes red for being aground. A drying mooring is aground for half of
+every cycle by design; painting that red would cry wolf twice a day and teach
+the skipper to ignore the colour. Red is reserved for a deadline that is
+arriving.
 """
 
 from __future__ import annotations

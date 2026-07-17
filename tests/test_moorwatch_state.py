@@ -13,21 +13,18 @@ harmonic model is exercised end-to-end separately by the CLI.
 """
 
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from moorwatch.config import VesselConfig
 from moorwatch.state import (
-    AFLOAT,
-    AGROUND,
-    DRIED_OUT,
-    MARGIN,
     _crossings,
     _governing,
     _near_lw_warning,
-    _status,
     compute_state,
 )
 
@@ -49,23 +46,28 @@ def dt(hour, minute=0, day=16):
     return datetime(2026, 7, day, hour, minute, tzinfo=timezone.utc)
 
 
-# --- the status ladder ------------------------------------------------
+# --- the two thresholds -----------------------------------------------
 
-def test_status_ladder_distinguishes_all_four_rungs():
-    # threshold = drying(2.0) + draught(1.0) + margin(0.3) = 3.3
-    assert _status(depth_m=-0.5, clearance_m=-1.5, height_m=1.5, threshold_m=3.3) == DRIED_OUT
-    assert _status(depth_m=0.5, clearance_m=-0.5, height_m=2.5, threshold_m=3.3) == AGROUND
-    assert _status(depth_m=1.2, clearance_m=0.2, height_m=3.2, threshold_m=3.3) == MARGIN
-    assert _status(depth_m=1.5, clearance_m=0.5, height_m=3.5, threshold_m=3.3) == AFLOAT
+def test_clearance_is_measured_from_the_float_line():
+    """Clearance is the tide's distance above drying + draught, so it is
+    negative by exactly the amount the boat is aground."""
+    c = cfg()                                   # drying 2.0 + draught 1.0 = 3.0
+    state = compute_state(c, dt(17, 11))
+    expected = state.height_cd_m - (c.drying_height_m + c.draught_m)
+    assert state.clearance_m == pytest.approx(expected)
 
 
-def test_margin_rung_is_afloat_but_not_accessible():
-    """The band the whole two-line design exists for: keel off the bottom,
-    still short of the access threshold."""
-    state = _status(depth_m=1.2, clearance_m=0.2, height_m=3.2, threshold_m=3.3)
-    assert state == MARGIN
-    assert state not in (AGROUND, DRIED_OUT), "keel is off the bottom"
-    assert state != AFLOAT, "still inside the safety margin"
+def test_the_margin_band_is_afloat_but_not_yet_clear_to_depart():
+    """The band the whole two-row design exists for: keel off the bottom, still
+    short of the access line. Nothing else in the tool distinguishes them."""
+    c = cfg(safety_margin_m=1.5)                # a wide band, easy to land in
+    for minute in range(0, 6 * 60, 10):
+        state = compute_state(c, dt(9) + timedelta(minutes=minute))
+        if state.clearance_m >= 0 and state.height_cd_m <= state.threshold_m:
+            assert state.transition.kind == "opens", "not yet clear to depart"
+            assert state.float_transition.kind == "closes", "but already afloat"
+            return
+    pytest.fail("no instant in the margin band; fixture needs revisiting")
 
 
 # --- crossings --------------------------------------------------------
@@ -205,20 +207,16 @@ def test_countdown_does_not_run_backwards_as_now_advances():
     )
 
 
-def test_dried_out_mooring_reports_negative_depth_and_a_float_time():
+def test_aground_mooring_reports_negative_clearance_and_a_float_time():
     state = compute_state(cfg(drying_height_m=2.0), dt(17, 11))
-    assert state.status == DRIED_OUT
-    assert state.depth_m < 0
-    assert state.dried_out
-    assert not state.afloat
+    assert state.clearance_m < 0, "keel is on the bottom"
     assert state.float_transition is not None
-    assert state.float_transition.kind == "opens"
+    assert state.float_transition.kind == "opens", "it will lift"
 
 
-def test_float_threshold_leads_the_access_threshold():
+def test_the_float_line_is_crossed_before_the_access_line():
     """The boat lifts before it has access -- never the other way round."""
     state = compute_state(cfg(drying_height_m=2.0), dt(17, 11))
-    assert state.float_threshold_m < state.threshold_m
     assert state.float_transition.at < state.transition.at
 
 

@@ -9,16 +9,32 @@ harmonic model, secondary-port offset and window engine unchanged — it is a
 read-only consumer, not a fork of the model.
 
 ```
-  IN MARGIN
-  afloat, but inside the safety margin
+  Moorwatch - Kerry Dancer - 3.5m Tide Required          <- the window title
 
-  1.03 m
-  under the keel 0.03 m  |  height 1.03 m above CD  |  access line 1.30 m
+  Fri 17 Jul 2026, 09:46 BST
 
-  Touches down at 06:54 BST - in 12h 08m
-  Access from 19:40 BST - in 54m
-  Window 19:40 BST - 06:20 BST  (10h 40m)
+  Current Height of Tide:   1.84 m above CD
+  Est. under Keel:         -1.16 m at mooring
+  Afloat at:               11:20 BST - in 1h 33m
+  Depart after:            11:55 BST - in 2h 08m
+
+  Next window 11:55 BST - 17:05 BST  (5h 10m)
 ```
+
+Four readings, and the pairs are the point:
+
+- **Height of tide** is the sea; **under the keel** is the gap under this hull.
+  The drying height between them is why one can be positive while the other is
+  negative.
+- **Afloat at** is when the keel lifts; **Depart after** is when there is the
+  safety margin on top — 15–20 minutes later on a flooding spring. Once out,
+  they read *Aground at* and **Moor by**, which is the pair that matters: be
+  back before the margin is gone, not before the boat touches.
+
+The access line (drying + draught + margin) lives in the title bar because it
+never changes. Colour is on two rows only: the keel goes green when there is
+water under the boat, and **Moor by** goes amber, then red inside the last half
+hour.
 
 ## Accuracy — read this before trusting a start time
 
@@ -161,8 +177,12 @@ mechanism — there is no vendored copy to drift.
   because this tool recomputes continuously against a moving `now` and its
   countdown has to tick down rather than jump. A finer step buys the identical
   answer for several times the work.
-- **Coloured by access, not by aground.** A drying mooring is aground half of
-  every cycle by design.
+- **Nothing goes red for being aground.** A drying mooring is aground half of
+  every cycle by design; red is reserved for a deadline that is arriving, so it
+  means "be back" and nothing else.
+- **The window says "Depart after" and "Moor by", never "Access".** "Access"
+  reads just as naturally as getting *to* the boat, which is the tender's
+  problem, a different depth, and one this tool does not compute.
 
 ## Not included
 

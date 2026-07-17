@@ -87,12 +87,6 @@ EVENTS_MAX_FWD_HOURS = 7 * 24
 # The readout cannot fix this without UKHO data, so it says so instead.
 NEAR_LW_WARNING_M = 1.0
 
-# Status ladder, shallowest first.
-DRIED_OUT = "dried_out"   # no water over the seabed at all
-AGROUND = "aground"       # water, but not enough to lift the keel
-MARGIN = "margin"         # keel lifted, but inside the safety margin
-AFLOAT = "afloat"         # above TSCTide's access threshold
-
 
 @dataclass(frozen=True)
 class Transition:
@@ -138,34 +132,15 @@ class MooringState:
 
     now: datetime
     height_cd_m: float          # tide height above Chart Datum
-    depth_m: float              # water over the seabed: height - drying_height
-    clearance_m: float          # under the keel: depth - draught
+    clearance_m: float          # under the keel: height - (drying + draught)
     threshold_m: float          # drying + draught + margin (the access line)
-    float_threshold_m: float    # drying + draught       (the float line)
-    status: str                 # one of the ladder constants above
     transition: Optional[Transition]          # against the access line
     float_transition: Optional[Transition]    # against the float line
-    window: Optional[dict]      # governing access window, raw / full precision
     display_window: Optional[tuple[datetime, datetime]]   # rounded for display
     float_display_window: Optional[tuple[datetime, datetime]]
     negligible_access: bool     # window collapsed under the rounding grid
     note: str                   # why, when the state is unusual
     warnings: tuple[str, ...] = ()   # model limitations that bite this mooring
-
-    @property
-    def accessible(self) -> bool:
-        """True when TSCTide would call the mooring accessible -- i.e. this
-        instant lies inside an access window as the ICS feed means it."""
-        return self.height_cd_m > self.threshold_m
-
-    @property
-    def afloat(self) -> bool:
-        """True when the keel is physically off the bottom, margin or not."""
-        return self.clearance_m >= 0
-
-    @property
-    def dried_out(self) -> bool:
-        return self.depth_m <= 0
 
 
 def _tide_events(start: datetime, end: datetime) -> list[dict]:
@@ -317,23 +292,6 @@ def _near_lw_warning(events: list[dict], transition: Optional[Transition],
     )
 
 
-def _status(depth_m: float, clearance_m: float, height_m: float,
-            threshold_m: float) -> str:
-    """Place the current water on the ladder.
-
-    The three lines are distinct and the display shows all of them: the boat can
-    be physically afloat while still inside the safety margin, which is neither
-    "aground" nor what the ICS feed calls accessible.
-    """
-    if depth_m <= 0:
-        return DRIED_OUT
-    if clearance_m < 0:
-        return AGROUND
-    if height_m <= threshold_m:
-        return MARGIN
-    return AFLOAT
-
-
 def compute_state(cfg: VesselConfig, now: Optional[datetime] = None) -> MooringState:
     """Answer the float question for ``now`` (default: this instant, UTC)."""
     now = now or datetime.now(timezone.utc)
@@ -367,9 +325,9 @@ def compute_state(cfg: VesselConfig, now: Optional[datetime] = None) -> MooringS
         _windows_for(events, cfg, 0.0), now, above=height > float_threshold
     )
 
-    depth = height - cfg.drying_height_m
-    clearance = depth - cfg.draught_m
-    status = _status(depth, clearance, height, cfg.threshold_m)
+    # The float line IS drying + draught, so the gap under the keel is just the
+    # tide's distance above it — no need to subtract the two separately.
+    clearance = height - float_threshold
 
     window = transition.window if transition else None
     display_window = _rounded(window)
@@ -404,14 +362,10 @@ def compute_state(cfg: VesselConfig, now: Optional[datetime] = None) -> MooringS
     return MooringState(
         now=now,
         height_cd_m=height,
-        depth_m=depth,
         clearance_m=clearance,
         threshold_m=cfg.threshold_m,
-        float_threshold_m=float_threshold,
-        status=status,
         transition=transition,
         float_transition=float_transition,
-        window=window,
         display_window=display_window,
         float_display_window=float_display_window,
         negligible_access=negligible,

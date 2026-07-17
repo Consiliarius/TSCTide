@@ -115,14 +115,21 @@ def test_water_under_the_keel_is_the_green_condition():
 
 def test_a_boat_in_the_margin_still_reads_as_having_water():
     """The margin band is the case the rule exists to settle: floating, but not
-    yet clear to depart. Two different rows, two different answers."""
+    yet clear to depart. Two rows, two different answers, and the green must
+    follow the keel rather than the access line."""
     c = cfg(safety_margin_m=1.5)          # a wide band, easy to land in
     tz = render.tzinfo_for(c.timezone)
-    state = compute_state(c, at(4, 0))
-    if state.status != "margin":
-        return                             # fixture drifted; the next test covers the rule
-    assert render.keel_has_water(state), "in the margin the boat is afloat"
-    assert render.access_row(state, tz)[0] != "Moor by:"
+    for minutes in range(0, 8 * 60, 10):
+        state = compute_state(c, at(9) + timedelta(minutes=minutes))
+        in_margin = (state.clearance_m >= 0
+                     and state.height_cd_m <= state.threshold_m)
+        if not in_margin:
+            continue
+        assert render.keel_has_water(state), "in the margin the boat is afloat"
+        assert render.access_row(state, tz)[0] == "Depart after:", \
+            "afloat, but not yet clear to go"
+        return
+    raise AssertionError("no instant in the margin band; fixture needs revisiting")
 
 
 def test_depart_after_carries_no_urgency():
