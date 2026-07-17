@@ -55,25 +55,9 @@ from __future__ import annotations
 
 import tkinter as tk
 import tkinter.font as tkfont
-from datetime import datetime, timezone
 
-from moorwatch import render
+from moorwatch import render, theme
 from moorwatch.state import AFLOAT, AGROUND, DRIED_OUT, MARGIN, compute_state
-
-# Palettes lifted from SYLog's logbook/ui/theme.py so the two tools look like
-# they belong on the same screen. Kept as a copy rather than an import: the
-# repos are separate, and this is a handful of hex values, not a dependency.
-LIGHT = {
-    "BG": "#f2f4f7", "BG_PANEL": "#e2e8ee",
-    "FG": "#11202e", "FG_MUTED": "#54626f", "ACCENT": "#0b5fbe",
-    "OK": "#0f7b3a", "WARN": "#8a5300", "BAD": "#b3261e",
-}
-DARK = {
-    "BG": "#0b0f14", "BG_PANEL": "#151d26",
-    "FG": "#e8edf2", "FG_MUTED": "#8695a3", "ACCENT": "#3fa7ff",
-    "OK": "#37c871", "WARN": "#f2b134", "BAD": "#e5484d",
-}
-PALETTES = {"light": LIGHT, "dark": DARK}
 
 TICK_MS = 30_000
 
@@ -96,7 +80,7 @@ class MoorwatchApp:
     def __init__(self, root: tk.Tk, cfg, mode: str = "light"):
         self.root = root
         self.cfg = cfg
-        self.mode = mode if mode in PALETTES else "light"
+        self.mode = theme.use(mode)
         self.tz = render.tzinfo_for(cfg.timezone)
         self._after_id = None
 
@@ -116,30 +100,35 @@ class MoorwatchApp:
     # -- chrome ---------------------------------------------------------
 
     def _build_fonts(self):
-        # 19pt is the ceiling: every reading is one of four rows of equal
-        # standing, so none of them shouts. The 64pt depth figure this replaced
-        # was not carrying 64pt worth of information — it repeated in three
-        # sizes what one line says once.
-        self.f_value = tkfont.Font(family="DejaVu Sans", size=19, weight="bold")
-        self.f_label = tkfont.Font(family="DejaVu Sans", size=15)
-        self.f_line = tkfont.Font(family="DejaVu Sans", size=15)
-        self.f_small = tkfont.Font(family="DejaVu Sans", size=11)
+        # SYLog's family, resolved SYLog's way, on SYLog's scale — the whole
+        # point being that the two windows read as one set of tools. The family
+        # was hard-coded to "DejaVu Sans" before, which on a box carrying Noto
+        # Sans put the two tools in different faces on the same screen.
+        #
+        # SIZE_BASE carries every reading; bold separates value from label.
+        # SIZE_LARGE (22) stays unused: four readings of equal standing need no
+        # heading, and the netbook feedback capped the type here.
+        family = theme.apply_fonts(self.root)
+        self.f_value = tkfont.Font(family=family, size=theme.SIZE_BASE, weight="bold")
+        self.f_label = tkfont.Font(family=family, size=theme.SIZE_BASE)
+        self.f_line = tkfont.Font(family=family, size=theme.SIZE_SMALL)
+        self.f_small = tkfont.Font(family=family, size=theme.SIZE_SMALL)
 
     ROWS = ("height", "keel", "float", "access")
 
     def _build_widgets(self):
-        p = PALETTES[self.mode]
-        self.root.configure(bg=p["BG"])
+        pad = theme.PAD
+        self.root.configure(bg=theme.BG)
 
         self.clock = tk.Label(self.root, font=self.f_small, anchor="w")
-        self.clock.pack(fill="x", padx=16, pady=(10, 6))
+        self.clock.pack(fill="x", padx=pad * 2, pady=(pad + 2, pad))
 
         # Four readings, one grid, values in a column so the eye drops straight
         # down them. The boat name and the access line are in the title bar:
         # neither changes between ticks, and a number that is the same at every
         # glance is chrome, not a reading.
-        body = tk.Frame(self.root, bg=p["BG"])
-        body.pack(fill="x", padx=16)
+        body = tk.Frame(self.root, bg=theme.BG)
+        body.pack(fill="x", padx=pad * 2)
         body.columnconfigure(1, weight=1)
         self._body = body
 
@@ -149,20 +138,20 @@ class MoorwatchApp:
             label = tk.Label(body, font=self.f_label, anchor="w")
             label.grid(row=index, column=0, sticky="w", pady=3)
             value = tk.Label(body, font=self.f_value, anchor="w")
-            value.grid(row=index, column=1, sticky="w", padx=(14, 0), pady=3)
+            value.grid(row=index, column=1, sticky="w", padx=(pad * 2, 0), pady=3)
             self._row_label[key] = label
             self._row_value[key] = value
 
         self.window_line = tk.Label(self.root, font=self.f_line, anchor="w")
-        self.window_line.pack(fill="x", padx=16, pady=(8, 0))
+        self.window_line.pack(fill="x", padx=pad * 2, pady=(pad, 0))
 
         self.warning = tk.Label(self.root, font=self.f_small, anchor="w",
                                 justify="left", wraplength=WRAP_WIDTH)
-        self.warning.pack(fill="x", padx=16, pady=(8, 0))
+        self.warning.pack(fill="x", padx=pad * 2, pady=(pad, 0))
 
         self.footer = tk.Label(self.root, font=self.f_small, anchor="w",
                                justify="left")
-        self.footer.pack(side="bottom", fill="x", padx=16, pady=8)
+        self.footer.pack(side="bottom", fill="x", padx=pad * 2, pady=pad)
 
         self._labels = [self.clock, self.window_line, self.warning, self.footer]
         self._labels += list(self._row_label.values())
@@ -176,7 +165,7 @@ class MoorwatchApp:
             self.warning.configure(wraplength=max(WRAP_WIDTH, event.width - 40))
 
     def toggle_theme(self, _event=None):
-        self.mode = "dark" if self.mode == "light" else "light"
+        self.mode = theme.use(theme.other(self.mode))
         self.render(self._state)
 
     def toggle_fullscreen(self, _event=None):
@@ -195,38 +184,35 @@ class MoorwatchApp:
         self._after_id = self.root.after(TICK_MS, self.tick)
 
     def _show_error(self, exc: Exception):
-        p = PALETTES[self.mode]
-        self.root.configure(bg=p["BG"])
-        self._body.configure(bg=p["BG"])
+        self.root.configure(bg=theme.BG)
+        self._body.configure(bg=theme.BG)
         for label in self._labels:
-            label.configure(bg=p["BG"], text="")
+            label.configure(bg=theme.BG, text="")
         # Blank every reading rather than leaving the last good one on screen:
         # a stale depth that looks live is worse than an empty window.
-        self._row_label["height"].configure(fg=p["BAD"], text="No reading")
+        self._row_label["height"].configure(fg=theme.BAD, text="No reading")
         self.warning.configure(
-            fg=p["FG"],
+            fg=theme.FG,
             text=f"{type(exc).__name__}: {exc}\n\nRetrying every {TICK_MS // 1000}s.",
         )
 
     def _accent_for(self, state) -> str:
-        p = PALETTES[self.mode]
         return {
-            AFLOAT: p["OK"],
-            MARGIN: p["WARN"],
-            AGROUND: p["FG"],
-            DRIED_OUT: p["FG_MUTED"],
-        }.get(state.status, p["FG"])
+            AFLOAT: theme.OK,
+            MARGIN: theme.WARN,
+            AGROUND: theme.FG,
+            DRIED_OUT: theme.FG_MUTED,
+        }.get(state.status, theme.FG)
 
     def render(self, state):
-        p = PALETTES[self.mode]
         accent = self._accent_for(state)
-        self.root.configure(bg=p["BG"])
-        self._body.configure(bg=p["BG"])
+        self.root.configure(bg=theme.BG)
+        self._body.configure(bg=theme.BG)
         for label in self._labels:
-            label.configure(bg=p["BG"])
+            label.configure(bg=theme.BG)
 
         self.clock.configure(
-            fg=p["FG_MUTED"], text=render.format_datetime(state.now, self.tz))
+            fg=theme.FG_MUTED, text=render.format_datetime(state.now, self.tz))
 
         rows = {
             "height": render.height_row(state),
@@ -249,24 +235,24 @@ class MoorwatchApp:
                 self._row_value[key].configure(text="")
                 continue
             label, value = row
-            self._row_label[key].configure(fg=p["FG_MUTED"], text=label)
-            self._row_value[key].configure(fg=colours.get(key, p["FG"]), text=value)
+            self._row_label[key].configure(fg=theme.FG_MUTED, text=label)
+            self._row_value[key].configure(fg=colours.get(key, theme.FG), text=value)
 
         self.window_line.configure(
-            fg=p["FG_MUTED"], text=render.window_line(state, self.tz)
+            fg=theme.FG_MUTED, text=render.window_line(state, self.tz)
         )
 
         notes = list(state.warnings)
         if state.note:
             notes.insert(0, state.note)
         self.warning.configure(
-            fg=p["WARN"] if state.warnings else p["FG_MUTED"],
+            fg=theme.WARN if state.warnings else theme.FG_MUTED,
             text="\n".join(notes),
         )
 
         stale = self.cfg.is_stale(state.now)
         self.footer.configure(
-            fg=p["BAD"] if stale else p["FG_MUTED"],
+            fg=theme.BAD if stale else theme.FG_MUTED,
             text="Harmonic model, no barometric correction.   "
                  + render.config_age_line(self.cfg, state.now)
                  + "    F2 night  |  F11 fullscreen  |  Esc quit",
