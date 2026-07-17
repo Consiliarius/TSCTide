@@ -21,6 +21,15 @@ from moorwatch.config import VesselConfig, save
 
 TIMEOUT_SECONDS = 20
 
+# Identify the tool. Not decoration: production sits behind a Cloudflare tunnel,
+# and Cloudflare's browser-integrity check bans urllib's default
+# "Python-urllib/3.x" on its signature — a 403 with error code 1010, from the
+# edge, before the request ever reaches an endpoint that has no PIN gate at all.
+# A client that says who it is passes. Deliberately NOT a spoofed browser
+# string: this is a tool, it should say so, and a fake one would be both
+# dishonest and the first thing to break.
+USER_AGENT = "moorwatch/1.0 (+https://github.com/Consiliarius/TSCTide)"
+
 
 class SyncError(Exception):
     """Raised when the config could not be fetched or understood."""
@@ -30,12 +39,20 @@ def fetch_config(base_url: str, mooring_id: int,
                  timeout: float = TIMEOUT_SECONDS) -> dict:
     """Fetch one mooring's public config. Raises SyncError on any failure."""
     url = f"{base_url.rstrip('/')}/api/moorings/{mooring_id}"
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         if e.code == 404:
             raise SyncError(f"Mooring {mooring_id} not found at {base_url}.") from e
+        if e.code == 403:
+            # This endpoint has no PIN gate, so a 403 did not come from the app.
+            raise SyncError(
+                f"{url} returned HTTP 403 — refused before reaching TSCTide, "
+                f"most likely by Cloudflare in front of it. The site itself is "
+                f"probably fine: try `curl {url}` to check."
+            ) from e
         raise SyncError(f"{url} returned HTTP {e.code}.") from e
     except (urllib.error.URLError, TimeoutError) as e:
         raise SyncError(f"Could not reach {base_url}: {e.reason if hasattr(e, 'reason') else e}") from e

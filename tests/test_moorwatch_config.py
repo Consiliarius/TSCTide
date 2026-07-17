@@ -9,6 +9,7 @@ berth, and the guard must not be quietly defeated by editing the example.
 
 import json
 import sys
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -17,7 +18,37 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from moorwatch import config as cfg_mod
+from moorwatch import sync as sync_mod
 from moorwatch.config import EXAMPLE_PATH, ConfigError, VesselConfig, load, read_raw
+
+
+def test_sync_identifies_itself_to_cloudflare(monkeypatch):
+    """Production sits behind a Cloudflare tunnel, whose browser-integrity check
+    bans urllib's default "Python-urllib/3.x" on its signature: a 403 (error
+    1010) from the edge, on an endpoint that has no PIN gate at all. A request
+    that says what it is passes; one that does not, does not."""
+    seen = {}
+
+    class FakeResponse:
+        def read(self):
+            return b'{"draught_m": 1.0, "drying_height_m": 2.0, "safety_margin_m": 0.3}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_urlopen(request, timeout=None):
+        seen["ua"] = request.get_header("User-agent")
+        return FakeResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    sync_mod.fetch_config("https://tsctide.uk", 64)
+
+    assert seen["ua"], "the request must carry a User-Agent"
+    assert "moorwatch" in seen["ua"]
+    assert "Python-urllib" not in seen["ua"]
 
 
 def test_shipped_example_cannot_be_used_to_compute(tmp_path):
