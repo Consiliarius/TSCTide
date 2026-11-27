@@ -226,7 +226,7 @@ The hashing scheme is deterministic (SHA-256 of `salt + pin` with the site-wide 
 
 A Windows PowerShell helper script is bundled at the repo root for operator convenience.
 
-**`delete-mooring.ps1`** — Permanently removes a mooring from the database, bypassing the PIN-gated UI flow. Useful when a user has lost their PIN, when test moorings need cleaning up, or when the UI is unreachable. Cascades into observations, calendar events, recorded wind checks (v2.11.1) and PIN lockout state in one transaction (sqlite3 runs with `-bail`, so a failing statement rolls the whole deletion back), removes the on-disk feed file, and inserts a `mooring_deleted` audit row into the activity log so the deletion is traceable.
+**`delete-mooring.ps1`** — Permanently removes a mooring from the database, bypassing the PIN-gated UI flow. Useful when a user has lost their PIN, when test moorings need cleaning up, or when the UI is unreachable. Cascades into observations, calendar events, recorded wind checks (v2.11.1) and PIN lockout state in one transaction (sqlite3 runs with `-bail`, so a failing statement rolls the whole deletion back; the app must have started once on v2.11.1 so the `wind_checks` table exists, otherwise the script stops with nothing deleted), removes the on-disk feed file, and inserts a `mooring_deleted` audit row into the activity log so the deletion is traceable.
 
 Usage:
 
