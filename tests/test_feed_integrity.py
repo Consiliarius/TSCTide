@@ -183,6 +183,15 @@ def _adjusted(env, monkeypatch, mooring_id=1, **overrides):
     return hw, baseline, adjusted
 
 
+def _latest_log(env, event_type, trigger=None):
+    """Newest activity entry by id (timestamps tie within one second)."""
+    entries = [
+        e for e in env["db"].get_activity_log(scope="mooring", mooring_id=1, event_type=event_type)
+        if trigger is None or (e.get("details") or {}).get("trigger") == trigger
+    ]
+    return max(entries, key=lambda e: e["id"])
+
+
 # --- A1: wind adjustments survive recomputes ---------------------------------
 
 def test_daily_refresh_keeps_adjusted_start(env, monkeypatch):
@@ -457,3 +466,202 @@ def test_shallow_direction_must_be_a_compass_point(env, value, status):
         "safety_margin_m": 0.3, "shallow_direction": value,
     }
     assert TestClient(main.app).post("/api/moorings", json=cfg).status_code == status
+
+
+# --- Independent review follow-ups -------------------------------------------
+
+def test_wind_check_survives_its_window_being_removed(env, monkeypatch):
+    """Marker -> tide below threshold (row removed) -> tide clears again: the
+    recorded wind check is re-applied, so the marker comes back rather than a
+    plain baseline window."""
+    hw, _baseline, adjusted = _adjusted(env, monkeypatch, shallow_extra_depth_m=1.5)
+    assert adjusted["start_time"] == adjusted["end_time"] == hw
+    _save(env, shallow_extra_depth_m=1.5, draught_m=2.5)  # threshold 4.8 > HW 4.5
+    _daily()
+    assert _row(env, 1, hw) is None
+    assert [c["event_uid"] for c in env["db"].get_wind_checks(1)] == [adjusted["event_uid"]]
+    _save(env, shallow_extra_depth_m=1.5)  # back to draught 1.0
+    _daily()
+    after = _row(env, 1, hw)
+    assert after["start_time"] == after["end_time"] == hw
+    assert after["wind_adjusted"] == 1
+    assert _feed(1)[after["event_uid"]][0].endswith("No access (wind-blown to shallows)")
+
+
+def test_wind_job_removes_window_when_tide_no_longer_clears(env, monkeypatch):
+    _save(env)
+    _daily()
+    hw = _next_hw(env["events"])
+    assert _row(env, 1, hw) is not None
+    _save(env, draught_m=2.5)  # direct save, no recompute: threshold 4.8 > 4.5
+    _wind(monkeypatch, "E")
+    _wind_job(1, hw)
+    assert _row(env, 1, hw) is None
+    assert len(env["db"].get_wind_checks(1)) == 1
+
+
+def test_wind_job_uses_config_saved_during_the_wind_fetch(env, monkeypatch):
+    import app.wind as wind
+
+    _save(env)
+    _daily()
+    hw = _next_hw(env["events"])
+    baseline = _row(env, 1, hw)
+
+    async def wind_while_saving():
+        # A Save lands while the OWM request is in flight.
+        _save(env, wind_offset_enabled=0, shallow_direction="", shallow_extra_depth_m=0.0)
+        return {"timestamp": to_utc_str(datetime.now(timezone.utc)),
+                "direction_deg": 90.0, "direction_compass": "E", "speed_ms": 10.0}
+
+    monkeypatch.setattr(wind, "fetch_current_wind", wind_while_saving)
+    _wind_job(1, hw)
+    after = _row(env, 1, hw)
+    assert after["wind_adjusted"] == 0
+    assert after["start_time"] == baseline["start_time"]
+
+
+def test_daily_refresh_starting_at_a_wind_checked_hw_reports_no_failure(env, monkeypatch):
+    hw, _baseline, adjusted = _adjusted(env, monkeypatch)
+    # The next fetch starts at that HW: no LW before it, so its baseline has
+    # no start. The stored adjusted row must be left alone, not flagged.
+    env["events"] = [e for e in env["events"] if e["timestamp"] >= hw]
+    _daily()
+    after = _row(env, 1, hw)
+    assert after["start_time"] == adjusted["start_time"] and after["wind_adjusted"] == 1
+    entry = _latest_log(env, "feed_generation", "daily_scheduler")
+    assert entry["severity"] == "info"
+    assert entry["details"]["windows_wind_failed"] == 0
+    assert entry["details"]["windows_incomplete"] >= 1
+    for key in ("windows_wind_preserved", "windows_wind_reverted",
+                "windows_removed_below_threshold", "windows_wind_failed_deleted"):
+        assert key in entry["details"]
+
+
+def test_update_feed_reports_removals_and_rejects_windows_without_hw(env):
+    env["seed"](_tides(hw_heights=(4.5, 4.0)))
+    _save(env)
+    _daily()
+    client, headers = _client(env)
+    calc = client.post("/api/calculate", json={
+        "mooring_id": 1, "source": "ukho", "draught_m": 1.9,
+    }).json()
+    resp = client.post("/api/moorings/1/feed/update", headers=headers, json={
+        "source": "ukho", "windows": calc["windows"], "parameters": calc["parameters"],
+    })
+    assert resp.status_code == 200 and resp.json()["removed"] > 0
+    bad = [dict(calc["windows"][0])]
+    del bad[0]["hw_timestamp"]
+    resp = client.post("/api/moorings/1/feed/update", headers=headers, json={
+        "source": "ukho", "windows": bad, "parameters": calc["parameters"],
+    })
+    assert resp.status_code == 400
+
+
+def test_save_without_ukho_data_clears_and_says_so(env):
+    from fastapi.testclient import TestClient
+    import app.main as main
+    import app.scheduler as sched
+
+    cfg = _save(env)
+    _daily()
+    assert env["db"].get_calendar_events(1)
+    with env["db"].db_connection() as conn:
+        conn.execute("DELETE FROM tide_data")
+    calls = []
+    real = sched.ensure_wind_jobs_scheduled
+    main_ensure = main.ensure_wind_jobs_scheduled
+
+    def counting():
+        calls.append(1)
+        return real()
+
+    try:
+        main.ensure_wind_jobs_scheduled = counting
+        resp = TestClient(main.app).post("/api/moorings", json=dict(cfg, draught_m=1.2))
+    finally:
+        main.ensure_wind_jobs_scheduled = main_ensure
+    assert resp.status_code == 200
+    future = [r for r in env["db"].get_calendar_events(1)
+              if r["hw_timestamp"] > to_utc_str(NOW)]
+    assert future == []
+    assert calls, "wind jobs must still be rescheduled"
+    saved = _latest_log(env, "mooring_config")
+    assert saved["details"]["windows_recomputed"] is False
+    assert saved["details"]["windows_cleared_no_ukho_data"] is True
+    feed = _latest_log(env, "feed_generation", "config_save")
+    assert feed["severity"] == "warning" and feed["details"]["status"] == "no_data"
+
+
+def _with_sentinel(env):
+    """A long-range harmonic row (day 20), which only a recompute clears."""
+    from app.access_calc import generate_event_uid
+    hw = to_utc_str(NOW + timedelta(days=20))
+    env["db"].upsert_calendar_event({
+        "event_uid": generate_event_uid(1, hw), "mooring_id": 1, "hw_timestamp": hw,
+        "start_time": hw, "end_time": to_utc_str(NOW + timedelta(days=20, hours=3)),
+        "source": "harmonic", "title": "sentinel",
+    })
+    return hw
+
+
+@pytest.mark.parametrize("base,change,master,recomputes", [
+    ({}, {"draught_m": 1.1}, False, True),
+    ({}, {"drying_height_m": 2.1}, False, True),
+    ({}, {"safety_margin_m": 0.4}, False, True),
+    ({}, {"tender_access_enabled": 1}, False, True),
+    ({"tender_access_enabled": 1}, {"tender_min_depth_m": 0.5}, False, True),
+    ({"tender_access_enabled": 0}, {"tender_min_depth_m": 0.5}, False, False),
+    ({}, {"shallow_extra_depth_m": 0.7}, False, True),
+    ({}, {"shallow_direction": "NW"}, False, True),
+    ({}, {"wind_offset_enabled": 0}, False, True),
+    ({"wind_offset_enabled": 0}, {"shallow_direction": "NW"}, False, False),
+    ({}, {"barometric_enabled": 1}, False, False),
+    ({}, {"barometric_enabled": 1}, True, True),
+    ({}, {"boat_name": "Renamed"}, False, False),
+    ({}, {"calendar_enabled": 0}, False, False),
+])
+def test_save_recomputes_only_on_effective_setting_changes(env, monkeypatch, base, change,
+                                                          master, recomputes):
+    from fastapi.testclient import TestClient
+    import app.config as config
+    import app.main as main
+
+    monkeypatch.setattr(config, "get_barometric_enabled", lambda default=False: master)
+    cfg = _save(env, **base)
+    sentinel = _with_sentinel(env)
+    resp = TestClient(main.app).post("/api/moorings", json=dict(cfg, **change))
+    assert resp.status_code == 200
+    assert (_row(env, 1, sentinel) is None) == recomputes
+
+
+def test_harmonic_push_skips_tides_inside_the_ukho_range(env):
+    from app.access_calc import compute_access_windows
+
+    _save(env)
+    client, headers = _client(env)
+    ukho_hw = _next_hw(env["events"])
+    inside = [w for w in compute_access_windows(env["events"], 1.0, 2.0, 0.3, source="harmonic")
+              if w["hw_timestamp"] == ukho_hw][0]
+    far = to_utc_str(NOW + timedelta(days=12))
+    beyond = {"hw_timestamp": far, "hw_height_m": 4.5, "duration_minutes": 180,
+              "start_time": far, "end_time": to_utc_str(NOW + timedelta(days=12, hours=3))}
+    resp = client.post("/api/moorings/1/feed/update", headers=headers, json={
+        "source": "harmonic", "windows": [inside, beyond],
+        "parameters": {"draught_m": 1.0, "drying_height_m": 2.0, "safety_margin_m": 0.3},
+    })
+    assert resp.status_code == 200 and resp.json()["dropped_in_ukho_range"] == 1
+    assert _row(env, 1, ukho_hw) is None
+    assert _row(env, 1, far)["source"] == "harmonic"
+
+
+def test_wind_checks_are_pruned_and_removed_with_the_mooring(env):
+    _save(env)
+    old = to_utc_str(NOW - timedelta(days=20))
+    new = to_utc_str(NOW + timedelta(hours=5))
+    env["db"].record_wind_check(1, "u-old", old, "E", 9.0)
+    env["db"].record_wind_check(1, "u-new", new, "E", 9.0)
+    env["db"].cleanup_old_events(14)
+    assert [c["event_uid"] for c in env["db"].get_wind_checks(1)] == ["u-new"]
+    env["db"].delete_mooring(1)
+    assert env["db"].get_wind_checks(1) == []
