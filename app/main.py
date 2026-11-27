@@ -270,26 +270,71 @@ def _compute_tender_windows(
     return tw, depth
 
 
-# Mooring settings that change the stored access windows. A Save that changes
-# any of these recomputes the future windows (v2.11.1).
-_WINDOW_SETTINGS = (
-    "draught_m", "drying_height_m", "safety_margin_m",
-    "tender_access_enabled", "tender_min_depth_m",
-    "barometric_enabled",
-    "wind_offset_enabled", "shallow_direction", "shallow_extra_depth_m",
-)
+def _effective_window_settings(m: dict) -> dict:
+    """
+    The mooring settings that shape its stored access windows, as they take
+    effect (v2.11.1): tender depth only while tender access is on, the wind
+    shallow-side settings only while the wind offset is configured, and the
+    barometric opt-in only while the system master is on. A Save that changes
+    any of these recomputes the future windows.
+    """
+    from app.config import get_barometric_enabled
+
+    def num(v):
+        return round(float(v), 6)
+
+    shallow_dir = m.get("shallow_direction") or ""
+    extra = num(m.get("shallow_extra_depth_m") or 0.0)
+    wind_on = bool(m.get("wind_offset_enabled")) and bool(shallow_dir) and extra > 0
+    return {
+        "draught_m": num(m["draught_m"]),
+        "drying_height_m": num(m["drying_height_m"]),
+        "safety_margin_m": num(m["safety_margin_m"]),
+        "tender": (num(m.get("tender_min_depth_m") or 0.3)
+                   if m.get("tender_access_enabled") else None),
+        "wind": (shallow_dir, extra) if wind_on else None,
+        "barometric": (bool(m.get("barometric_enabled"))
+                       if get_barometric_enabled(False) else None),
+    }
 
 
 def _window_settings_changed(old: dict, new: dict) -> bool:
-    """True when any window-affecting setting differs between two mooring rows."""
-    for key in _WINDOW_SETTINGS:
-        a, b = old.get(key), new.get(key)
-        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
-            if abs(float(a) - float(b)) > 1e-9:
-                return True
-        elif (a or None) != (b or None):
-            return True
-    return False
+    """True when the effective window settings differ between two mooring rows."""
+    try:
+        return _effective_window_settings(old) != _effective_window_settings(new)
+    except (TypeError, ValueError, KeyError):
+        return True  # unreadable values: recompute rather than risk stale windows
+
+
+def _log_recompute(mooring_id: int, trigger: str, result: dict):
+    """Activity-log the outcome of a _recompute_future_windows call."""
+    status = (result or {}).get("status")
+    if status not in ("rebuilt", "no_data"):
+        return
+    wind = result.get("wind") or {}
+    if status == "no_data":
+        message = ("Future windows cleared but not rebuilt: no UKHO tide data "
+                   "stored for the next 7 days")
+        severity = "warning"
+    else:
+        message = f"Future windows recomputed ({result.get('window_count', 0)} windows)"
+        severity = "warning" if wind.get("failed") else "info"
+    log_activity(
+        event_type="feed_generation",
+        message=message,
+        severity=severity,
+        scope="mooring",
+        mooring_id=mooring_id,
+        details={
+            "trigger": trigger,
+            "status": status,
+            "window_count": result.get("window_count", 0),
+            "windows_removed_below_threshold": result.get("removed", 0),
+            "windows_wind_preserved": wind.get("preserved", 0),
+            "windows_wind_reverted": wind.get("reverted", 0),
+            "windows_wind_failed": wind.get("failed", 0),
+        },
+    )
 
 
 def _recompute_future_windows(mooring_id: int):
@@ -299,23 +344,29 @@ def _recompute_future_windows(mooring_id: int):
     events and recompute them from currently-stored UKHO tide data, then
     regenerate the iCal feed if calendar subscription is enabled.
 
-    Stored wind adjustments are carried over (v2.11.1): the wind-adjusted
-    future rows are read before the clear and re-applied to the rebuilt
-    windows under the current config (see scheduler.reapply_stored_wind). A
-    cycle whose wind window cannot be recomputed is left out of the rebuild.
+    Stored wind adjustments are carried over (v2.11.1): recorded wind checks
+    (and, for rows written before those were recorded, the wind-adjusted
+    future rows read before the clear) are re-applied to the rebuilt windows
+    under the current config (see scheduler.reapply_stored_wind). A cycle
+    whose wind window cannot be recomputed is left out of the rebuild.
 
     Rows beyond the UKHO range (long-range harmonic entries pushed via Update
     Feed) are cleared and not rebuilt: they were computed with the old
     settings.
 
-    If no UKHO data is available, future rows are still cleared and nothing
-    is rebuilt. Uses the mooring's current stored configuration. Uses
+    If no UKHO data is stored for the next 7 days, future rows are still
+    cleared (no window computed with old settings is left in place) and
+    nothing is rebuilt; the feed is regenerated and wind jobs rescheduled
+    either way. Uses the mooring's current stored configuration. Uses
     get_ukho_tide_events() so that Portsmouth fallback data receives the
     secondary port correction transparently.
+
+    Returns {"status": "rebuilt" | "no_data" | "no_mooring", "window_count",
+    "removed", "wind": re-apply stats} for the caller to log.
     """
     m = get_mooring(mooring_id)
     if not m:
-        return
+        return {"status": "no_mooring"}
 
     now = datetime.now(timezone.utc)
     now_str = to_utc_str(now)
@@ -331,7 +382,12 @@ def _recompute_future_windows(mooring_id: int):
     end = to_utc_str(now + timedelta(days=7))
     tide_data = get_ukho_tide_events(query_start, end)
     if not tide_data:
-        return
+        logger.warning(
+            f"Mooring {mooring_id}: no UKHO tide data stored; future windows "
+            f"cleared and not rebuilt"
+        )
+        _finish_recompute(m)
+        return {"status": "no_data", "window_count": 0, "removed": 0, "wind": {}}
 
     # Barometric correction (v2.9): calibration-apply rebuilds this mooring's
     # future windows from scratch (delete_future_events above), so correct the
@@ -369,6 +425,7 @@ def _recompute_future_windows(mooring_id: int):
             f"could not be rebuilt and were left out of the recompute"
         )
 
+    window_count = len(windows)
     cal = calibrate_drying_height(mooring_id)
     calc_params = {
         "draught_m": m["draught_m"],
@@ -376,14 +433,28 @@ def _recompute_future_windows(mooring_id: int):
         "safety_margin_m": m["safety_margin_m"],
         "obs_calibrated": 1 if cal.get("confidence", "none") != "none" else 0,
     }
-    store_windows_as_events(
+    store_result = store_windows_as_events(
         windows, mooring_id, "ukho", m.get("boat_name", ""),
         calc_params=calc_params,
         tender_windows=tender_windows,
         tender_min_depth_m=tender_depth,
     )
 
+    _finish_recompute(m, cal)
+    return {
+        "status": "rebuilt",
+        "window_count": window_count,
+        "removed": store_result.get("removed", 0),
+        "wind": wind_stats,
+    }
+
+
+def _finish_recompute(m: dict, cal: dict = None):
+    """Regenerate the feed (if enabled) and reschedule wind jobs after a recompute."""
+    mooring_id = m["mooring_id"]
     if m.get("calendar_enabled"):
+        if cal is None:
+            cal = calibrate_drying_height(mooring_id)
         feed_cal = cal if cal.get("confidence") != "none" else None
         generate_feed_for_mooring(mooring_id, m.get("boat_name", ""), feed_cal)
 
@@ -550,15 +621,17 @@ async def save_mooring_config(request: Request):
     # the 02:00 refresh, and long-range entries kept them indefinitely.
     # _recompute_future_windows also reschedules the wind jobs and regenerates
     # the feed.
-    recomputed = False
+    recompute = {}
     if old is not None and _window_settings_changed(old, result):
         try:
-            _recompute_future_windows(mid)
-            recomputed = True
+            recompute = _recompute_future_windows(mid)
+            _log_recompute(mid, "config_save", recompute)
         except Exception as e:
             logger.error(f"Window recompute after config save failed for #{mid}: {e}")
+    recomputed = recompute.get("status") == "rebuilt"
+    recompute_ran = recompute.get("status") in ("rebuilt", "no_data")
 
-    if not recomputed:
+    if not recompute_ran:
         # Reschedule wind-sample jobs so changes to wind/shallow or
         # draught/drying settings take effect now rather than waiting for the
         # next daily fetch.
@@ -588,10 +661,11 @@ async def save_mooring_config(request: Request):
             "shallow_extra_depth_m": result.get("shallow_extra_depth_m", 0),
             "use_observations": bool(result.get("use_observations")),
             "windows_recomputed": recomputed,
+            "windows_cleared_no_ukho_data": recompute.get("status") == "no_data",
         },
     )
 
-    if result.get("calendar_enabled") and not recomputed:
+    if result.get("calendar_enabled") and not recompute_ran:
         existing_events = get_calendar_events(mid)
         if existing_events:
             cal = calibrate_drying_height(mid)
@@ -1237,7 +1311,7 @@ async def apply_drying_height_calibration(mooring_id: int):
         },
     )
 
-    _recompute_future_windows(mooring_id)
+    _log_recompute(mooring_id, "calibration_apply", _recompute_future_windows(mooring_id))
 
     return {
         "applied": True,
@@ -1310,7 +1384,7 @@ async def apply_wind_offset_calibration(mooring_id: int):
         },
     )
 
-    _recompute_future_windows(mooring_id)
+    _log_recompute(mooring_id, "calibration_apply", _recompute_future_windows(mooring_id))
 
     return {
         "applied": True,
@@ -1699,6 +1773,26 @@ async def update_mooring_feed(mooring_id: int, request: Request):
     # window is dropped before the stored wind is re-applied below.
     windows = [_strip_client_wind_state(w) for w in windows]
 
+    # Harmonic estimates only fill the feed beyond the UKHO range (v2.11.1).
+    # A harmonic window for a tide UKHO already covers would otherwise be
+    # stored whenever UKHO found that tide below the threshold (no UKHO row to
+    # outrank it), showing an estimated window UKHO says does not exist.
+    dropped_in_ukho_range = 0
+    if source == "harmonic":
+        now = datetime.now(timezone.utc)
+        ukho_hws = [
+            e["timestamp"] for e in get_ukho_tide_events(
+                to_utc_str(now - timedelta(hours=13)),
+                to_utc_str(now + timedelta(days=8)),
+            )
+            if e["event_type"] == "HighWater"
+        ]
+        if ukho_hws:
+            last_ukho_hw = max(ukho_hws)
+            kept = [w for w in windows if w["hw_timestamp"] > last_ukho_hw]
+            dropped_in_ukho_range = len(windows) - len(kept)
+            windows = kept
+
     cal = calibrate_drying_height(mooring_id)
     calc_params = {
         "draught_m": params.get("draught_m", m["draught_m"]),
@@ -1783,6 +1877,8 @@ async def update_mooring_feed(mooring_id: int, request: Request):
             "windows_wind_preserved": wind_stats["preserved"],
             "windows_wind_reverted": wind_stats["reverted"],
             "windows_wind_failed": wind_stats["failed"],
+            "windows_wind_failed_deleted": wind_stats["deleted"],
+            "windows_dropped_in_ukho_range": dropped_in_ukho_range,
         },
     )
 
@@ -1794,6 +1890,8 @@ async def update_mooring_feed(mooring_id: int, request: Request):
         "wind_preserved": wind_stats["preserved"],
         "removed": store_result.get("removed", 0),
         "failed": wind_stats["failed"],
+        "failed_deleted": wind_stats["deleted"],
+        "dropped_in_ukho_range": dropped_in_ukho_range,
     }
 
 
