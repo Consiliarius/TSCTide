@@ -366,8 +366,10 @@ def _recompute_future_windows(mooring_id: int):
     Returns {"status": "rebuilt" | "no_data" | "no_mooring", "window_count"
     (windows with a start and end), "rows_before"/"rows_after" (stored future
     rows), "wind": re-apply stats} for the caller to log. The rows are cleared
-    before the rebuild, so below-threshold tides show as the drop between
-    rows_before and rows_after rather than as removals.
+    before the rebuild, so the drop from rows_before to rows_after covers
+    below-threshold tides, cleared long-range harmonic entries and an
+    incomplete window at the end of the tide data, rather than appearing as
+    removals.
     """
     m = get_mooring(mooring_id)
     if not m:
