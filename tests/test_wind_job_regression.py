@@ -154,7 +154,10 @@ def test_tender_start_moves_with_offset(env, monkeypatch):
 
 def test_barometric_opt_in_composes_with_offset(env, monkeypatch):
     import app.barometric as barometric
+    import app.config as config
 
+    # Do not depend on the master switch shipped in model_config.json.
+    monkeypatch.setattr(config, "get_barometric_enabled", lambda default=False: True)
     _mooring(env, barometric_enabled=1)
     _stub_wind(monkeypatch, "E")
     # 20 hPa below the reference raises water by about 0.18 m.
