@@ -1993,9 +1993,24 @@ async function updateFeed() {
       const msg = (data.detail && (data.detail.message || data.detail)) || 'Update failed';
       throw new Error(msg);
     }
+    // v2.11.1: the stored feed can differ from the results table. A wind
+    // adjustment the scheduler already applied is kept, and a tide that no
+    // longer clears the threshold has its old entry removed.
+    const notes = [];
+    if (data.wind_preserved) {
+      notes.push(`${data.wind_preserved} wind adjustment${data.wind_preserved === 1 ? '' : 's'} kept`);
+    }
+    if (data.removed) {
+      notes.push(`${data.removed} entr${data.removed === 1 ? 'y' : 'ies'} removed (tide below threshold)`);
+    }
+    if (data.failed) {
+      notes.push(`${data.failed} wind-adjusted window${data.failed === 1 ? '' : 's'} could not be updated`);
+    }
+    const extra = notes.length ? ` ${notes.join('; ')}.` : '';
     if (data.feed_generated) {
       showStatus('calc-status',
-        `Calendar feed updated (${data.window_count} windows).`, 'ok');
+        `Calendar feed updated (${data.window_count} windows).${extra}`,
+        data.failed ? 'info' : 'ok');
     } else {
       showStatus('calc-status',
         'Events stored but feed not regenerated (calendar subscription is disabled).',
@@ -2931,7 +2946,7 @@ async function loadMooringConfigs() {
           `</div>`;
       if (m.wind_offset_enabled && m.shallow_direction) {
         html += `<div style="font-size:12px;margin-top:6px;color:var(--text-light);">` +
-          `Shallow side: <b>${m.shallow_direction}</b>, extra drying: <b>+${(m.shallow_extra_depth_m || 0).toFixed(2)}m</b>` +
+          `Shallow side: <b>${escapeHtml(m.shallow_direction)}</b>, extra drying: <b>+${(m.shallow_extra_depth_m || 0).toFixed(2)}m</b>` +
           `</div>`;
       }
       if (m.tender_access_enabled) {
