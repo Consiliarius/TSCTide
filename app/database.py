@@ -1465,6 +1465,23 @@ def delete_future_events(mooring_id: int, after: str):
         )
 
 
+def delete_calendar_event(event_uid: str, mooring_id: int) -> int:
+    """
+    Delete one stored calendar event by cycle UID, scoped to its mooring.
+
+    Used when a recompute finds that a stored window no longer exists, for
+    example a high water that has dropped below the access threshold after a
+    draught increase or a barometric shift (v2.11.1). Returns the number of
+    rows deleted (0 or 1).
+    """
+    with db_connection() as conn:
+        result = conn.execute(
+            "DELETE FROM calendar_events WHERE event_uid = ? AND mooring_id = ?",
+            (event_uid, mooring_id),
+        )
+        return result.rowcount
+
+
 def cleanup_old_events(days: int = 14):
     """Remove calendar events with HW times older than the given number of days.
     Only cleans calendar_events (computed windows); tide_data is preserved
