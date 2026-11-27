@@ -1172,6 +1172,10 @@
 // State
 let lastWindows = [];
 let lastSource = '';
+// Parameters /api/calculate actually used for lastWindows (v2.11.1). Update
+// Feed sends these, not the current form, so the stored windows are labelled
+// with the settings they were computed with even if the form changed since.
+let lastParameters = null;
 // v2: wind_info preserved from last /calculate response so the Update Feed
 // button can pass wind metadata through to the feed-update endpoint.
 let lastWindInfo = null;
@@ -1798,6 +1802,7 @@ async function calculate(source) {
     lastWindows = data.windows;
     lastSource = source;
     lastWindInfo = data.wind_info || null;
+    lastParameters = data.parameters || null;
     renderResults(data);
     let msg = `${data.event_count} access window(s) from ${source.toUpperCase()} data.`;
     // v2: feed is no longer auto-updated by calculation. When the mooring
@@ -1976,7 +1981,12 @@ async function updateFeed() {
     const body = {
       source: lastSource,
       windows: lastWindows,
-      parameters: {
+      parameters: lastParameters ? {
+        draught_m: lastParameters.draught_m,
+        drying_height_m: lastParameters.drying_height_m,
+        safety_margin_m: lastParameters.safety_margin_m,
+        tender_min_depth_m: lastParameters.tender_min_depth_m,
+      } : {
         draught_m: cfg.draught_m,
         drying_height_m: cfg.drying_height_m,
         safety_margin_m: cfg.safety_margin_m,
@@ -2004,7 +2014,13 @@ async function updateFeed() {
       notes.push(`${data.removed} entr${data.removed === 1 ? 'y' : 'ies'} removed (tide below threshold)`);
     }
     if (data.failed) {
-      notes.push(`${data.failed} wind-adjusted window${data.failed === 1 ? '' : 's'} could not be updated`);
+      const kept = data.failed - (data.failed_deleted || 0);
+      notes.push(`${data.failed} wind-adjusted window${data.failed === 1 ? '' : 's'} could not be recomputed`
+        + (data.failed_deleted ? ` (${data.failed_deleted} removed` + (kept ? `, ${kept} left as stored)` : ')')
+                               : ' (left as stored)'));
+    }
+    if (data.dropped_in_ukho_range) {
+      notes.push(`${data.dropped_in_ukho_range} estimated window${data.dropped_in_ukho_range === 1 ? '' : 's'} skipped inside the UKHO range (UKHO data takes precedence)`);
     }
     const extra = notes.length ? ` ${notes.join('; ')}.` : '';
     if (data.feed_generated) {
