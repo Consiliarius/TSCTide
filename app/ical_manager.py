@@ -60,6 +60,10 @@ from app.window_display import round_window_conservative
 
 logger = logging.getLogger(__name__)
 
+# Calendar-event source priority, as used by database.upsert_calendar_event
+# and cleanup_superseded_events. Keep the three in step.
+_SOURCE_PRIORITY = {"ukho": 2, "harmonic": 1}
+
 # Unicode fraction characters for compact durations in event titles
 _QUARTER_FRACTIONS = {0: "", 1: "\u00bc", 2: "\u00bd", 3: "\u00be"}
 
@@ -348,6 +352,9 @@ def generate_feed_for_mooring(mooring_id: int, boat_name: str = "",
         title_window = {
             "duration_minutes": duration_minutes,
             "always_accessible": is_always,
+            # The start==end marker is the wind-induced no-access event; without
+            # this flag it would be titled as a zero-length access window.
+            "wind_no_access": is_marker,
         }
         title = build_event_title(
             title_window, ev_data.get("source", "ukho"), boat_name, mooring_id
@@ -562,7 +569,11 @@ def store_windows_as_events(windows: list[dict], mooring_id: int,
     """Store computed access windows as calendar events in the database.
 
     calc_params: {draught_m, drying_height_m, safety_margin_m, obs_calibrated}
-    wind_details: {direction, speed_ms, offset_m}
+    wind_details: {direction, speed_ms, offset_m}. Applied to every window
+        flagged wind_adjusted. A window dict may instead carry its own
+        ``wind_details`` key (same shape), which takes precedence; the daily
+        refresh uses this to keep each re-applied window's own wind reading
+        (v2.11.1).
     tender_windows: optional list from a second compute_access_windows() call
         with draught_m=0 and safety_margin_m=tender_min_depth_m. Matched to
         main windows by hw_timestamp; tender fields are written onto the same
@@ -584,9 +595,20 @@ def store_windows_as_events(windows: list[dict], mooring_id: int,
     the persisted events can be re-evaluated and updated on subsequent
     recalculation rather than being silently missing.
 
-    Returns {"written": n, "skipped": n} for logging/inspection.
+    Below-threshold windows are never stored. Since v2.11.1 a below-threshold
+    result also REMOVES any window already stored for that tide, when this
+    write's source has at least the stored row's priority (ukho 2, harmonic 1):
+    the tide no longer gives access, so the old window must not stay in the
+    feed. A harmonic result never removes a UKHO row.
+
+    Windows with no start or end (incomplete data at the edge of the tide
+    data) are skipped and counted, leaving any stored row untouched.
+
+    Returns {"written", "skipped", "removed", "incomplete"} counts for
+    logging/inspection.
     """
     from app.access_calc import generate_event_uid
+    from app.database import delete_calendar_event
 
     tender_by_hw = {}
     if tender_windows:
@@ -595,20 +617,27 @@ def store_windows_as_events(windows: list[dict], mooring_id: int,
             if ts:
                 tender_by_hw[ts] = tw
 
-    # For the deadband comparison, load the currently-stored rows once and key
-    # them by cycle UID. Only needed when the deadband is active.
-    existing_by_uid = {}
+    # Load the currently-stored rows once, keyed by cycle UID: needed for the
+    # below-threshold removal and, when active, the deadband comparison.
+    existing_by_uid = {e["event_uid"]: e for e in get_calendar_events(mooring_id)}
     use_deadband = bool(deadband_minutes and deadband_minutes > 0)
-    if use_deadband:
-        for e in get_calendar_events(mooring_id):
-            existing_by_uid[e["event_uid"]] = e
+    new_priority = _SOURCE_PRIORITY.get(source, 0)
 
     written = 0
     skipped = 0
+    removed = 0
+    incomplete = 0
     for w in windows:
-        if not w.get("start_time") or not w.get("end_time"):
-            continue
         if w.get("below_threshold"):
+            uid = generate_event_uid(mooring_id, w["hw_timestamp"])
+            existing = existing_by_uid.get(uid)
+            if existing is not None and (
+                new_priority >= _SOURCE_PRIORITY.get(existing.get("source"), 0)
+            ):
+                removed += delete_calendar_event(uid, mooring_id)
+            continue
+        if not w.get("start_time") or not w.get("end_time"):
+            incomplete += 1
             continue
 
         uid = generate_event_uid(mooring_id, w["hw_timestamp"])
@@ -633,10 +662,11 @@ def store_windows_as_events(windows: list[dict], mooring_id: int,
             event["safety_margin_m"] = calc_params.get("safety_margin_m")
             event["obs_calibrated"] = calc_params.get("obs_calibrated", 0)
 
-        if wind_details and w.get("wind_adjusted"):
-            event["wind_direction"] = wind_details.get("direction")
-            event["wind_speed_ms"] = wind_details.get("speed_ms")
-            event["wind_offset_m"] = wind_details.get("offset_m", 0)
+        w_wind = w.get("wind_details") or wind_details
+        if w_wind and w.get("wind_adjusted"):
+            event["wind_direction"] = w_wind.get("direction")
+            event["wind_speed_ms"] = w_wind.get("speed_ms")
+            event["wind_offset_m"] = w_wind.get("offset_m", 0)
 
         tw = tender_by_hw.get(w["hw_timestamp"])
         if tw is not None and not tw.get("below_threshold"):
@@ -661,10 +691,24 @@ def store_windows_as_events(windows: list[dict], mooring_id: int,
         upsert_calendar_event(event)
         written += 1
 
+    if removed:
+        logger.info(
+            f"Mooring {mooring_id}: removed {removed} stored window(s) whose "
+            f"high water is now below the access threshold"
+        )
+    if incomplete:
+        logger.info(
+            f"Mooring {mooring_id}: {incomplete} window(s) had no start or end "
+            f"(edge of the tide data); any stored row for them was left as is"
+        )
+
     # Clean up any lower-priority events that were superseded but got
     # different cycle-based UIDs due to timing differences across sources
     cleanup_superseded_events(mooring_id)
-    return {"written": written, "skipped": skipped}
+    return {
+        "written": written, "skipped": skipped,
+        "removed": removed, "incomplete": incomplete,
+    }
 
 
 # --- Standalone Langstone tide feeds (not per-mooring) ---

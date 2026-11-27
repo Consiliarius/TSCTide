@@ -58,6 +58,7 @@ Write-Host "  - Row in   moorings"
 Write-Host "  - Rows in  observations         (any observations for this mooring)"
 Write-Host "  - Rows in  calendar_events      (any stored access windows)"
 Write-Host "  - Rows in  pin_failed_attempts  (any PIN lockout state)"
+Write-Host "  - Rows in  wind_checks          (recorded wind readings, v2.11.1)"
 Write-Host "  - Feed file $feedPath           (if present)"
 Write-Host ""
 Write-Host "Activity-log entries are PRESERVED, plus a 'mooring_deleted' audit row is added." -ForegroundColor Yellow
@@ -80,6 +81,7 @@ BEGIN TRANSACTION;
 DELETE FROM observations         WHERE mooring_id = $MooringId;
 DELETE FROM calendar_events      WHERE mooring_id = $MooringId;
 DELETE FROM pin_failed_attempts  WHERE mooring_id = $MooringId;
+DELETE FROM wind_checks          WHERE mooring_id = $MooringId;
 DELETE FROM moorings             WHERE mooring_id = $MooringId;
 INSERT INTO activity_log (timestamp, scope, mooring_id, severity, event_type, message)
 VALUES (strftime('%Y-%m-%dT%H:%M:%SZ','now'), 'mooring', $MooringId, 'warning',
@@ -92,9 +94,13 @@ Write-Host "Running SQL transaction..." -ForegroundColor Cyan
 
 # Pipe the SQL into sqlite3 via docker exec. -i (no -t) for non-interactive
 # stdin. ASCII-only here-string keeps Windows code-page issues out of scope.
-$sql | docker exec -i $Container sqlite3 /app/data/tides.db
+# -bail stops at the first failing statement, so the open transaction is
+# rolled back. Without it sqlite3 skips the failed statement and COMMIT
+# keeps the rest (for example on a database without the wind_checks table,
+# i.e. one not yet started under v2.11.1).
+$sql | docker exec -i $Container sqlite3 -bail /app/data/tides.db
 if ($LASTEXITCODE -ne 0) {
-    Write-Error "SQL execution failed (exit code $LASTEXITCODE). Database state should be unchanged due to the transaction wrapper."
+    Write-Error "SQL execution failed (exit code $LASTEXITCODE). The transaction was rolled back, so the database is unchanged. If the error was 'no such table: wind_checks', the container is still running a version before v2.11.1: rebuild it (docker compose up -d --build) and run this script again."
     exit 3
 }
 

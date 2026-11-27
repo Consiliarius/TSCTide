@@ -112,6 +112,22 @@ CREATE TABLE IF NOT EXISTS wind_observations (
     UNIQUE(timestamp, source)
 );
 
+-- v2.11.1: the outcome of each per-mooring wind grounding check, keyed by
+-- the tide's cycle UID. Kept apart from calendar_events so it survives that
+-- tide's window being removed (e.g. a recompute finds the tide below the
+-- threshold, then a later one finds it clearing again): the wind reading is
+-- then re-applied rather than lost. Pruned with old calendar events.
+CREATE TABLE IF NOT EXISTS wind_checks (
+    mooring_id INTEGER NOT NULL,
+    event_uid TEXT NOT NULL,
+    hw_timestamp TEXT NOT NULL,
+    wind_direction TEXT NOT NULL,
+    wind_speed_ms REAL,
+    checked_at TEXT NOT NULL,
+    PRIMARY KEY (mooring_id, event_uid)
+);
+CREATE INDEX IF NOT EXISTS idx_wind_checks_hw ON wind_checks(hw_timestamp);
+
 CREATE INDEX IF NOT EXISTS idx_tide_timestamp ON tide_data(timestamp);
 CREATE INDEX IF NOT EXISTS idx_tide_source ON tide_data(source);
 CREATE INDEX IF NOT EXISTS idx_obs_mooring ON observations(mooring_id);
@@ -623,6 +639,7 @@ def delete_mooring(mooring_id: int) -> dict:
       - observations (per-mooring)
       - calendar_events (per-mooring)
       - pin_failed_attempts (per-mooring)
+      - wind_checks (per-mooring, v2.11.1; not counted in the result)
 
     Intentionally NOT touched:
       - activity_log: kept as audit trail per design decision. Old entries
@@ -659,6 +676,8 @@ def delete_mooring(mooring_id: int) -> dict:
             "DELETE FROM pin_failed_attempts WHERE mooring_id = ?", (mooring_id,)
         )
         counts["pin_failed_attempts"] = r.rowcount
+
+        conn.execute("DELETE FROM wind_checks WHERE mooring_id = ?", (mooring_id,))
 
         # Delete the mooring row last so that if any of the above fails,
         # the orphan rows can still be cleaned up by re-running.
@@ -1465,10 +1484,28 @@ def delete_future_events(mooring_id: int, after: str):
         )
 
 
+def delete_calendar_event(event_uid: str, mooring_id: int) -> int:
+    """
+    Delete one stored calendar event by cycle UID, scoped to its mooring.
+
+    Used when a recompute finds that a stored window no longer exists, for
+    example a high water that has dropped below the access threshold after a
+    draught increase or a barometric shift (v2.11.1). Returns the number of
+    rows deleted (0 or 1).
+    """
+    with db_connection() as conn:
+        result = conn.execute(
+            "DELETE FROM calendar_events WHERE event_uid = ? AND mooring_id = ?",
+            (event_uid, mooring_id),
+        )
+        return result.rowcount
+
+
 def cleanup_old_events(days: int = 14):
     """Remove calendar events with HW times older than the given number of days.
-    Only cleans calendar_events (computed windows); tide_data is preserved
-    for observation calibration and the historical Tides tab view."""
+    Only cleans calendar_events (computed windows) and, since v2.11.1, the
+    wind_checks recorded for those tides; tide_data is preserved for
+    observation calibration and the historical Tides tab view."""
     cutoff = to_utc_str(datetime.now(timezone.utc) - timedelta(days=days))
     with db_connection() as conn:
         result = conn.execute(
@@ -1476,6 +1513,35 @@ def cleanup_old_events(days: int = 14):
         )
         if result.rowcount:
             logger.info(f"Cleaned up {result.rowcount} calendar events older than {days} days")
+        conn.execute("DELETE FROM wind_checks WHERE hw_timestamp < ?", (cutoff,))
+
+
+def record_wind_check(mooring_id: int, event_uid: str, hw_timestamp: str,
+                      wind_direction: str, wind_speed_ms: Optional[float]):
+    """
+    Record (or replace) the wind reading a grounding check took for one tide
+    of one mooring (v2.11.1). Written by the wind job before it computes the
+    window, so the outcome is kept even if that window is later removed.
+    """
+    with db_connection() as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO wind_checks
+               (mooring_id, event_uid, hw_timestamp, wind_direction,
+                wind_speed_ms, checked_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (mooring_id, event_uid, hw_timestamp, wind_direction, wind_speed_ms,
+             to_utc_str(datetime.now(timezone.utc))),
+        )
+
+
+def get_wind_checks(mooring_id: int) -> list[dict]:
+    """All recorded wind checks for a mooring (v2.11.1), oldest tide first."""
+    with db_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM wind_checks WHERE mooring_id = ? ORDER BY hw_timestamp",
+            (mooring_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def cleanup_old_tide_data(days: int = 365):

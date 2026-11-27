@@ -13,6 +13,14 @@ A wind reading taken at a grounding adjusts only the START of that mooring's
 enumerated -- drives the sample for the window after that, and so on. The
 "reactive" recalculation is the body of wind_observation_job; it is not a
 separately-registered job type.
+
+Since v2.11.1 a wind adjustment survives later recomputes of the same tide.
+The daily refresh (and, in app.main, calibration Apply, Save Configuration
+and Update Feed) passes its fresh baseline windows through
+reapply_stored_wind, which re-applies each stored wind outcome to the fresh
+tide data via compute_wind_window, the same computation the wind job uses.
+Before this, a baseline write replaced the wind-adjusted row, and because the
+wind job for that tide had already fired, the adjustment was lost for good.
 """
 
 import asyncio
@@ -98,7 +106,7 @@ async def daily_ukho_fetch():
         cleanup_old_tide_data,
         store_harmonic_predictions, cleanup_old_harmonic_predictions,
         compute_harmonic_residuals,
-        log_activity, prune_activity_log,
+        log_activity, prune_activity_log, get_calendar_events,
     )
     from app.harmonic import predict_events as harmonic_predict_events
     from app.access_calc import compute_access_windows
@@ -197,6 +205,14 @@ async def daily_ukho_fetch():
                     safety_margin_m=tender_depth,
                     source="ukho",
                 )
+            window_count = len(windows)
+            # Keep any stored wind adjustment: re-apply it to these fresh
+            # events rather than overwriting it with the baseline (v2.11.1).
+            # Same events as the baseline, so the two cannot diverge.
+            windows, tender_windows, wind_stats = reapply_stored_wind(
+                m, windows, tender_windows,
+                get_calendar_events(m["mooring_id"]), events=m_events,
+            )
             cal = calibrate_drying_height(m["mooring_id"])
             calc_params = {
                 "draught_m": m["draught_m"],
@@ -217,17 +233,23 @@ async def daily_ukho_fetch():
             updated_count += 1
             log_activity(
                 event_type="feed_generation",
-                message=f"Calendar feed refreshed with {len(windows)} access windows",
-                severity="info",
+                message=f"Calendar feed refreshed with {window_count} access windows",
+                severity="warning" if wind_stats["failed"] else "info",
                 scope="mooring",
                 mooring_id=m["mooring_id"],
                 details={
-                    "window_count": len(windows),
+                    "window_count": window_count,
                     "trigger": "daily_scheduler",
                     "boat_name": m.get("boat_name", ""),
                     "barometric_applied": m_barometric,
                     "windows_written": store_result.get("written"),
                     "windows_unchanged_deadband": store_result.get("skipped"),
+                    "windows_removed_below_threshold": store_result.get("removed"),
+                    "windows_incomplete": store_result.get("incomplete"),
+                    "windows_wind_preserved": wind_stats["preserved"],
+                    "windows_wind_reverted": wind_stats["reverted"],
+                    "windows_wind_failed": wind_stats["failed"],
+                    "windows_wind_failed_deleted": wind_stats["deleted"],
                 },
             )
         except Exception as e:
@@ -715,20 +737,310 @@ async def _get_wind_for_sample():
     return wind
 
 
+def compute_wind_window(m: dict, hw_timestamp: str, wind_offset: float,
+                        events: list[dict] = None, params: dict = None):
+    """
+    Compute the wind-adjusted window (vessel, and tender when enabled) for the
+    high water at ``hw_timestamp`` on mooring ``m``, applying ``wind_offset``
+    (metres; 0 for favourable wind) to the window START only.
+
+    Shared by wind_observation_job and reapply_stored_wind, so a re-applied
+    adjustment is computed exactly as the original was.
+
+    events: tide events to compute from, used as given (the caller has already
+        applied, or decided against, the barometric correction). When None,
+        the events within 8 hours either side of the high water are read from
+        the database and the barometric correction is applied if the system
+        master is on and the mooring opted in; this is the wind job's path.
+        Callers that hold the events their baseline was computed from should
+        pass them, so the wind window and its neighbours share one data set
+        (the database can hold a superseded row for a revised high-water time).
+    params: optional {draught_m, drying_height_m, safety_margin_m} overriding
+        the mooring's stored values for the vessel window (Update Feed). The
+        tender pass always uses the stored drying height and tender depth, as
+        /api/calculate does.
+
+    Synchronous by design: callers rely on there being no await between
+    reading stored rows and writing them.
+
+    Returns (window, tender_windows or None, tender_depth or None), or None
+    when no tide data covers the high water or it is not among the events.
+    """
+    from app.database import get_ukho_tide_events
+    from app.access_calc import compute_next_window_with_wind
+
+    if events is None:
+        hw_dt = dtparse.parse(hw_timestamp)
+        if hw_dt.tzinfo is None:
+            hw_dt = hw_dt.replace(tzinfo=timezone.utc)
+        # Enough tide data to bracket the HW (flood LW before, ebb LW after).
+        # get_ukho_tide_events applies the Langstone offset to any Portsmouth
+        # fallback data automatically.
+        events = get_ukho_tide_events(
+            to_utc_str(hw_dt - timedelta(hours=8)),
+            to_utc_str(hw_dt + timedelta(hours=8)),
+        )
+        if not events:
+            return None
+        # Barometric correction (v2.9) composes with the wind offset:
+        # barometric shifts event heights, wind shifts the threshold. Gated on
+        # the system master AND this mooring's opt-in.
+        from app.config import get_barometric_enabled
+        if get_barometric_enabled(False) and m.get("barometric_enabled"):
+            from app.barometric import apply_barometric_correction, make_pressure_provider
+            events = apply_barometric_correction(events, make_pressure_provider())
+
+    p = params or m
+    window = compute_next_window_with_wind(
+        events, p["draught_m"], p["drying_height_m"], p["safety_margin_m"],
+        hw_timestamp, wind_offset, source="ukho",
+    )
+    if window is None:
+        return None
+
+    tender_windows = None
+    tender_depth = None
+    if m.get("tender_access_enabled"):
+        tender_depth = float(m.get("tender_min_depth_m") or 0.3)
+        tw = compute_next_window_with_wind(
+            events, 0.0, m["drying_height_m"], tender_depth,
+            hw_timestamp, wind_offset, source="ukho",
+        )
+        if tw is not None:
+            tender_windows = [tw]
+    return window, tender_windows, tender_depth
+
+
+def _recompute_usable(w: dict) -> bool:
+    """
+    True when a recomputed wind window can be acted on: a below-threshold
+    result (the stored window is then removed, whatever the wind) or a window
+    with real start and end. An incomplete-data result is not usable; note
+    that compute_next_window_with_wind can turn an incomplete baseline into a
+    start==end marker that still carries incomplete_data, which this rejects.
+    """
+    if w.get("below_threshold"):
+        return True
+    if w.get("incomplete_data"):
+        return False
+    return bool(w.get("start_time") and w.get("end_time"))
+
+
+def _same_tide(check_hw: str, window_hw: str, max_hours: float = 3.0) -> bool:
+    """
+    True when a recorded wind check belongs to the window's high water: both
+    high waters within ``max_hours``. Cycle UIDs are stable for shifts of up
+    to about 3 hours, so a revised HW time still matches, while two
+    consecutive tides that happen to share a UID (from 2029, as high waters
+    drift across the cycle grid) do not.
+    """
+    if not check_hw or not window_hw:
+        return False
+    try:
+        a = dtparse.parse(check_hw)
+        b = dtparse.parse(window_hw)
+    except (ValueError, OverflowError, TypeError):
+        return False
+    if a.tzinfo is None:
+        a = a.replace(tzinfo=timezone.utc)
+    if b.tzinfo is None:
+        b = b.replace(tzinfo=timezone.utc)
+    return abs((a - b).total_seconds()) <= max_hours * 3600
+
+
+def _stored_params_match(row: dict, vessel: dict) -> bool:
+    """True when a stored row was computed with these vessel parameters."""
+    for key in ("draught_m", "drying_height_m", "safety_margin_m"):
+        a, b = row.get(key), vessel.get(key)
+        if a is None or b is None:
+            return False
+        try:
+            if abs(float(a) - float(b)) > 1e-6:
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
+def reapply_stored_wind(m: dict, windows: list[dict], tender_windows,
+                        stored_rows: list[dict], events: list[dict] = None,
+                        params: dict = None):
+    """
+    Carry stored wind adjustments over a recompute of baseline windows
+    (v2.11.1).
+
+    For each fresh window whose tide (matched by cycle UID, never by raw HW
+    timestamp) has a recorded wind check, the window is recomputed with that
+    check's wind reading via compute_wind_window, so the adjustment is kept
+    while fresh tide data and the barometric correction still land.
+
+    Wind checks come from the wind_checks table, which keeps them even after
+    the tide's window row is removed. A stored row with ``wind_adjusted = 1``
+    and a wind direction but no recorded check (written before the table
+    existed) is used as a fallback. A check is used only when its high water
+    is within 3 hours of the window's (see _same_tide).
+
+    Rules:
+
+    - Baseline below threshold, or incomplete (no start/end at the edge of
+      the tide data): passed through unchanged, with no recompute. Store then
+      removes the row (below threshold: no access whatever the wind) or
+      leaves it as is (incomplete). The wind check stays recorded, so a later
+      recompute that finds the tide clearing again re-applies it.
+    - Offset: re-derived from the recorded wind direction and the CURRENT
+      config: the current shallow_extra_depth_m when should_apply_offset(
+      recorded direction, current shallow_direction), else 0. So a
+      calibration or settings change takes effect on the re-applied window.
+    - Wind offset no longer configured on the mooring: not re-applied. The
+      baseline window is written and the wind flags clear ("reverted").
+    - Recompute fails although the baseline was usable (HW not found in the
+      events, incomplete wind window, or an exception): the cycle is dropped
+      from the write. The stored row is kept only when it was computed with
+      the vessel parameters now in use; otherwise it is deleted, because a
+      stale window is worse than none. Counted "failed" once (and "deleted"
+      when removed).
+
+    stored_rows: the mooring's stored calendar rows (for the parameter check
+    and the fallback above). events: passed to compute_wind_window; see
+    there. params: vessel parameter override (Update Feed); defaults to the
+    mooring's own.
+
+    Each cycle is handled in its own try/except, so one bad cycle cannot
+    abort the refresh. Returns (windows, tender_windows, stats) with stats
+    {preserved, reverted, failed, deleted}.
+    """
+    from app.wind import should_apply_offset
+    from app.access_calc import generate_event_uid
+    from app.database import delete_calendar_event, get_wind_checks
+
+    stats = {"preserved": 0, "reverted": 0, "failed": 0, "deleted": 0}
+    mooring_id = m["mooring_id"]
+    if not windows:
+        return windows, tender_windows, stats
+
+    rows_by_uid = {r["event_uid"]: r for r in stored_rows or []}
+    # Wind reading per tide: recorded checks first, then pre-v2.11.1 rows.
+    checks = {}
+    for r in rows_by_uid.values():
+        if r.get("wind_adjusted") and r.get("wind_direction"):
+            checks[r["event_uid"]] = {
+                "hw_timestamp": r["hw_timestamp"],
+                "wind_direction": r["wind_direction"],
+                "wind_speed_ms": r.get("wind_speed_ms"),
+            }
+    for c in get_wind_checks(mooring_id):
+        checks[c["event_uid"]] = c
+    if not checks:
+        return windows, tender_windows, stats
+
+    shallow_dir = m.get("shallow_direction") or ""
+    extra_depth = float(m.get("shallow_extra_depth_m") or 0.0)
+    wind_configured = (
+        bool(m.get("wind_offset_enabled")) and bool(shallow_dir) and extra_depth > 0
+    )
+    vessel = params or {
+        "draught_m": m["draught_m"],
+        "drying_height_m": m["drying_height_m"],
+        "safety_margin_m": m["safety_margin_m"],
+    }
+
+    tender_by_hw = {
+        tw["hw_timestamp"]: tw for tw in (tender_windows or []) if tw.get("hw_timestamp")
+    }
+    tender_touched = False
+    out = []
+    for w in windows:
+        hw = w.get("hw_timestamp")
+        uid = generate_event_uid(mooring_id, hw) if hw else None
+        check = checks.get(uid)
+        if check is not None and not _same_tide(check.get("hw_timestamp"), hw):
+            # Same cycle UID but a different high water (UIDs can collide once
+            # high waters drift across the cycle grid): not this tide's check.
+            check = None
+        if check is None:
+            out.append(w)
+            continue
+        if w.get("below_threshold") or not _recompute_usable(w):
+            # Nothing for the wind to adjust: store removes (below threshold)
+            # or leaves (incomplete) the row. The check stays recorded.
+            out.append(w)
+            continue
+        if not wind_configured:
+            if (rows_by_uid.get(uid) or {}).get("wind_adjusted"):
+                stats["reverted"] += 1
+            out.append(w)
+            continue
+
+        offset = 0.0
+        result = None
+        reason = None
+        try:
+            if should_apply_offset(check["wind_direction"], shallow_dir):
+                offset = extra_depth
+            result = compute_wind_window(m, hw, offset, events=events, params=params)
+            if result is None or not _recompute_usable(result[0]):
+                reason = "no usable wind window"
+        except Exception as e:
+            reason = f"error: {e}"
+
+        if reason is not None:
+            # Same handling whatever the cause: keep the stored row only if it
+            # was computed with the vessel parameters now in use.
+            stats["failed"] += 1
+            row = rows_by_uid.get(uid)
+            keep = row is not None and _stored_params_match(row, vessel)
+            outcome = ("window not rewritten (vessel parameters unchanged)" if keep
+                       else "no stored window to keep" if row is None
+                       else "stored window removed (vessel parameters changed)")
+            if row is not None and not keep:
+                try:
+                    stats["deleted"] += delete_calendar_event(uid, mooring_id)
+                except Exception as e:
+                    outcome = f"stale stored window could not be removed ({e})"
+            logger.warning(
+                f"Mooring {mooring_id}: could not re-apply stored wind to HW {hw} "
+                f"({reason}); {outcome}"
+            )
+            continue
+
+        new_w, new_tender, _depth = result
+        new_w = dict(new_w)
+        new_w["wind_details"] = {
+            "direction": check["wind_direction"],
+            "speed_ms": check.get("wind_speed_ms"),
+            "offset_m": offset,
+        }
+        out.append(new_w)
+        if not new_w.get("below_threshold"):
+            stats["preserved"] += 1
+        if m.get("tender_access_enabled"):
+            tender_touched = True
+            if new_tender:
+                tender_by_hw[hw] = new_tender[0]
+            else:
+                tender_by_hw.pop(hw, None)
+
+    if tender_touched or tender_windows is not None:
+        tender_windows = list(tender_by_hw.values())
+    return out, tender_windows, stats
+
+
 async def wind_observation_job(mooring_id: int, next_hw_timestamp: str):
     """
     Fired at a mooring's worst-case grounding: read the wind now and adjust the
     START of that mooring's NEXT access window (vessel and tender), leaving the
     ebb-side grounding at baseline.
 
-    Writes exactly the one next-HW event (upsert by cycle UID) so it cannot
-    clobber a sibling window already adjusted by an earlier grounding's job.
+    Touches only the one next-HW event (by cycle UID) so it cannot clobber a
+    sibling window already adjusted by an earlier grounding's job: it writes
+    that event, or removes it if the tide no longer clears the threshold.
+
+    Since v2.11.1 the wind reading is also recorded in wind_checks before the
+    window is computed, so later recomputes of that tide can re-apply it (see
+    reapply_stored_wind), even if the window row is removed in between.
     """
     from app.wind import should_apply_offset
-    from app.database import (
-        get_mooring, get_ukho_tide_events, calibrate_drying_height, log_activity,
-    )
-    from app.access_calc import compute_next_window_with_wind
+    from app.database import get_mooring, calibrate_drying_height, log_activity
     from app.ical_manager import store_windows_as_events, generate_feed_for_mooring
 
     m = get_mooring(mooring_id)
@@ -756,9 +1068,31 @@ async def wind_observation_job(mooring_id: int, next_hw_timestamp: str):
         )
         return
 
+    # Re-read the mooring: a Save during the OWM await above may have changed
+    # its config, and the window must be computed with the config now stored.
+    m = get_mooring(mooring_id)
+    if not m or not m.get("wind_offset_enabled"):
+        return
+    shallow_dir = m.get("shallow_direction") or ""
+    extra_depth = float(m.get("shallow_extra_depth_m") or 0.0)
+    if not shallow_dir or extra_depth <= 0:
+        return
+
     offset_triggered = should_apply_offset(wind["direction_compass"], shallow_dir)
     wind_offset = extra_depth if offset_triggered else 0.0
     wind_kts = (wind.get("speed_ms") or 0.0) * 1.944
+
+    # Record the reading for this tide before computing anything, so later
+    # recomputes can re-apply it whatever happens to the window row.
+    from app.access_calc import generate_event_uid
+    from app.database import record_wind_check
+    try:
+        record_wind_check(
+            mooring_id, generate_event_uid(mooring_id, next_hw_timestamp),
+            next_hw_timestamp, wind["direction_compass"], wind.get("speed_ms"),
+        )
+    except Exception as e:
+        logger.error(f"Could not record wind check for mooring {mooring_id}: {e}")
 
     log_activity(
         event_type="wind_check",
@@ -819,53 +1153,20 @@ async def wind_observation_job(mooring_id: int, next_hw_timestamp: str):
             },
         )
 
-    # Fetch enough tide data to bracket the next HW (flood LW before, ebb LW
-    # after). get_ukho_tide_events applies the Langstone offset to any
-    # Portsmouth fallback data automatically.
-    hw_dt = dtparse.parse(next_hw_timestamp)
-    if hw_dt.tzinfo is None:
-        hw_dt = hw_dt.replace(tzinfo=timezone.utc)
-    events = get_ukho_tide_events(
-        to_utc_str(hw_dt - timedelta(hours=8)),
-        to_utc_str(hw_dt + timedelta(hours=8)),
-    )
-    if not events:
-        logger.info("No tide events around next HW for wind adjustment")
-        return
-
-    # Barometric correction (v2.9) composes with the wind offset: barometric
-    # shifts event heights, wind shifts the threshold. Correct the heights for
-    # an opted-in mooring before recomputing this one window, otherwise the
-    # wind job would overwrite the daily job's pressure-corrected window with an
-    # uncorrected one. Gated on the system master AND this mooring's opt-in, so
-    # while the feature is dark this is a no-op. No deadband here: the wind job
-    # is a deliberate, reactive single-window write that should always land.
-    from app.config import get_barometric_enabled
-    if get_barometric_enabled(False) and m.get("barometric_enabled"):
-        from app.barometric import apply_barometric_correction, make_pressure_provider
-        events = apply_barometric_correction(events, make_pressure_provider())
-
+    # Compute this one window from the tide data around the next HW, with the
+    # barometric correction for an opted-in mooring (otherwise the wind job
+    # would overwrite the daily job's pressure-corrected window with an
+    # uncorrected one). No deadband here: the wind job is a deliberate,
+    # reactive single-window write that should always land.
     try:
-        window = compute_next_window_with_wind(
-            events, m["draught_m"], m["drying_height_m"], m["safety_margin_m"],
-            next_hw_timestamp, wind_offset, source="ukho",
-        )
-        if window is None:
+        computed = compute_wind_window(m, next_hw_timestamp, wind_offset)
+        if computed is None:
             logger.info(
-                f"Next HW {next_hw_timestamp} not found in events; skipping"
+                f"Tide data does not cover next HW {next_hw_timestamp}; "
+                f"skipping wind adjustment"
             )
             return
-
-        tender_windows = None
-        tender_depth = None
-        if m.get("tender_access_enabled"):
-            tender_depth = float(m.get("tender_min_depth_m") or 0.3)
-            tw = compute_next_window_with_wind(
-                events, 0.0, m["drying_height_m"], tender_depth,
-                next_hw_timestamp, wind_offset, source="ukho",
-            )
-            if tw is not None:
-                tender_windows = [tw]
+        window, tender_windows, tender_depth = computed
 
         cal = calibrate_drying_height(mooring_id)
         calc_params = {

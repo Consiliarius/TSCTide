@@ -1172,6 +1172,13 @@
 // State
 let lastWindows = [];
 let lastSource = '';
+// Parameters /api/calculate actually used for lastWindows (v2.11.1). Update
+// Feed sends these, not the current form, so the stored windows are labelled
+// with the settings they were computed with even if the form changed since.
+let lastParameters = null;
+// Mooring the last calculation was run for (v2.11.1). Update Feed refuses to
+// push those windows to a different mooring selected since.
+let lastMooringId = null;
 // v2: wind_info preserved from last /calculate response so the Update Feed
 // button can pass wind metadata through to the feed-update endpoint.
 let lastWindInfo = null;
@@ -1798,6 +1805,8 @@ async function calculate(source) {
     lastWindows = data.windows;
     lastSource = source;
     lastWindInfo = data.wind_info || null;
+    lastParameters = data.parameters || null;
+    lastMooringId = cfg.mooring_id;
     renderResults(data);
     let msg = `${data.event_count} access window(s) from ${source.toUpperCase()} data.`;
     // v2: feed is no longer auto-updated by calculation. When the mooring
@@ -1968,6 +1977,12 @@ async function updateFeed() {
     showStatus('calc-status', 'Calculate access windows first before updating the feed.', 'err');
     return;
   }
+  if (lastMooringId !== cfg.mooring_id) {
+    showStatus('calc-status',
+      `These results were calculated ${lastMooringId ? `for mooring ${lastMooringId}` : 'without a mooring'}. ` +
+      `Calculate again for mooring ${cfg.mooring_id} before updating its feed.`, 'err');
+    return;
+  }
   try {
     // Push the last calculated windows into the mooring's stored events
     // and regenerate the .ics feed (PIN-gated). The body shape matches
@@ -1976,7 +1991,12 @@ async function updateFeed() {
     const body = {
       source: lastSource,
       windows: lastWindows,
-      parameters: {
+      parameters: lastParameters ? {
+        draught_m: lastParameters.draught_m,
+        drying_height_m: lastParameters.drying_height_m,
+        safety_margin_m: lastParameters.safety_margin_m,
+        tender_min_depth_m: lastParameters.tender_min_depth_m,
+      } : {
         draught_m: cfg.draught_m,
         drying_height_m: cfg.drying_height_m,
         safety_margin_m: cfg.safety_margin_m,
@@ -1993,9 +2013,27 @@ async function updateFeed() {
       const msg = (data.detail && (data.detail.message || data.detail)) || 'Update failed';
       throw new Error(msg);
     }
+    // v2.11.1: the stored feed can differ from the results table. A wind
+    // adjustment the scheduler already applied is kept, and a tide that no
+    // longer clears the threshold has its old entry removed.
+    const notes = [];
+    if (data.wind_preserved) {
+      notes.push(`${data.wind_preserved} wind adjustment${data.wind_preserved === 1 ? '' : 's'} kept`);
+    }
+    if (data.removed) {
+      notes.push(`${data.removed} entr${data.removed === 1 ? 'y' : 'ies'} removed (tide below threshold)`);
+    }
+    if (data.failed) {
+      const kept = data.failed - (data.failed_deleted || 0);
+      notes.push(`${data.failed} wind-adjusted window${data.failed === 1 ? '' : 's'} could not be recomputed`
+        + (data.failed_deleted ? ` (${data.failed_deleted} removed` + (kept ? `, ${kept} left as stored)` : ')')
+                               : ' (left as stored)'));
+    }
+    const extra = notes.length ? ` ${notes.join('; ')}.` : '';
     if (data.feed_generated) {
       showStatus('calc-status',
-        `Calendar feed updated (${data.window_count} windows).`, 'ok');
+        `Calendar feed updated (${data.window_count} windows).${extra}`,
+        data.failed ? 'info' : 'ok');
     } else {
       showStatus('calc-status',
         'Events stored but feed not regenerated (calendar subscription is disabled).',
@@ -2931,7 +2969,7 @@ async function loadMooringConfigs() {
           `</div>`;
       if (m.wind_offset_enabled && m.shallow_direction) {
         html += `<div style="font-size:12px;margin-top:6px;color:var(--text-light);">` +
-          `Shallow side: <b>${m.shallow_direction}</b>, extra drying: <b>+${(m.shallow_extra_depth_m || 0).toFixed(2)}m</b>` +
+          `Shallow side: <b>${escapeHtml(m.shallow_direction)}</b>, extra drying: <b>+${(m.shallow_extra_depth_m || 0).toFixed(2)}m</b>` +
           `</div>`;
       }
       if (m.tender_access_enabled) {
