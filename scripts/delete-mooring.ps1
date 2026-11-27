@@ -100,7 +100,7 @@ Write-Host "Running SQL transaction..." -ForegroundColor Cyan
 # i.e. one not yet started under v2.11.1).
 $sql | docker exec -i $Container sqlite3 -bail /app/data/tides.db
 if ($LASTEXITCODE -ne 0) {
-    Write-Error "SQL execution failed (exit code $LASTEXITCODE). Database state should be unchanged due to the transaction wrapper."
+    Write-Error "SQL execution failed (exit code $LASTEXITCODE). The transaction was rolled back, so the database is unchanged. If the error was 'no such table: wind_checks', the container is still running a version before v2.11.1: rebuild it (docker compose up -d --build) and run this script again."
     exit 3
 }
 
