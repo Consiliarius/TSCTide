@@ -826,6 +826,28 @@ def _recompute_usable(w: dict) -> bool:
     return bool(w.get("start_time") and w.get("end_time"))
 
 
+def _same_tide(check_hw: str, window_hw: str, max_hours: float = 3.0) -> bool:
+    """
+    True when a recorded wind check belongs to the window's high water: both
+    high waters within ``max_hours``. Cycle UIDs are stable for shifts of up
+    to about 3 hours, so a revised HW time still matches, while two
+    consecutive tides that happen to share a UID (from 2029, as high waters
+    drift across the cycle grid) do not.
+    """
+    if not check_hw or not window_hw:
+        return False
+    try:
+        a = dtparse.parse(check_hw)
+        b = dtparse.parse(window_hw)
+    except (ValueError, OverflowError, TypeError):
+        return False
+    if a.tzinfo is None:
+        a = a.replace(tzinfo=timezone.utc)
+    if b.tzinfo is None:
+        b = b.replace(tzinfo=timezone.utc)
+    return abs((a - b).total_seconds()) <= max_hours * 3600
+
+
 def _stored_params_match(row: dict, vessel: dict) -> bool:
     """True when a stored row was computed with these vessel parameters."""
     for key in ("draught_m", "drying_height_m", "safety_margin_m"):
@@ -855,7 +877,8 @@ def reapply_stored_wind(m: dict, windows: list[dict], tender_windows,
     Wind checks come from the wind_checks table, which keeps them even after
     the tide's window row is removed. A stored row with ``wind_adjusted = 1``
     and a wind direction but no recorded check (written before the table
-    existed) is used as a fallback.
+    existed) is used as a fallback. A check is used only when its high water
+    is within 3 hours of the window's (see _same_tide).
 
     Rules:
 
@@ -871,11 +894,11 @@ def reapply_stored_wind(m: dict, windows: list[dict], tender_windows,
     - Wind offset no longer configured on the mooring: not re-applied. The
       baseline window is written and the wind flags clear ("reverted").
     - Recompute fails although the baseline was usable (HW not found in the
-      events, incomplete wind window, or an error): the cycle is dropped from
-      the write. The stored row is kept only when it was computed with the
-      vessel parameters now in use; otherwise it is deleted, because a stale
-      window is worse than none. Counted "failed" (and "deleted" when
-      removed).
+      events, incomplete wind window, or an exception): the cycle is dropped
+      from the write. The stored row is kept only when it was computed with
+      the vessel parameters now in use; otherwise it is deleted, because a
+      stale window is worse than none. Counted "failed" once (and "deleted"
+      when removed).
 
     stored_rows: the mooring's stored calendar rows (for the parameter check
     and the fallback above). events: passed to compute_wind_window; see
@@ -901,6 +924,7 @@ def reapply_stored_wind(m: dict, windows: list[dict], tender_windows,
     for r in rows_by_uid.values():
         if r.get("wind_adjusted") and r.get("wind_direction"):
             checks[r["event_uid"]] = {
+                "hw_timestamp": r["hw_timestamp"],
                 "wind_direction": r["wind_direction"],
                 "wind_speed_ms": r.get("wind_speed_ms"),
             }
@@ -929,6 +953,10 @@ def reapply_stored_wind(m: dict, windows: list[dict], tender_windows,
         hw = w.get("hw_timestamp")
         uid = generate_event_uid(mooring_id, hw) if hw else None
         check = checks.get(uid)
+        if check is not None and not _same_tide(check.get("hw_timestamp"), hw):
+            # Same cycle UID but a different high water (UIDs can collide once
+            # high waters drift across the cycle grid): not this tide's check.
+            check = None
         if check is None:
             out.append(w)
             continue
@@ -945,28 +973,33 @@ def reapply_stored_wind(m: dict, windows: list[dict], tender_windows,
 
         offset = 0.0
         result = None
+        reason = None
         try:
             if should_apply_offset(check["wind_direction"], shallow_dir):
                 offset = extra_depth
             result = compute_wind_window(m, hw, offset, events=events, params=params)
             if result is None or not _recompute_usable(result[0]):
-                stats["failed"] += 1
-                row = rows_by_uid.get(uid)
-                keep = row is not None and _stored_params_match(row, vessel)
-                if row is not None and not keep:
-                    stats["deleted"] += delete_calendar_event(uid, mooring_id)
-                logger.warning(
-                    f"Mooring {mooring_id}: could not re-apply stored wind to HW {hw}; "
-                    + ("window not rewritten (vessel parameters unchanged)" if keep
-                       else "stored window removed (vessel parameters changed)"
-                       if row is not None else "no stored window to keep")
-                )
-                continue
+                reason = "no usable wind window"
         except Exception as e:
+            reason = f"error: {e}"
+
+        if reason is not None:
+            # Same handling whatever the cause: keep the stored row only if it
+            # was computed with the vessel parameters now in use.
             stats["failed"] += 1
-            logger.error(
-                f"Wind re-apply failed for mooring {mooring_id}, HW {hw}: {e}; "
-                f"window not rewritten"
+            row = rows_by_uid.get(uid)
+            keep = row is not None and _stored_params_match(row, vessel)
+            outcome = ("window not rewritten (vessel parameters unchanged)" if keep
+                       else "no stored window to keep" if row is None
+                       else "stored window removed (vessel parameters changed)")
+            if row is not None and not keep:
+                try:
+                    stats["deleted"] += delete_calendar_event(uid, mooring_id)
+                except Exception as e:
+                    outcome = f"stale stored window could not be removed ({e})"
+            logger.warning(
+                f"Mooring {mooring_id}: could not re-apply stored wind to HW {hw} "
+                f"({reason}); {outcome}"
             )
             continue
 
