@@ -848,29 +848,39 @@ def reapply_stored_wind(m: dict, windows: list[dict], tender_windows,
     (v2.11.1).
 
     For each fresh window whose tide (matched by cycle UID, never by raw HW
-    timestamp) has a stored row with ``wind_adjusted = 1``, the window is
-    recomputed with that row's wind outcome via compute_wind_window, so the
-    adjustment is kept while fresh tide data and the barometric correction
-    still land. Rules:
+    timestamp) has a recorded wind check, the window is recomputed with that
+    check's wind reading via compute_wind_window, so the adjustment is kept
+    while fresh tide data and the barometric correction still land.
 
-    - Offset: re-derived from the stored wind direction and the CURRENT
+    Wind checks come from the wind_checks table, which keeps them even after
+    the tide's window row is removed. A stored row with ``wind_adjusted = 1``
+    and a wind direction but no recorded check (written before the table
+    existed) is used as a fallback.
+
+    Rules:
+
+    - Baseline below threshold, or incomplete (no start/end at the edge of
+      the tide data): passed through unchanged, with no recompute. Store then
+      removes the row (below threshold: no access whatever the wind) or
+      leaves it as is (incomplete). The wind check stays recorded, so a later
+      recompute that finds the tide clearing again re-applies it.
+    - Offset: re-derived from the recorded wind direction and the CURRENT
       config: the current shallow_extra_depth_m when should_apply_offset(
-      stored direction, current shallow_direction), else 0. So a calibration
-      or settings change takes effect on the re-applied window.
-    - Wind offset no longer configured on the mooring, or the stored row has
-      no wind direction: not re-applied. The baseline window is written and
-      the wind flags clear ("reverted").
-    - Recompute below threshold: kept in the list; store_windows_as_events
-      then removes the stored row (the tide gives no access, whatever the
-      wind).
-    - Recompute fails (no data, HW not found, incomplete data, or an error):
-      the cycle is dropped from the write. The stored row is kept only when
-      it was computed with the vessel parameters now in use; otherwise it is
-      deleted, because a stale window is worse than none. Counted "failed"
-      (and "deleted" when removed).
+      recorded direction, current shallow_direction), else 0. So a
+      calibration or settings change takes effect on the re-applied window.
+    - Wind offset no longer configured on the mooring: not re-applied. The
+      baseline window is written and the wind flags clear ("reverted").
+    - Recompute fails although the baseline was usable (HW not found in the
+      events, incomplete wind window, or an error): the cycle is dropped from
+      the write. The stored row is kept only when it was computed with the
+      vessel parameters now in use; otherwise it is deleted, because a stale
+      window is worse than none. Counted "failed" (and "deleted" when
+      removed).
 
-    events: passed to compute_wind_window; see there. params: vessel
-    parameter override (Update Feed); defaults to the mooring's own.
+    stored_rows: the mooring's stored calendar rows (for the parameter check
+    and the fallback above). events: passed to compute_wind_window; see
+    there. params: vessel parameter override (Update Feed); defaults to the
+    mooring's own.
 
     Each cycle is handled in its own try/except, so one bad cycle cannot
     abort the refresh. Returns (windows, tender_windows, stats) with stats
@@ -878,14 +888,25 @@ def reapply_stored_wind(m: dict, windows: list[dict], tender_windows,
     """
     from app.wind import should_apply_offset
     from app.access_calc import generate_event_uid
-    from app.database import delete_calendar_event
+    from app.database import delete_calendar_event, get_wind_checks
 
     stats = {"preserved": 0, "reverted": 0, "failed": 0, "deleted": 0}
     mooring_id = m["mooring_id"]
-    wind_rows = {
-        r["event_uid"]: r for r in stored_rows or [] if r.get("wind_adjusted")
-    }
-    if not wind_rows or not windows:
+    if not windows:
+        return windows, tender_windows, stats
+
+    rows_by_uid = {r["event_uid"]: r for r in stored_rows or []}
+    # Wind reading per tide: recorded checks first, then pre-v2.11.1 rows.
+    checks = {}
+    for r in rows_by_uid.values():
+        if r.get("wind_adjusted") and r.get("wind_direction"):
+            checks[r["event_uid"]] = {
+                "wind_direction": r["wind_direction"],
+                "wind_speed_ms": r.get("wind_speed_ms"),
+            }
+    for c in get_wind_checks(mooring_id):
+        checks[c["event_uid"]] = c
+    if not checks:
         return windows, tender_windows, stats
 
     shallow_dir = m.get("shallow_direction") or ""
@@ -907,44 +928,53 @@ def reapply_stored_wind(m: dict, windows: list[dict], tender_windows,
     for w in windows:
         hw = w.get("hw_timestamp")
         uid = generate_event_uid(mooring_id, hw) if hw else None
-        row = wind_rows.get(uid)
-        if row is None:
+        check = checks.get(uid)
+        if check is None:
             out.append(w)
             continue
-        if not wind_configured or not row.get("wind_direction"):
-            stats["reverted"] += 1
+        if w.get("below_threshold") or not _recompute_usable(w):
+            # Nothing for the wind to adjust: store removes (below threshold)
+            # or leaves (incomplete) the row. The check stays recorded.
+            out.append(w)
+            continue
+        if not wind_configured:
+            if (rows_by_uid.get(uid) or {}).get("wind_adjusted"):
+                stats["reverted"] += 1
             out.append(w)
             continue
 
         offset = 0.0
         result = None
         try:
-            if should_apply_offset(row["wind_direction"], shallow_dir):
+            if should_apply_offset(check["wind_direction"], shallow_dir):
                 offset = extra_depth
             result = compute_wind_window(m, hw, offset, events=events, params=params)
+            if result is None or not _recompute_usable(result[0]):
+                stats["failed"] += 1
+                row = rows_by_uid.get(uid)
+                keep = row is not None and _stored_params_match(row, vessel)
+                if row is not None and not keep:
+                    stats["deleted"] += delete_calendar_event(uid, mooring_id)
+                logger.warning(
+                    f"Mooring {mooring_id}: could not re-apply stored wind to HW {hw}; "
+                    + ("window not rewritten (vessel parameters unchanged)" if keep
+                       else "stored window removed (vessel parameters changed)"
+                       if row is not None else "no stored window to keep")
+                )
+                continue
         except Exception as e:
-            logger.error(
-                f"Wind re-apply failed for mooring {mooring_id}, HW {hw}: {e}"
-            )
-            result = None
-
-        if result is None or not _recompute_usable(result[0]):
             stats["failed"] += 1
-            keep = _stored_params_match(row, vessel)
-            if not keep:
-                stats["deleted"] += delete_calendar_event(uid, mooring_id)
-            logger.warning(
-                f"Mooring {mooring_id}: could not re-apply stored wind to HW {hw}; "
-                + ("window not rewritten (vessel parameters unchanged)" if keep
-                   else "stored window removed (vessel parameters changed)")
+            logger.error(
+                f"Wind re-apply failed for mooring {mooring_id}, HW {hw}: {e}; "
+                f"window not rewritten"
             )
             continue
 
         new_w, new_tender, _depth = result
         new_w = dict(new_w)
         new_w["wind_details"] = {
-            "direction": row["wind_direction"],
-            "speed_ms": row.get("wind_speed_ms"),
+            "direction": check["wind_direction"],
+            "speed_ms": check.get("wind_speed_ms"),
             "offset_m": offset,
         }
         out.append(new_w)
@@ -968,8 +998,13 @@ async def wind_observation_job(mooring_id: int, next_hw_timestamp: str):
     START of that mooring's NEXT access window (vessel and tender), leaving the
     ebb-side grounding at baseline.
 
-    Writes exactly the one next-HW event (upsert by cycle UID) so it cannot
-    clobber a sibling window already adjusted by an earlier grounding's job.
+    Touches only the one next-HW event (by cycle UID) so it cannot clobber a
+    sibling window already adjusted by an earlier grounding's job: it writes
+    that event, or removes it if the tide no longer clears the threshold.
+
+    Since v2.11.1 the wind reading is also recorded in wind_checks before the
+    window is computed, so later recomputes of that tide can re-apply it (see
+    reapply_stored_wind), even if the window row is removed in between.
     """
     from app.wind import should_apply_offset
     from app.database import get_mooring, calibrate_drying_height, log_activity
@@ -1013,6 +1048,18 @@ async def wind_observation_job(mooring_id: int, next_hw_timestamp: str):
     offset_triggered = should_apply_offset(wind["direction_compass"], shallow_dir)
     wind_offset = extra_depth if offset_triggered else 0.0
     wind_kts = (wind.get("speed_ms") or 0.0) * 1.944
+
+    # Record the reading for this tide before computing anything, so later
+    # recomputes can re-apply it whatever happens to the window row.
+    from app.access_calc import generate_event_uid
+    from app.database import record_wind_check
+    try:
+        record_wind_check(
+            mooring_id, generate_event_uid(mooring_id, next_hw_timestamp),
+            next_hw_timestamp, wind["direction_compass"], wind.get("speed_ms"),
+        )
+    except Exception as e:
+        logger.error(f"Could not record wind check for mooring {mooring_id}: {e}")
 
     log_activity(
         event_type="wind_check",
@@ -1082,7 +1129,7 @@ async def wind_observation_job(mooring_id: int, next_hw_timestamp: str):
         computed = compute_wind_window(m, next_hw_timestamp, wind_offset)
         if computed is None:
             logger.info(
-                f"No tide data for next HW {next_hw_timestamp}; "
+                f"Tide data does not cover next HW {next_hw_timestamp}; "
                 f"skipping wind adjustment"
             )
             return
