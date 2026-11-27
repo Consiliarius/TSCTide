@@ -638,10 +638,6 @@ def store_windows_as_events(windows: list[dict], mooring_id: int,
             continue
         if not w.get("start_time") or not w.get("end_time"):
             incomplete += 1
-            logger.debug(
-                f"Mooring {mooring_id}: window for HW {w.get('hw_timestamp')} "
-                f"has no start/end (incomplete data); stored row left as is"
-            )
             continue
 
         uid = generate_event_uid(mooring_id, w["hw_timestamp"])
@@ -699,6 +695,11 @@ def store_windows_as_events(windows: list[dict], mooring_id: int,
         logger.info(
             f"Mooring {mooring_id}: removed {removed} stored window(s) whose "
             f"high water is now below the access threshold"
+        )
+    if incomplete:
+        logger.info(
+            f"Mooring {mooring_id}: {incomplete} window(s) had no start or end "
+            f"(edge of the tide data); any stored row for them was left as is"
         )
 
     # Clean up any lower-priority events that were superseded but got
