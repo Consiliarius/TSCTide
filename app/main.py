@@ -42,7 +42,7 @@ from app.pin import (
 from app.ukho import fetch_tidal_events
 from app.harmonic import predict_events as harmonic_predict_events
 from app.secondary_port import apply_offset
-from app.wind import fetch_current_wind, fetch_current_weather
+from app.wind import fetch_current_wind, fetch_current_weather, COMPASS_POINTS
 from app.conditions import get_current_conditions
 from app.access_calc import compute_access_windows, _interpolate_from_parsed
 from app.ical_manager import (
@@ -51,7 +51,10 @@ from app.ical_manager import (
     generate_langstone_ukho_7d_feed, generate_langstone_harmonic_180d_feed,
     generate_langstone_ukho_7d_pressure_corrected_feed,
 )
-from app.scheduler import start_scheduler, shutdown_scheduler, ensure_wind_jobs_scheduled
+from app.scheduler import (
+    start_scheduler, shutdown_scheduler, ensure_wind_jobs_scheduled,
+    reapply_stored_wind,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -267,15 +270,48 @@ def _compute_tender_windows(
     return tw, depth
 
 
+# Mooring settings that change the stored access windows. A Save that changes
+# any of these recomputes the future windows (v2.11.1).
+_WINDOW_SETTINGS = (
+    "draught_m", "drying_height_m", "safety_margin_m",
+    "tender_access_enabled", "tender_min_depth_m",
+    "barometric_enabled",
+    "wind_offset_enabled", "shallow_direction", "shallow_extra_depth_m",
+)
+
+
+def _window_settings_changed(old: dict, new: dict) -> bool:
+    """True when any window-affecting setting differs between two mooring rows."""
+    for key in _WINDOW_SETTINGS:
+        a, b = old.get(key), new.get(key)
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            if abs(float(a) - float(b)) > 1e-9:
+                return True
+        elif (a or None) != (b or None):
+            return True
+    return False
+
+
 def _recompute_future_windows(mooring_id: int):
     """
-    After a mooring configuration change, clear stored future events and
-    recompute them from currently-stored UKHO tide data, then regenerate
-    the iCal feed if calendar subscription is enabled.
+    After a mooring configuration change (calibration Apply, or since v2.11.1
+    a Save that changes a window-affecting setting), clear stored future
+    events and recompute them from currently-stored UKHO tide data, then
+    regenerate the iCal feed if calendar subscription is enabled.
 
-    Does nothing if no UKHO data is available. Uses the mooring's current
-    stored configuration. Uses get_ukho_tide_events() so that Portsmouth
-    fallback data receives the secondary port correction transparently.
+    Stored wind adjustments are carried over (v2.11.1): the wind-adjusted
+    future rows are read before the clear and re-applied to the rebuilt
+    windows under the current config (see scheduler.reapply_stored_wind). A
+    cycle whose wind window cannot be recomputed is left out of the rebuild.
+
+    Rows beyond the UKHO range (long-range harmonic entries pushed via Update
+    Feed) are cleared and not rebuilt: they were computed with the old
+    settings.
+
+    If no UKHO data is available, future rows are still cleared and nothing
+    is rebuilt. Uses the mooring's current stored configuration. Uses
+    get_ukho_tide_events() so that Portsmouth fallback data receives the
+    secondary port correction transparently.
     """
     m = get_mooring(mooring_id)
     if not m:
@@ -283,6 +319,12 @@ def _recompute_future_windows(mooring_id: int):
 
     now = datetime.now(timezone.utc)
     now_str = to_utc_str(now)
+    # Read the wind-adjusted rows the clear below is about to remove, so their
+    # wind outcome can be re-applied to the rebuilt windows.
+    stored_wind_rows = [
+        r for r in get_calendar_events(mooring_id)
+        if r.get("wind_adjusted") and r["hw_timestamp"] > now_str
+    ]
     delete_future_events(mooring_id, now_str)
 
     query_start = to_utc_str(now - timedelta(hours=13))
@@ -315,6 +357,17 @@ def _recompute_future_windows(mooring_id: int):
     windows = [w for w in windows if w["hw_timestamp"] >= now_str]
 
     tender_windows, tender_depth = _compute_tender_windows(tide_data, m, "ukho")
+
+    # Re-apply stored wind on the same events as the baseline. The rows were
+    # cleared above, so a cycle that fails here is simply left out.
+    windows, tender_windows, wind_stats = reapply_stored_wind(
+        m, windows, tender_windows, stored_wind_rows, events=tide_data,
+    )
+    if wind_stats["failed"]:
+        logger.warning(
+            f"Mooring {mooring_id}: {wind_stats['failed']} wind-adjusted window(s) "
+            f"could not be rebuilt and were left out of the recompute"
+        )
 
     cal = calibrate_drying_height(mooring_id)
     calc_params = {
@@ -480,14 +533,39 @@ async def save_mooring_config(request: Request):
         mid, request, allow_unclaimed=True, allow_nonexistent=True
     )
 
+    # Only a compass point (or empty, for no shallow side) is meaningful here.
+    # The value is also rendered on the Moorings tab, so free text must not be
+    # stored (v2.11.1).
+    shallow_direction = data.get("shallow_direction")
+    if shallow_direction not in (None, "") and shallow_direction not in COMPASS_POINTS:
+        raise HTTPException(
+            400, "shallow_direction must be one of " + ", ".join(COMPASS_POINTS)
+        )
+
+    old = get_mooring(mid)
     result = save_mooring(data)
 
-    # Reschedule wind-sample jobs so changes to wind/shallow or draught/drying
-    # settings take effect now rather than waiting for the next daily fetch.
-    try:
-        ensure_wind_jobs_scheduled()
-    except Exception as e:
-        logger.warning(f"Wind-job reschedule after config save failed: {e}")
+    # A change to any setting that shapes access windows recomputes the stored
+    # future windows now (v2.11.1). Before, they kept the old settings until
+    # the 02:00 refresh, and long-range entries kept them indefinitely.
+    # _recompute_future_windows also reschedules the wind jobs and regenerates
+    # the feed.
+    recomputed = False
+    if old is not None and _window_settings_changed(old, result):
+        try:
+            _recompute_future_windows(mid)
+            recomputed = True
+        except Exception as e:
+            logger.error(f"Window recompute after config save failed for #{mid}: {e}")
+
+    if not recomputed:
+        # Reschedule wind-sample jobs so changes to wind/shallow or
+        # draught/drying settings take effect now rather than waiting for the
+        # next daily fetch.
+        try:
+            ensure_wind_jobs_scheduled()
+        except Exception as e:
+            logger.warning(f"Wind-job reschedule after config save failed: {e}")
 
     log_activity(
         event_type="mooring_config",
@@ -509,10 +587,11 @@ async def save_mooring_config(request: Request):
             "shallow_direction": result.get("shallow_direction", ""),
             "shallow_extra_depth_m": result.get("shallow_extra_depth_m", 0),
             "use_observations": bool(result.get("use_observations")),
+            "windows_recomputed": recomputed,
         },
     )
 
-    if result.get("calendar_enabled"):
+    if result.get("calendar_enabled") and not recomputed:
         existing_events = get_calendar_events(mid)
         if existing_events:
             cal = calibrate_drying_height(mid)
@@ -1413,9 +1492,10 @@ async def calculate_access_windows(request: Request):
 
     # Wind offset is not applied in this read-only preview. The scheduler is
     # the sole owner of wind adjustment: it applies the offset start-only to
-    # the live feed at each vessel's worst-case grounding. /calculate (and the
-    # /feed/update it feeds) therefore show and store *baseline* windows;
-    # whatever wind is blowing at the next grounding adjusts the feed then.
+    # the live feed at each vessel's worst-case grounding. /calculate therefore
+    # shows *baseline* windows. Since v2.11.1, /feed/update keeps any wind
+    # adjustment the scheduler already stored for a tide (re-applied to the
+    # pushed windows), so the feed can differ from this preview for that tide.
     wind_offset = 0.0
     wind_info = None
 
@@ -1611,6 +1691,13 @@ async def update_mooring_feed(mooring_id: int, request: Request):
         raise HTTPException(400, "No windows supplied to update feed")
     if source not in ("ukho", "harmonic"):
         raise HTTPException(400, f"Invalid source: {source}")
+    if not all(isinstance(w, dict) and w.get("hw_timestamp") for w in windows):
+        raise HTTPException(400, "Each window needs an hw_timestamp")
+
+    # Wind state is never taken from the client (v2.11.1): only the scheduler
+    # may mark a window wind-adjusted. Anything wind-related on an incoming
+    # window is dropped before the stored wind is re-applied below.
+    windows = [_strip_client_wind_state(w) for w in windows]
 
     cal = calibrate_drying_height(mooring_id)
     calc_params = {
@@ -1620,8 +1707,9 @@ async def update_mooring_feed(mooring_id: int, request: Request):
         "obs_calibrated": 1 if cal.get("confidence", "none") != "none" else 0,
     }
     # Wind adjustment is owned by the scheduler (applied start-only to the live
-    # feed at each grounding), not by this manual path. Any wind_info in the
-    # request body is ignored so manual updates always store baseline windows.
+    # feed at each grounding), not by this manual path: any wind_info in the
+    # request body is ignored. Since v2.11.1 a wind adjustment the scheduler
+    # already stored is kept, re-applied below to these windows' parameters.
     wind_details = None
 
     # Tender data round-trips on each window dict from /api/calculate.
@@ -1643,9 +1731,27 @@ async def update_mooring_feed(mooring_id: int, request: Request):
             for w in windows
         ]
 
+    # Keep stored wind adjustments (v2.11.1). Only UKHO windows can meet a
+    # wind-adjusted row: the wind job writes UKHO rows only, and a harmonic
+    # write never replaces a UKHO row (source priority). The wind window is
+    # recomputed from the stored tide data, with the barometric correction
+    # for an opted-in mooring, as /api/calculate builds these windows.
+    window_count = len(windows)
+    wind_stats = {"preserved": 0, "reverted": 0, "failed": 0, "deleted": 0}
+    if source == "ukho":
+        vessel = {
+            "draught_m": calc_params["draught_m"],
+            "drying_height_m": calc_params["drying_height_m"],
+            "safety_margin_m": calc_params["safety_margin_m"],
+        }
+        windows, tender_windows, wind_stats = reapply_stored_wind(
+            m, windows, tender_windows, get_calendar_events(mooring_id),
+            params=vessel,
+        )
+
     # Always store events - they are internal state, used by serve_feed
     # on every request, and preserved across calendar_enabled toggles.
-    store_windows_as_events(
+    store_result = store_windows_as_events(
         windows, mooring_id, source, m.get("boat_name", ""),
         calc_params=calc_params, wind_details=wind_details,
         tender_windows=tender_windows,
@@ -1661,27 +1767,45 @@ async def update_mooring_feed(mooring_id: int, request: Request):
     log_activity(
         event_type="feed_generation",
         message=(
-            f"Calendar feed updated ({len(windows)} windows from {source.upper()})"
+            f"Calendar feed updated ({window_count} windows from {source.upper()})"
             if feed_generated
             else f"Events stored but feed file not regenerated - calendar disabled for mooring #{mooring_id}"
         ),
-        severity="info" if feed_generated else "warning",
+        severity="info" if feed_generated and not wind_stats["failed"] else "warning",
         scope="mooring",
         mooring_id=mooring_id,
         details={
-            "window_count": len(windows),
+            "window_count": window_count,
             "source": source,
             "trigger": "user_update_feed",
             "feed_generated": feed_generated,
+            "windows_removed_below_threshold": store_result.get("removed"),
+            "windows_wind_preserved": wind_stats["preserved"],
+            "windows_wind_reverted": wind_stats["reverted"],
+            "windows_wind_failed": wind_stats["failed"],
         },
     )
 
     return {
         "status": "ok",
-        "window_count": len(windows),
+        "window_count": window_count,
         "source": source,
         "feed_generated": feed_generated,
+        "wind_preserved": wind_stats["preserved"],
+        "removed": store_result.get("removed", 0),
+        "failed": wind_stats["failed"],
     }
+
+
+def _strip_client_wind_state(w: dict) -> dict:
+    """Copy of a client-supplied window with every wind field removed."""
+    clean = {
+        k: v for k, v in w.items()
+        if k not in ("wind_details", "wind_no_access", "wind_direction",
+                     "wind_speed_ms", "wind_offset_m")
+    }
+    clean["wind_adjusted"] = False
+    return clean
 
 
 # --- Activity Log ---
