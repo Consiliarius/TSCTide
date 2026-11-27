@@ -935,7 +935,7 @@ def reapply_stored_wind(m: dict, windows: list[dict], tender_windows,
                 stats["deleted"] += delete_calendar_event(uid, mooring_id)
             logger.warning(
                 f"Mooring {mooring_id}: could not re-apply stored wind to HW {hw}; "
-                + ("stored window kept (same vessel parameters)" if keep
+                + ("window not rewritten (vessel parameters unchanged)" if keep
                    else "stored window removed (vessel parameters changed)")
             )
             continue
