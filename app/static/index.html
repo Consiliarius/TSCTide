@@ -1176,6 +1176,9 @@ let lastSource = '';
 // Feed sends these, not the current form, so the stored windows are labelled
 // with the settings they were computed with even if the form changed since.
 let lastParameters = null;
+// Mooring the last calculation was run for (v2.11.1). Update Feed refuses to
+// push those windows to a different mooring selected since.
+let lastMooringId = null;
 // v2: wind_info preserved from last /calculate response so the Update Feed
 // button can pass wind metadata through to the feed-update endpoint.
 let lastWindInfo = null;
@@ -1803,6 +1806,7 @@ async function calculate(source) {
     lastSource = source;
     lastWindInfo = data.wind_info || null;
     lastParameters = data.parameters || null;
+    lastMooringId = cfg.mooring_id;
     renderResults(data);
     let msg = `${data.event_count} access window(s) from ${source.toUpperCase()} data.`;
     // v2: feed is no longer auto-updated by calculation. When the mooring
@@ -1973,6 +1977,12 @@ async function updateFeed() {
     showStatus('calc-status', 'Calculate access windows first before updating the feed.', 'err');
     return;
   }
+  if (lastMooringId !== cfg.mooring_id) {
+    showStatus('calc-status',
+      `These results were calculated ${lastMooringId ? `for mooring ${lastMooringId}` : 'without a mooring'}. ` +
+      `Calculate again for mooring ${cfg.mooring_id} before updating its feed.`, 'err');
+    return;
+  }
   try {
     // Push the last calculated windows into the mooring's stored events
     // and regenerate the .ics feed (PIN-gated). The body shape matches
@@ -2018,9 +2028,6 @@ async function updateFeed() {
       notes.push(`${data.failed} wind-adjusted window${data.failed === 1 ? '' : 's'} could not be recomputed`
         + (data.failed_deleted ? ` (${data.failed_deleted} removed` + (kept ? `, ${kept} left as stored)` : ')')
                                : ' (left as stored)'));
-    }
-    if (data.dropped_in_ukho_range) {
-      notes.push(`${data.dropped_in_ukho_range} estimated window${data.dropped_in_ukho_range === 1 ? '' : 's'} skipped inside the UKHO range (UKHO data takes precedence)`);
     }
     const extra = notes.length ? ` ${notes.join('; ')}.` : '';
     if (data.feed_generated) {
