@@ -317,7 +317,8 @@ def _log_recompute(mooring_id: int, trigger: str, result: dict):
                    "stored for the next 7 days")
         severity = "warning"
     else:
-        message = f"Future windows recomputed ({result.get('window_count', 0)} windows)"
+        message = (f"Future windows recomputed: {result.get('rows_before', 0)} stored "
+                   f"before, {result.get('rows_after', 0)} after")
         severity = "warning" if wind.get("failed") else "info"
     log_activity(
         event_type="feed_generation",
@@ -329,7 +330,8 @@ def _log_recompute(mooring_id: int, trigger: str, result: dict):
             "trigger": trigger,
             "status": status,
             "window_count": result.get("window_count", 0),
-            "windows_removed_below_threshold": result.get("removed", 0),
+            "future_rows_before": result.get("rows_before", 0),
+            "future_rows_after": result.get("rows_after", 0),
             "windows_wind_preserved": wind.get("preserved", 0),
             "windows_wind_reverted": wind.get("reverted", 0),
             "windows_wind_failed": wind.get("failed", 0),
@@ -361,8 +363,11 @@ def _recompute_future_windows(mooring_id: int):
     get_ukho_tide_events() so that Portsmouth fallback data receives the
     secondary port correction transparently.
 
-    Returns {"status": "rebuilt" | "no_data" | "no_mooring", "window_count",
-    "removed", "wind": re-apply stats} for the caller to log.
+    Returns {"status": "rebuilt" | "no_data" | "no_mooring", "window_count"
+    (windows with a start and end), "rows_before"/"rows_after" (stored future
+    rows), "wind": re-apply stats} for the caller to log. The rows are cleared
+    before the rebuild, so below-threshold tides show as the drop between
+    rows_before and rows_after rather than as removals.
     """
     m = get_mooring(mooring_id)
     if not m:
@@ -372,10 +377,8 @@ def _recompute_future_windows(mooring_id: int):
     now_str = to_utc_str(now)
     # Read the wind-adjusted rows the clear below is about to remove, so their
     # wind outcome can be re-applied to the rebuilt windows.
-    stored_wind_rows = [
-        r for r in get_calendar_events(mooring_id)
-        if r.get("wind_adjusted") and r["hw_timestamp"] > now_str
-    ]
+    future_rows = [r for r in get_calendar_events(mooring_id) if r["hw_timestamp"] > now_str]
+    stored_wind_rows = [r for r in future_rows if r.get("wind_adjusted")]
     delete_future_events(mooring_id, now_str)
 
     query_start = to_utc_str(now - timedelta(hours=13))
@@ -387,7 +390,8 @@ def _recompute_future_windows(mooring_id: int):
             f"cleared and not rebuilt"
         )
         _finish_recompute(m)
-        return {"status": "no_data", "window_count": 0, "removed": 0, "wind": {}}
+        return {"status": "no_data", "window_count": 0,
+                "rows_before": len(future_rows), "rows_after": 0, "wind": {}}
 
     # Barometric correction (v2.9): calibration-apply rebuilds this mooring's
     # future windows from scratch (delete_future_events above), so correct the
@@ -425,7 +429,7 @@ def _recompute_future_windows(mooring_id: int):
             f"could not be rebuilt and were left out of the recompute"
         )
 
-    window_count = len(windows)
+    window_count = sum(1 for w in windows if w.get("start_time") and w.get("end_time"))
     cal = calibrate_drying_height(mooring_id)
     calc_params = {
         "draught_m": m["draught_m"],
@@ -433,7 +437,7 @@ def _recompute_future_windows(mooring_id: int):
         "safety_margin_m": m["safety_margin_m"],
         "obs_calibrated": 1 if cal.get("confidence", "none") != "none" else 0,
     }
-    store_result = store_windows_as_events(
+    store_windows_as_events(
         windows, mooring_id, "ukho", m.get("boat_name", ""),
         calc_params=calc_params,
         tender_windows=tender_windows,
@@ -444,7 +448,10 @@ def _recompute_future_windows(mooring_id: int):
     return {
         "status": "rebuilt",
         "window_count": window_count,
-        "removed": store_result.get("removed", 0),
+        "rows_before": len(future_rows),
+        "rows_after": sum(
+            1 for r in get_calendar_events(mooring_id) if r["hw_timestamp"] > now_str
+        ),
         "wind": wind_stats,
     }
 
@@ -1773,26 +1780,6 @@ async def update_mooring_feed(mooring_id: int, request: Request):
     # window is dropped before the stored wind is re-applied below.
     windows = [_strip_client_wind_state(w) for w in windows]
 
-    # Harmonic estimates only fill the feed beyond the UKHO range (v2.11.1).
-    # A harmonic window for a tide UKHO already covers would otherwise be
-    # stored whenever UKHO found that tide below the threshold (no UKHO row to
-    # outrank it), showing an estimated window UKHO says does not exist.
-    dropped_in_ukho_range = 0
-    if source == "harmonic":
-        now = datetime.now(timezone.utc)
-        ukho_hws = [
-            e["timestamp"] for e in get_ukho_tide_events(
-                to_utc_str(now - timedelta(hours=13)),
-                to_utc_str(now + timedelta(days=8)),
-            )
-            if e["event_type"] == "HighWater"
-        ]
-        if ukho_hws:
-            last_ukho_hw = max(ukho_hws)
-            kept = [w for w in windows if w["hw_timestamp"] > last_ukho_hw]
-            dropped_in_ukho_range = len(windows) - len(kept)
-            windows = kept
-
     cal = calibrate_drying_height(mooring_id)
     calc_params = {
         "draught_m": params.get("draught_m", m["draught_m"]),
@@ -1878,7 +1865,6 @@ async def update_mooring_feed(mooring_id: int, request: Request):
             "windows_wind_reverted": wind_stats["reverted"],
             "windows_wind_failed": wind_stats["failed"],
             "windows_wind_failed_deleted": wind_stats["deleted"],
-            "windows_dropped_in_ukho_range": dropped_in_ukho_range,
         },
     )
 
@@ -1891,7 +1877,6 @@ async def update_mooring_feed(mooring_id: int, request: Request):
         "removed": store_result.get("removed", 0),
         "failed": wind_stats["failed"],
         "failed_deleted": wind_stats["deleted"],
-        "dropped_in_ukho_range": dropped_in_ukho_range,
     }
 
 
