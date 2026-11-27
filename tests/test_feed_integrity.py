@@ -635,24 +635,116 @@ def test_save_recomputes_only_on_effective_setting_changes(env, monkeypatch, bas
     assert (_row(env, 1, sentinel) is None) == recomputes
 
 
-def test_harmonic_push_skips_tides_inside_the_ukho_range(env):
-    from app.access_calc import compute_access_windows
-
+def test_harmonic_window_inside_ukho_range_is_cleared_by_the_next_daily_run(env):
+    """A harmonic push can store a window for a tide UKHO puts below the
+    threshold (harmonic cannot overwrite UKHO rows, but there is no UKHO row
+    here). The next UKHO recompute removes it; a harmonic window beyond the
+    UKHO range is left alone."""
+    env["seed"](_tides(hw_heights=(4.5, 3.0)))  # threshold 3.3 m
     _save(env)
-    client, headers = _client(env)
-    ukho_hw = _next_hw(env["events"])
-    inside = [w for w in compute_access_windows(env["events"], 1.0, 2.0, 0.3, source="harmonic")
-              if w["hw_timestamp"] == ukho_hw][0]
+    _daily()
+    cutoff = to_utc_str(NOW + timedelta(hours=1))
+    low_hw = min(e["timestamp"] for e in env["events"] if e["event_type"] == "HighWater"
+                 and e["height_m"] == 3.0 and e["timestamp"] > cutoff)
+    assert _row(env, 1, low_hw) is None
+    hw_dt = datetime.fromisoformat(low_hw.replace("Z", "+00:00"))
+    inside = {"hw_timestamp": low_hw, "hw_height_m": 3.4, "duration_minutes": 60,
+              "start_time": to_utc_str(hw_dt - timedelta(minutes=30)),
+              "end_time": to_utc_str(hw_dt + timedelta(minutes=30))}
     far = to_utc_str(NOW + timedelta(days=12))
     beyond = {"hw_timestamp": far, "hw_height_m": 4.5, "duration_minutes": 180,
               "start_time": far, "end_time": to_utc_str(NOW + timedelta(days=12, hours=3))}
+    client, headers = _client(env)
     resp = client.post("/api/moorings/1/feed/update", headers=headers, json={
         "source": "harmonic", "windows": [inside, beyond],
         "parameters": {"draught_m": 1.0, "drying_height_m": 2.0, "safety_margin_m": 0.3},
     })
-    assert resp.status_code == 200 and resp.json()["dropped_in_ukho_range"] == 1
-    assert _row(env, 1, ukho_hw) is None
+    assert resp.status_code == 200 and "dropped_in_ukho_range" not in resp.json()
+    assert _row(env, 1, low_hw)["source"] == "harmonic"
+    _daily()
+    assert _row(env, 1, low_hw) is None
     assert _row(env, 1, far)["source"] == "harmonic"
+
+
+def test_reapply_exception_follows_the_same_parameter_rule(env, monkeypatch):
+    import app.database as database
+    import app.scheduler as sched
+    from app.access_calc import compute_access_windows
+
+    hw, _baseline, adjusted = _adjusted(env, monkeypatch)
+    m = env["db"].get_mooring(1)
+    windows = [w for w in compute_access_windows(env["events"], 1.0, 2.0, 0.3)
+               if w["hw_timestamp"] == hw]
+
+    def boom(*a, **k):
+        raise RuntimeError("synthetic")
+
+    monkeypatch.setattr(sched, "compute_wind_window", boom)
+
+    # Same vessel parameters: the stored row is kept.
+    rows = env["db"].get_calendar_events(1)
+    out, _t, stats = sched.reapply_stored_wind(m, windows, None, rows)
+    assert out == [] and stats["failed"] == 1 and stats["deleted"] == 0
+    assert _row(env, 1, hw)["start_time"] == adjusted["start_time"]
+
+    # Delete itself failing: logged, no exception, nothing counted as deleted.
+    params = {"draught_m": 1.2, "drying_height_m": 2.0, "safety_margin_m": 0.3}
+    real_delete = database.delete_calendar_event
+    monkeypatch.setattr(database, "delete_calendar_event", boom)
+    out, _t, stats = sched.reapply_stored_wind(m, windows, None, rows, params=params)
+    assert out == [] and stats["failed"] == 1 and stats["deleted"] == 0
+    assert _row(env, 1, hw) is not None
+
+    # Changed vessel parameters: the stale row is removed.
+    monkeypatch.setattr(database, "delete_calendar_event", real_delete)
+    out, _t, stats = sched.reapply_stored_wind(m, windows, None, rows, params=params)
+    assert out == [] and stats["failed"] == 1 and stats["deleted"] == 1
+    assert _row(env, 1, hw) is None
+
+
+def test_wind_check_for_a_different_high_water_is_ignored(env, monkeypatch):
+    """UIDs can collide once high waters drift across the cycle grid: a check
+    recorded for a HW more than 3 h away is not applied."""
+    from app.access_calc import compute_access_windows, generate_event_uid
+    from app.scheduler import reapply_stored_wind
+
+    _save(env)
+    _daily()
+    hw = _next_hw(env["events"])
+    uid = generate_event_uid(1, hw)
+    m = env["db"].get_mooring(1)
+    windows = [w for w in compute_access_windows(env["events"], 1.0, 2.0, 0.3)
+               if w["hw_timestamp"] == hw]
+    hw_dt = datetime.fromisoformat(hw.replace("Z", "+00:00"))
+
+    env["db"].record_wind_check(1, uid, to_utc_str(hw_dt + timedelta(hours=6)), "E", 10.0)
+    out, _t, stats = reapply_stored_wind(m, windows, None, env["db"].get_calendar_events(1),
+                                         events=env["events"])
+    assert out == windows and stats["preserved"] == 0
+
+    env["db"].record_wind_check(1, uid, to_utc_str(hw_dt + timedelta(minutes=20)), "E", 10.0)
+    out, _t, stats = reapply_stored_wind(m, windows, None, env["db"].get_calendar_events(1),
+                                         events=env["events"])
+    assert stats["preserved"] == 1 and out[0]["start_time"] > windows[0]["start_time"]
+
+
+def test_recompute_log_reports_stored_rows_before_and_after(env):
+    from fastapi.testclient import TestClient
+    import app.main as main
+
+    env["seed"](_tides(hw_heights=(4.5, 4.0)))
+    cfg = _save(env)
+    _daily()
+    now = to_utc_str(datetime.now(timezone.utc))
+    before = sum(1 for r in env["db"].get_calendar_events(1) if r["hw_timestamp"] > now)
+    resp = TestClient(main.app).post("/api/moorings", json=dict(cfg, draught_m=1.9))
+    assert resp.status_code == 200
+    after = sum(1 for r in env["db"].get_calendar_events(1) if r["hw_timestamp"] > now)
+    assert after < before
+    details = _latest_log(env, "feed_generation", "config_save")["details"]
+    assert details["future_rows_before"] == before
+    assert details["future_rows_after"] == after
+    assert "windows_removed_below_threshold" not in details
 
 
 def test_wind_checks_are_pruned_and_removed_with_the_mooring(env):
